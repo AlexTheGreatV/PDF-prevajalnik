@@ -3,6 +3,7 @@ from pathlib import Path
 import pymupdf as fitz
 
 from app.models import PageAnalysis, PageDimensions, PdfAnalysis, PdfKind, TextBlock
+from app.services.document_segmenter import segment_pdf
 
 TEXT_PAGE_THRESHOLD = 25
 
@@ -10,6 +11,7 @@ TEXT_PAGE_THRESHOLD = 25
 def analyze_pdf(path: Path, filename: str | None = None) -> PdfAnalysis:
     source_name = filename or path.name
     pages: list[PageAnalysis] = []
+    document_model = segment_pdf(path)
 
     with fitz.open(path) as document:
         for page_index, page in enumerate(document):
@@ -38,6 +40,7 @@ def analyze_pdf(path: Path, filename: str | None = None) -> PdfAnalysis:
         kind=_classify_document([page.kind for page in pages]),
         extracted_text_chars=total_text_chars,
         pages=pages,
+        document=document_model,
     )
 
 

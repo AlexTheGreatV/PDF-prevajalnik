@@ -74,10 +74,21 @@ async def _save_upload(file: UploadFile, upload_dir: Path) -> Path:
 
 @contextmanager
 def _processing_tempdir() -> Iterator[str]:
-    settings.processing_tmp_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir = settings.processing_tmp_dir / f"pdf-pipeline-{uuid.uuid4().hex}"
+    root = settings.processing_tmp_dir.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    temp_dir = root / f"pdf-pipeline-{uuid.uuid4().hex}"
     temp_dir.mkdir()
     try:
         yield str(temp_dir)
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        _safe_rmtree(temp_dir, root)
+
+
+def _safe_rmtree(target: Path, root: Path) -> None:
+    resolved_root = root.resolve()
+    resolved_target = target.resolve()
+
+    if resolved_target == resolved_root or resolved_root not in resolved_target.parents:
+        raise RuntimeError("Refusing to remove a path outside the PDF processing temp root.")
+
+    shutil.rmtree(resolved_target, ignore_errors=True)

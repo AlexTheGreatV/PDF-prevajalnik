@@ -4,9 +4,12 @@ import {
   blockOverlayStyle,
   countImages,
   countTextBlocks,
+  flattenStructuredBlocks,
   formatBytes,
   formatPdfKind,
   pageText,
+  structuredBlockOverlayStyle,
+  structuredPageText,
   validatePdfFile,
 } from "../lib/pdf-view";
 import type { PdfAnalysis } from "../lib/pdf-types";
@@ -85,6 +88,64 @@ test("summarizes page content", () => {
 
 test("projects PDF block coordinates to percentages", () => {
   assert.deepEqual(blockOverlayStyle(analysis.pages[0].text_blocks[0], analysis.pages[0]), {
+    left: "10%",
+    top: "10%",
+    width: "50%",
+    height: "20%",
+  });
+});
+
+test("summarizes structured document blocks", () => {
+  const structured: PdfAnalysis = {
+    ...analysis,
+    document: {
+      metadata: {},
+      pages: [
+        {
+          page_number: 1,
+          width: 200,
+          height: 100,
+          page_type: "digital",
+          images: [],
+          regions: [
+            {
+              kind: "body",
+              reading_order: 1,
+              bbox: { x0: 20, y0: 10, x1: 120, y1: 40 },
+              blocks: [
+                {
+                  kind: "heading",
+                  reading_order: 1,
+                  bbox: { x0: 20, y0: 10, x1: 120, y1: 30 },
+                  original_text: "NASLOV",
+                  normalized_text: "Naslov",
+                  lines: [],
+                  line_boundaries: [],
+                  style: {
+                    font: "Helvetica",
+                    font_size: 14,
+                    color: 0,
+                    flags: 16,
+                    bold: true,
+                    italic: false,
+                  },
+                  confidence: 1,
+                  warnings: [],
+                  needs_ocr_check: false,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  const page = structured.document?.pages[0];
+  assert.equal(countTextBlocks(structured), 1);
+  assert.equal(page ? structuredPageText(page, "normalized") : "", "Naslov");
+  assert.equal(page ? flattenStructuredBlocks(page)[0].kind : "", "heading");
+  assert.deepEqual(page ? structuredBlockOverlayStyle(flattenStructuredBlocks(page)[0], page) : {}, {
     left: "10%",
     top: "10%",
     width: "50%",
