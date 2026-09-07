@@ -1,10 +1,10 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 
-import { analyzePdf, renderPdf } from "../lib/pdf-client";
-import type { PdfAnalysis, RenderResult, StructuredBlock } from "../lib/pdf-types";
+import { analyzePdf, getOcrStatus, ocrPdf, renderPdf } from "../lib/pdf-client";
+import type { OcrResponse, OcrStatus, PdfAnalysis, RenderResult, StructuredBlock } from "../lib/pdf-types";
 import {
   blockOverlayStyle,
   countImages,
@@ -31,10 +31,31 @@ export function PdfAnalyzer() {
   const [visibleBlocks, setVisibleBlocks] = useState<Record<number, boolean>>({});
   const [textMode, setTextMode] = useState<"original" | "normalized">("normalized");
   const [selectedBlockKey, setSelectedBlockKey] = useState<string | null>(null);
+  const [ocrStatus, setOcrStatus] = useState<OcrStatus | null>(null);
+  const [ocrResult, setOcrResult] = useState<OcrResponse | null>(null);
+  const [isOcrRunning, setIsOcrRunning] = useState(false);
+  const [ocrError, setOcrError] = useState<string | null>(null);
 
   const selectedFileError = file ? validatePdfFile(file) : null;
   const totalBlocks = analysis ? countTextBlocks(analysis) : 0;
   const totalImages = analysis ? countImages(analysis) : 0;
+
+  useEffect(() => {
+    getOcrStatus()
+      .then(setOcrStatus)
+      .catch(() =>
+        setOcrStatus({
+          available: false,
+          provider: "unknown",
+          executable: null,
+          version: null,
+          languages: [],
+          tessdata_prefix: null,
+          pymupdf_ocr_available: false,
+          message: "Stanja lokalnega OCR ni bilo mogoče preveriti.",
+        }),
+      );
+  }, []);
 
   const renderPagesByNumber = useMemo(() => {
     return new Map(renderResult?.pages.map((page) => [page.page_number, page]) ?? []);
@@ -46,6 +67,8 @@ export function PdfAnalyzer() {
     setRenderResult(null);
     setVisibleBlocks({});
     setSelectedBlockKey(null);
+    setOcrResult(null);
+    setOcrError(null);
     setError(nextFile ? validatePdfFile(nextFile) : null);
     setState(nextFile ? "ready" : "idle");
   }
@@ -65,6 +88,8 @@ export function PdfAnalyzer() {
     setAnalysis(null);
     setRenderResult(null);
     setSelectedBlockKey(null);
+    setOcrResult(null);
+    setOcrError(null);
 
     try {
       const [analysisPayload, renderPayload] = await Promise.all([
@@ -77,6 +102,20 @@ export function PdfAnalyzer() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Analiza ni uspela.");
       setState("error");
+    }
+  }
+
+  async function runOcr() {
+    if (!file) return;
+    setIsOcrRunning(true);
+    setOcrError(null);
+    try {
+      setOcrResult(await ocrPdf(file));
+      setOcrStatus((await getOcrStatus()));
+    } catch (caught) {
+      setOcrError(caught instanceof Error ? caught.message : "OCR preverjanje ni uspelo.");
+    } finally {
+      setIsOcrRunning(false);
     }
   }
 
@@ -139,6 +178,20 @@ export function PdfAnalyzer() {
           <div className="error-box">{error ?? selectedFileError}</div>
         )}
       </section>
+
+      <section className="panel ocr-panel">
+        <div>
+          <span>Lokalni OCR</span>
+          <strong>{ocrStatus?.available ? "OCR na voljo" : "Lokalni OCR ni na voljo"}</strong>
+          <small>{ocrStatus?.message ?? ocrStatus?.version ?? "Tesseract status se preverja."}</small>
+        </div>
+        <button className="button secondary" disabled={!file || !analysis || isOcrRunning} onClick={runOcr}>
+          {isOcrRunning ? "Preverjam OCR..." : "OCR-preveri sumljive dele"}
+        </button>
+      </section>
+
+      {ocrError && <div className="error-box">{ocrError}</div>}
+      {ocrResult && <OcrCandidates result={ocrResult} />}
 
       {analysis && (
         <>
@@ -325,6 +378,78 @@ export function PdfAnalyzer() {
       )}
     </div>
   );
+}
+
+function OcrCandidates({ result }: { result: OcrResponse }) {
+  return (
+    <section className="panel ocr-results">
+      <div className="page-header">
+        <div>
+          <h3>OCR kandidati</h3>
+          <p>
+            {result.candidates.length} kandidatov ·{" "}
+            {result.status.available ? "lokalni OCR izveden" : "lokalni OCR ni na voljo"}
+          </p>
+        </div>
+      </div>
+      {result.candidates.length === 0 && <p>Ni zaznanih kandidatov za OCR preverjanje.</p>}
+      {result.candidates.map((candidate, index) => (
+        <div className="ocr-candidate" key={`${candidate.page_number}-${candidate.source}-${index}`}>
+          <div>
+            <strong>
+              Stran {candidate.page_number} · {sourceLabel(candidate.source)}
+            </strong>
+            <span>
+              {candidate.reasons.map(reasonLabel).join(", ")} · {candidate.status}
+              {candidate.ocr_confidence !== null ? ` · ${candidate.ocr_confidence.toFixed(1)} %` : ""}
+            </span>
+            {candidate.linked_heading && <small>Povezano z: {candidate.linked_heading}</small>}
+            {candidate.message && <em>{candidate.message}</em>}
+          </div>
+          <div className="ocr-compare">
+            <div>
+              <h4>Izvorno</h4>
+              <pre>{candidate.native_text || "Ni izvornega besedila."}</pre>
+            </div>
+            <div>
+              <h4>OCR</h4>
+              <pre>{candidate.ocr_text || "Ni OCR rezultata."}</pre>
+            </div>
+          </div>
+          <div className="ocr-actions">
+            <button className="button secondary" disabled>
+              Ohrani izvirnik
+            </button>
+            <button className="button secondary" disabled>
+              Uporabi OCR rezultat
+            </button>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function sourceLabel(source: OcrResponse["candidates"][number]["source"]): string {
+  const labels = {
+    full_page: "cela stran",
+    image_region: "slikovno območje",
+    suspicious_block: "sumljiv blok",
+  };
+  return labels[source];
+}
+
+function reasonLabel(reason: OcrResponse["candidates"][number]["reasons"][number]): string {
+  const labels = {
+    scanned_page: "skenirana stran",
+    low_native_text_coverage: "malo izvornega besedila",
+    suspicious_glyph: "sumljiv znak",
+    image_text_candidate: "besedilo v sliki",
+    font_encoding_anomaly: "font encoding",
+    manual_request: "ročna zahteva",
+    ambiguous_hyphen: "dvoumen vezaj",
+  };
+  return labels[reason];
 }
 
 function BlockRow({

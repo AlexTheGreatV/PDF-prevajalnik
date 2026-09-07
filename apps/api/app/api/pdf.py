@@ -7,7 +7,8 @@ from collections.abc import Iterator
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.core.config import settings
-from app.models import PdfAnalysis, RenderResult
+from app.models import OcrResponse, PdfAnalysis, RenderResult
+from app.services.ocr import run_selective_ocr
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_renderer import render_pdf_pages_as_data_urls
 
@@ -44,6 +45,26 @@ async def render(file: UploadFile = File(...), dpi: int = Form(150)) -> RenderRe
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail="PDF strani ni bilo mogoce renderirati.") from exc
+
+
+@router.post("/ocr", response_model=OcrResponse)
+async def ocr(file: UploadFile = File(...), language: str = Form("eng"), dpi: int = Form(180)) -> OcrResponse:
+    if dpi < 100 or dpi > 240:
+        raise HTTPException(status_code=400, detail="OCR DPI mora biti med 100 in 240.")
+
+    with _processing_tempdir() as temp_dir:
+        temp_path = Path(temp_dir)
+        path = await _save_upload(file, temp_path)
+        try:
+            return run_selective_ocr(
+                path,
+                filename=file.filename or "upload.pdf",
+                temp_root=temp_path / "ocr",
+                language=language,
+                dpi=dpi,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="OCR priprava PDF-ja ni uspela.") from exc
 
 
 async def _save_upload(file: UploadFile, upload_dir: Path) -> Path:

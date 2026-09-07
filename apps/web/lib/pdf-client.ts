@@ -1,4 +1,4 @@
-import type { PdfAnalysis, RenderResult } from "./pdf-types";
+import type { OcrResponse, OcrStatus, PdfAnalysis, RenderResult } from "./pdf-types";
 
 export const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -19,6 +19,22 @@ export async function renderPdf(file: File): Promise<RenderResult> {
   const response = await fetchApi(`${apiBaseUrl}/api/pdf/render`, form);
 
   return parseApiResponse<RenderResult>(response);
+}
+
+export async function getOcrStatus(): Promise<OcrStatus> {
+  const response = await fetch(`${apiBaseUrl}/api/ocr/status`);
+  return parseApiResponse<OcrStatus>(response);
+}
+
+export async function ocrPdf(file: File): Promise<OcrResponse> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("language", "eng");
+  form.append("dpi", "180");
+
+  const response = await fetchApi(`${apiBaseUrl}/api/pdf/ocr`, form);
+
+  return parseApiResponse<OcrResponse>(response);
 }
 
 async function fetchApi(url: string, body: FormData): Promise<Response> {

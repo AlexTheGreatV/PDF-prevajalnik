@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.ocr import router as ocr_router
 from app.api.pdf import router as pdf_router
 from app.core.config import settings
 
@@ -30,3 +31,4 @@ def health() -> dict[str, str]:
 
 
 app.include_router(pdf_router, prefix="/api/pdf", tags=["pdf"])
+app.include_router(ocr_router, prefix="/api/ocr", tags=["ocr"])

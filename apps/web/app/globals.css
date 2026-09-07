@@ -147,6 +147,25 @@ input {
   gap: 14px;
 }
 
+.ocr-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.ocr-panel span,
+.ocr-panel small {
+  display: block;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.ocr-panel strong {
+  display: block;
+  margin: 4px 0;
+}
+
 .file-row {
   display: flex;
   align-items: center;
@@ -476,6 +495,46 @@ pre {
   vertical-align: top;
 }
 
+.ocr-results {
+  display: grid;
+  gap: 14px;
+}
+
+.ocr-candidate {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.ocr-candidate span,
+.ocr-candidate small,
+.ocr-candidate em {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  font-style: normal;
+}
+
+.ocr-candidate em {
+  color: var(--warning);
+  font-weight: 700;
+}
+
+.ocr-compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ocr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 @media (max-width: 640px) {
   .app-shell {
     padding: 18px;
@@ -494,6 +553,16 @@ pre {
 
   .page-columns {
     grid-template-columns: 1fr;
+  }
+
+  .ocr-panel,
+  .ocr-compare {
+    grid-template-columns: 1fr;
+  }
+
+  .ocr-panel {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .diagnostic-toolbar {

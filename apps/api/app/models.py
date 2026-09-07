@@ -5,6 +5,16 @@ from pydantic import BaseModel, Field
 PdfKind = Literal["digital", "scanned", "mixed", "empty"]
 RegionKind = Literal["header", "footer", "column", "table", "body", "unknown"]
 BlockKind = Literal["heading", "paragraph", "list", "list_item", "table", "caption", "unknown"]
+OcrReason = Literal[
+    "scanned_page",
+    "low_native_text_coverage",
+    "suspicious_glyph",
+    "image_text_candidate",
+    "font_encoding_anomaly",
+    "manual_request",
+    "ambiguous_hyphen",
+]
+OcrSource = Literal["full_page", "image_region", "suspicious_block"]
 
 
 class PageDimensions(BaseModel):
@@ -107,6 +117,13 @@ class DocumentBlock(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     needs_ocr_check: bool = False
     table_cells: list[list[str]] | None = None
+    ocr_candidates: list["OcrCandidate"] = Field(default_factory=list)
+    selected_text_source: Literal["native", "ocr", "manual_review"] = "native"
+    native_text: str | None = None
+    ocr_text: str | None = None
+    ocr_confidence: float | None = None
+    ocr_applied: bool = False
+    requires_review: bool = False
 
 
 class DocumentRegion(BaseModel):
@@ -138,3 +155,57 @@ class DocumentPage(BaseModel):
 class DocumentModel(BaseModel):
     pages: list[DocumentPage] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OcrWord(BaseModel):
+    text: str
+    bbox: BBox
+    confidence: float
+
+
+class OcrResult(BaseModel):
+    text: str
+    words: list[OcrWord] = Field(default_factory=list)
+    confidence: float
+    bbox: BBox
+    language: str
+    provider: str
+    processing_time_ms: int
+    source: OcrSource
+
+
+class OcrCandidate(BaseModel):
+    page_number: int
+    source: OcrSource
+    reasons: list[OcrReason] = Field(default_factory=list)
+    bbox: BBox
+    native_text: str | None = None
+    ocr_text: str | None = None
+    ocr_confidence: float | None = None
+    selected_text_source: Literal["native", "ocr", "manual_review"] = "native"
+    ocr_applied: bool = False
+    requires_review: bool = True
+    result: OcrResult | None = None
+    linked_block_reading_order: int | None = None
+    linked_heading: str | None = None
+    dpi: int | None = None
+    scale: float | None = None
+    status: Literal["planned", "processed", "skipped", "unavailable", "failed"] = "planned"
+    message: str | None = None
+
+
+class OcrStatus(BaseModel):
+    available: bool
+    provider: str
+    executable: str | None = None
+    version: str | None = None
+    languages: list[str] = Field(default_factory=list)
+    tessdata_prefix: str | None = None
+    pymupdf_ocr_available: bool = False
+    message: str | None = None
+
+
+class OcrResponse(BaseModel):
+    filename: str
+    status: OcrStatus
+    candidates: list[OcrCandidate] = Field(default_factory=list)
