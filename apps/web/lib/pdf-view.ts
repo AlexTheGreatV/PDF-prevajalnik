@@ -1,0 +1,59 @@
+import type { PageAnalysis, PdfAnalysis, PdfKind, TextBlock } from "./pdf-types";
+
+export const MAX_PDF_BYTES = 50 * 1024 * 1024;
+
+const kindLabels: Record<PdfKind, string> = {
+  digital: "digitalen",
+  scanned: "skeniran",
+  mixed: "mešan",
+  empty: "prazen",
+};
+
+export function formatPdfKind(kind: PdfKind): string {
+  return kindLabels[kind];
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function validatePdfFile(file: { name: string; size: number; type: string }): string | null {
+  const hasPdfName = file.name.toLowerCase().endsWith(".pdf");
+  const hasPdfType = file.type === "" || file.type === "application/pdf" || file.type === "application/x-pdf";
+
+  if (!hasPdfName || !hasPdfType) {
+    return "Izberi datoteko PDF.";
+  }
+
+  if (file.size > MAX_PDF_BYTES) {
+    return `PDF je prevelik. Največja dovoljena velikost je ${formatBytes(MAX_PDF_BYTES)}.`;
+  }
+
+  return null;
+}
+
+export function countTextBlocks(analysis: PdfAnalysis): number {
+  return analysis.pages.reduce((total, page) => total + page.text_blocks.length, 0);
+}
+
+export function countImages(analysis: PdfAnalysis): number {
+  return analysis.pages.reduce((total, page) => total + page.image_count, 0);
+}
+
+export function pageText(page: PageAnalysis): string {
+  return page.text_blocks.map((block) => block.text).join("\n\n");
+}
+
+export function blockOverlayStyle(block: TextBlock, page: PageAnalysis): Record<string, string> {
+  const width = page.dimensions.width || 1;
+  const height = page.dimensions.height || 1;
+
+  return {
+    left: `${(block.x0 / width) * 100}%`,
+    top: `${(block.y0 / height) * 100}%`,
+    width: `${((block.x1 - block.x0) / width) * 100}%`,
+    height: `${((block.y1 - block.y0) / height) * 100}%`,
+  };
+}
