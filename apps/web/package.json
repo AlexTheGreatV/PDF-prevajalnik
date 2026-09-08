@@ -2,18 +2,24 @@
   "name": "@jub-koop/pdf-translator-web",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.19.0",
   "scripts": {
+    "predev": "node scripts/prepare-ocr-runtime.mjs",
     "dev": "next dev",
+    "prebuild": "node scripts/prepare-ocr-runtime.mjs",
     "build": "next build",
     "start": "next start",
+    "prepare:ocr-runtime": "node scripts/prepare-ocr-runtime.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "tsc -p tsconfig.test.json && node ../../tmp/web-tests/tests/pdf-view.test.js"
   },
   "dependencies": {
+    "@tesseract.js-data/eng": "1.0.0",
     "next": "16.1.0",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "tesseract.js": "6.0.1"
   },
   "devDependencies": {
     "@types/node": "24.10.2",

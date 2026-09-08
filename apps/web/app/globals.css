@@ -535,6 +535,37 @@ pre {
   gap: 8px;
 }
 
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.actions button {
+  min-height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 700;
+  padding: 0 14px;
+}
+
+.actions button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: #f1fbf7;
+}
+
+.actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ocr-smoke-output {
+  max-height: 520px;
+}
+
 @media (max-width: 640px) {
   .app-shell {
     padding: 18px;

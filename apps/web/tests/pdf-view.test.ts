@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 
 import {
+  OCR_RUNTIME_PATHS,
+  checkBrowserOcrRuntime,
+  explainBrowserOcrError,
+  findExternalOcrRuntimeUrls,
+  getBrowserOcrRuntimePaths,
+} from "../lib/browser-ocr-provider";
+import {
   blockOverlayStyle,
   countImages,
   countTextBlocks,
@@ -50,9 +57,16 @@ const analysis: PdfAnalysis = {
   ],
 };
 
-function test(name: string, run: () => void) {
-  run();
-  console.log(`ok - ${name}`);
+const pendingTests: Promise<void>[] = [];
+
+function test(name: string, run: () => void | Promise<void>) {
+  pendingTests.push(
+    Promise.resolve()
+      .then(run)
+      .then(() => {
+        console.log(`ok - ${name}`);
+      }),
+  );
 }
 
 test("formats PDF kind labels in Slovene", () => {
@@ -151,4 +165,58 @@ test("summarizes structured document blocks", () => {
     width: "50%",
     height: "20%",
   });
+});
+
+test("uses local browser OCR runtime paths", () => {
+  const paths = getBrowserOcrRuntimePaths();
+  assert.equal(paths.workerPath, "/vendor/tesseract/worker.min.js");
+  assert.equal(paths.corePath, "/vendor/tesseract/tesseract-core.wasm.js");
+  assert.equal(paths.langPath, "/vendor/tesseract/lang");
+  assert.equal(paths.language, "eng");
+  assert.ok(!Object.values(paths).some((value) => /^https?:\/\//i.test(value)));
+});
+
+test("checks local OCR runtime availability", async () => {
+  const requestedUrls: string[] = [];
+  const fetcher = async (input: string | URL | Request) => {
+    const url = input instanceof Request ? input.url : String(input);
+    requestedUrls.push(url);
+    return new Response(null, { status: 200 });
+  };
+
+  const result = await checkBrowserOcrRuntime(fetcher);
+  assert.equal(result.ok, true);
+  assert.deepEqual(requestedUrls, [
+    OCR_RUNTIME_PATHS.workerPath,
+    OCR_RUNTIME_PATHS.corePath,
+    "/vendor/tesseract/tesseract-core.wasm",
+    `${OCR_RUNTIME_PATHS.langPath}/eng.traineddata.gz`,
+  ]);
+});
+
+test("reports missing local OCR runtime files clearly", async () => {
+  const fetcher = async (input: string | URL | Request) => {
+    const url = input instanceof Request ? input.url : String(input);
+    return new Response(null, { status: url.includes("eng.traineddata.gz") ? 404 : 200 });
+  };
+
+  const result = await checkBrowserOcrRuntime(fetcher);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.missing, ["/vendor/tesseract/lang/eng.traineddata.gz"]);
+  assert.match(explainBrowserOcrError(new Error("Failed to fetch")), /lokalne runtime datoteke/);
+});
+
+test("detects external OCR runtime requests", () => {
+  assert.deepEqual(
+    findExternalOcrRuntimeUrls([
+      "http://127.0.0.1:3000/vendor/tesseract/worker.min.js",
+      "https://cdn.jsdelivr.net/npm/tesseract.js/worker.min.js",
+    ]),
+    ["https://cdn.jsdelivr.net/npm/tesseract.js/worker.min.js"],
+  );
+});
+
+void Promise.all(pendingTests).catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
 });
