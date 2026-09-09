@@ -715,6 +715,179 @@ pre {
   padding: 0 8px;
 }
 
+.translation-workspace {
+  display: grid;
+  gap: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 20px;
+}
+
+.translation-header,
+.translation-subhead,
+.translation-actions,
+.translation-row-actions,
+.translation-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.translation-header h2,
+.translation-subhead h3,
+.translation-segment h3 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+.translation-header p,
+.translation-subhead p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.translation-header > div > span {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.translation-languages,
+.translation-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.translation-languages label,
+.translation-columns label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.translation-languages select,
+.translation-columns textarea,
+.glossary-row input {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+}
+
+.translation-languages select,
+.glossary-row input {
+  min-height: 38px;
+  padding: 0 9px;
+}
+
+.translation-columns textarea {
+  min-height: 128px;
+  padding: 10px;
+  resize: vertical;
+}
+
+.translation-columns pre {
+  min-height: 128px;
+}
+
+.translation-actions,
+.translation-row-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.translation-progress progress {
+  width: min(100%, 420px);
+  accent-color: var(--accent);
+}
+
+.translation-filters {
+  display: flex;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.translation-filters button {
+  border: 0;
+  border-bottom: 3px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 10px 14px;
+  white-space: nowrap;
+}
+
+.translation-filters button.active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+  font-weight: 700;
+}
+
+.translation-segments,
+.glossary-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.translation-segment {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px;
+}
+
+.translation-segment header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.translation-segment header span,
+.translation-skip,
+.glossary-matches {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.translation-reviewed {
+  border-color: #79b89d;
+  background: #f3fbf7;
+}
+
+.translation-failed,
+.translation-error {
+  color: var(--danger);
+}
+
+.translation-skipped {
+  background: #f7f8fa;
+}
+
+.glossary-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) repeat(3, auto) auto;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.glossary-row label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 @media (max-width: 640px) {
   .app-shell {
     padding: 18px;
@@ -753,5 +926,19 @@ pre {
   .diagnostic-toolbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .translation-header,
+  .translation-subhead,
+  .translation-progress,
+  .translation-segment header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .translation-languages,
+  .translation-columns,
+  .glossary-row {
+    grid-template-columns: 1fr;
   }
 }

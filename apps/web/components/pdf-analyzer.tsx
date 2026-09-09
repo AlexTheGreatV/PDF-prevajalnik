@@ -10,6 +10,7 @@ import {
 import { ManualRegionSelector, type SelectionBox } from "./manual-region-selector";
 import { useOcrQueue } from "./use-ocr-queue";
 import { OcrReviewList, reasonLabel } from "./ocr-review-list";
+import { TranslationWorkspace } from "./translation-workspace";
 import { recognizeBestVariant, cropImageToCanvas, ensureImageReady } from "../lib/ocr-canvas";
 import { analyzePdf, renderPdf } from "../lib/pdf-client";
 import type { PdfAnalysis, RenderResult, StructuredBlock } from "../lib/pdf-types";
@@ -376,6 +377,8 @@ export function PdfAnalyzer() {
           onReject={(id) => updateOcrItem(id, rejectOcrResult)}
         />
       )}
+
+      {analysis?.document && <TranslationWorkspace analysis={analysis} ocrItems={ocrItems} />}
 
       {analysis && (
         <>
