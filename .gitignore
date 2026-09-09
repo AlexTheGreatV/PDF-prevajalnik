@@ -18,6 +18,7 @@ apps/web/public/vendor/tesseract/
 apps/api/storage/
 tmp/
 local-fixtures/
+local-models/
 apps/api/tmp/
 apps/api/.coverage
 *.pyc

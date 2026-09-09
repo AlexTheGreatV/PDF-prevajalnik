@@ -15,6 +15,7 @@ import {
   validateTranslationJobCompatibility,
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationJob, TranslationSegment, TranslationStatus } from "../lib/translation-types";
+import { useLocalTranslation } from "./use-local-translation";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -29,7 +30,8 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
   const [glossary, setGlossary] = useState<GlossaryEntry[]>([]);
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
-  const [message, setMessage] = useState("Prevajalski ponudnik še ni konfiguriran.");
+  const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
+  const local = useLocalTranslation(job, setJob);
 
   const visibleSegments = useMemo(
     () => job?.segments.filter((segment) => filter === "all" || segment.status === filter) ?? [],
@@ -88,7 +90,7 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
     <section className="translation-workspace">
       <div className="translation-header">
         <div>
-          <span>Mejnik 6A</span>
+          <span>Mejnik 6B</span>
           <h2>Pregled prevodov</h2>
           <p>{message}</p>
         </div>
@@ -108,10 +110,15 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
 
       <GlossaryEditor entries={glossary} onChange={changeGlossary} onAdd={addGlossaryEntry} />
 
+      <div className={`translation-provider-status ${local.status?.available ? "available" : "unavailable"}`}>
+        <strong>{local.status?.available ? "Lokalni prevajalnik je pripravljen" : "Lokalni prevajalnik ni nameščen"}</strong>
+        <span>{local.statusError ?? local.status?.message ?? (local.status ? `${local.status.model_id} · ${local.status.device}/${local.status.compute_type}` : "Preverjam stanje lokalnega prevajalnika …")}</span>
+      </div>
+
       <div className="translation-actions">
         <button className="button" onClick={prepare}>{job ? "Znova pripravi prevod" : "Pripravi prevod"}</button>
-        <button className="button secondary" disabled title="Prevajalski ponudnik še ni konfiguriran.">Prevedi čakajoče</button>
-        <button className="button secondary" disabled>Prekliči</button>
+        <button className="button secondary" disabled={!job || !local.status?.available || local.running} onClick={() => void local.translate()}>Prevedi čakajoče</button>
+        <button className="button secondary" disabled={!local.running} onClick={local.cancel}>Prekliči</button>
         <button className="button secondary" disabled={!job} onClick={exportJob}>Izvozi JSON</button>
         <button className="button secondary" onClick={() => importRef.current?.click()}>Uvozi JSON</button>
         <input ref={importRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => void importJob(event.target.files?.[0] ?? null)} />
@@ -119,6 +126,8 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
 
       {job && (
         <>
+          {local.message && <p className="translation-provider-message">{local.message}</p>}
+          {local.running && <div className="translation-progress"><span>{local.progress.completed} od {local.progress.total} segmentov</span><progress value={local.progress.completed} max={local.progress.total || 1} /></div>}
           <div className="translation-progress">
             <span>{completed} od {actionable} prevodov potrjenih</span>
             <progress value={completed} max={actionable || 1} />

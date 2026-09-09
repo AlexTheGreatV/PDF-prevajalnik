@@ -1,0 +1,4 @@
+-r requirements-translation.txt
+huggingface-hub==0.36.2
+transformers==4.57.6
+torch==2.14.0

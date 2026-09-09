@@ -26,6 +26,8 @@ No external AI services are called in this milestone. Documents stay local.
 - Render pages to PNG images through Poppler
 - Run backend tests using generated local fixture PDFs
 - Use a Slovenian web UI for drag-and-drop PDF analysis and page previews
+- Prepare and review structured translation segments without changing source text
+- Optionally translate English segments to Slovenian with a local OPUS-MT/CTranslate2 model
 
 ## Local Backend Setup
 
@@ -53,6 +55,38 @@ Run the API directly:
 $env:PYTHONPATH='apps/api'
 python -m uvicorn app.main:app --app-dir apps/api --reload --port 8000
 ```
+
+### Optional local translation
+
+The base PDF API does not require the translation runtime. Install the optional runtime in the project virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r apps/api/requirements-translation.txt
+```
+
+Preparing a model additionally requires the heavier conversion dependencies:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r apps/api/requirements-translation-prep.txt
+.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --download
+```
+
+The preparation command downloads the pinned official `Helsinki-NLP/opus-mt-en-sla` revision only when explicitly invoked, converts it to CTranslate2 INT8, and writes hashes to a local manifest. It never runs during API startup, tests, or frontend builds. The model is stored under ignored `local-models/`; use `--source-dir` instead of `--download` when an approved snapshot was transferred separately. Existing output is not replaced unless `--force` is explicitly passed.
+
+Runtime configuration:
+
+```text
+LOCAL_TRANSLATION_MODEL_PATH=local-models/opus-mt-en-sla-ct2-int8
+LOCAL_TRANSLATION_DEVICE=cpu
+LOCAL_TRANSLATION_COMPUTE_TYPE=int8
+```
+
+Local translation endpoints:
+
+- `GET /api/translation/providers/local/status`
+- `POST /api/translation/providers/local/translate`
+
+The prototype supports English to Slovenian only. Documents and translations are not sent to an external translation service, and translated segments always require manual review.
 
 ## Local Frontend Setup
 
@@ -95,6 +129,8 @@ Services:
 - `GET /health`
 - `POST /api/pdf/analyze`
 - `POST /api/pdf/render`
+- `GET /api/translation/providers/local/status`
+- `POST /api/translation/providers/local/translate`
 
 Both PDF endpoints accept multipart form data with a `file` field. Render also accepts an optional `dpi` field.
 
@@ -121,6 +157,8 @@ infra/
 - No public registration
 - No external AI calls
 - No document uploads to third-party services
-- No translation workflow until the PDF pipeline is verified
+- No external translation APIs without explicit approval
+- No automatic model downloads during startup, tests, or builds
+- Local models and generated translation results stay outside Git
 - Uploaded PDFs and rendered previews are processed through request-scoped temporary directories and cleaned after each request
 - API rejects non-PDF uploads and files above the configured size limit

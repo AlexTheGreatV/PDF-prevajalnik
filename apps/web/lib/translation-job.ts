@@ -144,13 +144,18 @@ export function protectForTranslation(text: string, glossary: GlossaryEntry[]) {
   const technical = protectTechnicalTokens(text);
   const tokens = [...technical.tokens];
   let protected_text = technical.protected_text;
-  for (const entry of glossary.filter((item) => item.do_not_translate && item.source_term.trim())) {
+  for (const entry of glossary.filter((item) => item.source_term.trim() && (item.do_not_translate || item.target_term.trim()))) {
     const flags = entry.case_sensitive ? "gu" : "giu";
     const escaped = entry.source_term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(entry.exact_match ? `(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])` : escaped, flags);
     protected_text = protected_text.replace(pattern, (value) => {
-      const placeholder = `__GLOSSARY_${String(tokens.length).padStart(3, "0")}__`;
-      tokens.push({ placeholder, value, kind: "glossary" });
+      const placeholder = `GLS${String(tokens.length).padStart(3, "0")}GLS`;
+      tokens.push({
+        placeholder,
+        value,
+        replacement_value: entry.do_not_translate ? value : entry.target_term,
+        kind: "glossary",
+      });
       return placeholder;
     });
   }
@@ -165,9 +170,9 @@ export function restoreProtectedTokens(text: string, tokens: ProtectedToken[]): 
     if (restored.split(token.placeholder).length !== 2) {
       throw new Error("Prevod vsebuje manjkajoč ali poškodovan slovarski placeholder.");
     }
-    restored = restored.replace(token.placeholder, token.value);
+    restored = restored.replace(token.placeholder, token.replacement_value ?? token.value);
   }
-  if (/__(?:TECH|GLOSSARY)_\d{3}__/.test(restored)) throw new Error("Prevod vsebuje neobnovljen placeholder.");
+  if (/(?:TK\d{3}TK|GLS\d{3}GLS)/.test(restored)) throw new Error("Prevod vsebuje neobnovljen placeholder.");
   return restored;
 }
 
@@ -204,6 +209,7 @@ export async function translateJobBatch(
   job: TranslationJob,
   provider: TranslationProvider,
   signal?: AbortSignal,
+  onProgress?: (completed: number, total: number) => void,
 ): Promise<TranslationJob> {
   const selected = job.segments.filter((segment) => ["pending", "failed"].includes(segment.status) && !segment.skip_reason);
   if (signal?.aborted) return job;
@@ -225,6 +231,7 @@ export async function translateJobBatch(
       source_language: job.source_language,
       target_language: job.target_language,
       signal,
+      onProgress,
     });
   } catch (error) {
     if (signal?.aborted) return job;

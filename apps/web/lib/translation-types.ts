@@ -6,6 +6,7 @@ export type TranslationSourceOrigin = "native" | "accepted_ocr";
 export type ProtectedToken = {
   placeholder: string;
   value: string;
+  replacement_value?: string;
   kind: "url" | "email" | "measurement" | "number" | "product_code" | "technical_term" | "glossary";
 };
 
@@ -80,6 +81,11 @@ export interface TranslationProvider {
   readonly id: string;
   translateBatch(
     requests: TranslationRequest[],
-    options: { source_language: string; target_language: string; signal?: AbortSignal },
+    options: {
+      source_language: string;
+      target_language: string;
+      signal?: AbortSignal;
+      onProgress?: (completed: number, total: number) => void;
+    },
   ): Promise<TranslationProviderResult[]>;
 }

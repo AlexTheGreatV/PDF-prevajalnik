@@ -11,6 +11,7 @@ import {
   importTranslationJob,
   protectForTranslation,
   resetTranslation,
+  restoreProtectedTokens,
   retryFailedTranslation,
   reviewTranslation,
   translateJobBatch,
@@ -96,15 +97,17 @@ test("protects and restores technical values exactly", () => {
     assert.ok(protectedValue.tokens.some((token) => token.value === value), `Missing protected token: ${value}`);
   }
   assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), source);
-  assert.throws(() => restoreTechnicalTokens(protectedValue.protected_text.replace("__TECH_000__", "broken"), protectedValue.tokens), /placeholder/);
-  assert.throws(() => restoreTechnicalTokens(`${protectedValue.protected_text} __TECH_000__`, protectedValue.tokens), /placeholder/);
+  assert.throws(() => restoreTechnicalTokens(protectedValue.protected_text.replace("TK000TK", "broken"), protectedValue.tokens), /placeholder/);
+  assert.throws(() => restoreTechnicalTokens(`${protectedValue.protected_text} TK000TK`, protectedValue.tokens), /placeholder/);
 });
 
-test("finds glossary rules and protects do-not-translate terms", () => {
+test("finds glossary rules and restores target and do-not-translate terms", () => {
   const glossary: GlossaryEntry[] = [{ id: "g1", source_term: "Panel Bond", target_term: "lepilo za panele", case_sensitive: true, exact_match: true, do_not_translate: false }, { id: "g2", source_term: "Zettex", target_term: "", case_sensitive: false, exact_match: true, do_not_translate: true }];
   assert.equal(findGlossaryMatches("Zettex Panel Bond", glossary).length, 2);
   const protectedValue = protectForTranslation("Zettex Panel Bond", glossary);
-  assert.match(protectedValue.protected_text, /__GLOSSARY_/);
+  assert.equal(protectedValue.tokens.filter((token) => token.kind === "glossary").length, 2);
+  assert.equal(restoreProtectedTokens(protectedValue.protected_text, protectedValue.tokens), "Zettex lepilo za panele");
+  assert.equal(protectedValue.tokens.find((token) => token.value === "Panel Bond")?.value, "Panel Bond");
 });
 
 test("manual edit, review and reset never change source text", () => {

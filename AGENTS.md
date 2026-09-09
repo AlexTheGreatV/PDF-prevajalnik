@@ -6,15 +6,22 @@ Build an internal document translation application for JUB/KOOP, starting with a
 
 ## Current Milestone
 
-Focus only on PDF intake, analysis, extraction, rendering, and test coverage.
+Build provider-independent translation workflows and a local OPUS-MT/CTranslate2 prototype behind local FastAPI endpoints.
 
-Do not add:
+Allowed:
 
-- Payments
-- Public registration
-- External AI service calls
-- Remote document uploads
-- Translation logic
+- Provider-independent translation logic
+- Local OPUS-MT/CTranslate2 inference
+- Local FastAPI translation endpoints
+
+Guardrails:
+
+- Do not call external translation APIs without explicit user approval.
+- Never download models during app startup, tests, or builds.
+- Keep models, test-document translations, and temporary results out of Git.
+- Preserve `native_text`, OCR results, and the source document model.
+- Do not hardcode translations or silently repair damaged placeholders.
+- Do not add payments, public registration, or remote document uploads.
 
 ## Architecture
 
@@ -40,4 +47,3 @@ Do not add:
 python -m pip install -r apps/api/requirements-dev.txt
 pytest apps/api/tests
 ```
-

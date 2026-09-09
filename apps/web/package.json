@@ -12,7 +12,7 @@
     "prepare:ocr-runtime": "node scripts/prepare-ocr-runtime.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "tsc -p tsconfig.test.json && node ../../tmp/web-tests/tests/pdf-view.test.js && node ../../tmp/web-tests/tests/ocr-review.test.js && node ../../tmp/web-tests/tests/translation-job.test.js"
+    "test": "tsc -p tsconfig.test.json && node ../../tmp/web-tests/tests/pdf-view.test.js && node ../../tmp/web-tests/tests/ocr-review.test.js && node ../../tmp/web-tests/tests/translation-job.test.js && node ../../tmp/web-tests/tests/local-translation-provider.test.js"
   },
   "dependencies": {
     "@tesseract.js-data/eng": "1.0.0",

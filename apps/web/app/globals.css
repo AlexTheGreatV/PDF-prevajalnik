@@ -808,6 +808,25 @@ pre {
   accent-color: var(--accent);
 }
 
+.translation-provider-status {
+  display: grid;
+  gap: 3px;
+  border-left: 4px solid var(--danger);
+  background: #fff5f5;
+  padding: 10px 12px;
+}
+
+.translation-provider-status.available {
+  border-left-color: #2f855a;
+  background: #f3fbf7;
+}
+
+.translation-provider-status span,
+.translation-provider-message {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .translation-filters {
   display: flex;
   overflow-x: auto;

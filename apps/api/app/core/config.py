@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     processing_tmp_dir: Path = Path(tempfile.gettempdir()) / "jub-koop-pdf-pipeline"
     max_upload_bytes: int = 50 * 1024 * 1024
     poppler_pdftoppm: str = "pdftoppm"
+    local_translation_model_path: Path = Path("local-models/opus-mt-en-sla-ct2-int8")
+    local_translation_device: str = "cpu"
+    local_translation_compute_type: str = "int8"
 
     @field_validator("cors_origins", mode="before")
     @classmethod
