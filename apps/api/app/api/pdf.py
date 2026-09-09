@@ -28,9 +28,11 @@ async def analyze(file: UploadFile = File(...)) -> PdfAnalysis:
 
 
 @router.post("/render", response_model=RenderResult)
-async def render(file: UploadFile = File(...), dpi: int = Form(150)) -> RenderResult:
-    if dpi < 36 or dpi > 300:
-        raise HTTPException(status_code=400, detail="DPI mora biti med 36 in 300.")
+async def render(
+    file: UploadFile = File(...),
+    dpi: int = Form(150, ge=72, le=400),
+    page_number: int | None = Form(None, ge=1),
+) -> RenderResult:
 
     with _processing_tempdir() as temp_dir:
         temp_path = Path(temp_dir)
@@ -42,6 +44,7 @@ async def render(file: UploadFile = File(...), dpi: int = Form(150)) -> RenderRe
                 filename=file.filename,
                 dpi=dpi,
                 pdftoppm_bin=settings.poppler_pdftoppm,
+                page_number=page_number,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail="PDF strani ni bilo mogoce renderirati.") from exc

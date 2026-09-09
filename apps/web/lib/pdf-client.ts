@@ -11,10 +11,11 @@ export async function analyzePdf(file: File): Promise<PdfAnalysis> {
   return parseApiResponse<PdfAnalysis>(response);
 }
 
-export async function renderPdf(file: File): Promise<RenderResult> {
+export async function renderPdf(file: File, options: { dpi?: number; page_number?: number } = {}): Promise<RenderResult> {
   const form = new FormData();
   form.append("file", file);
-  form.append("dpi", "110");
+  form.append("dpi", String(options.dpi ?? 110));
+  if (options.page_number !== undefined) form.append("page_number", String(options.page_number));
 
   const response = await fetchApi(`${apiBaseUrl}/api/pdf/render`, form);
 

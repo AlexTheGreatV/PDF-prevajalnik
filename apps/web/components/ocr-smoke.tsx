@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   BrowserOcrProvider,
@@ -8,6 +8,7 @@ import {
   explainBrowserOcrError,
   findExternalOcrRuntimeUrls,
   type BrowserOcrResult,
+  type BrowserOcrSegmentationMode,
 } from "../lib/browser-ocr-provider";
 
 type SmokeState =
@@ -40,12 +41,26 @@ function createApplicationsCanvas(): HTMLCanvasElement {
   return canvas;
 }
 
+function dataUrlToImage(dataUrl: string): Promise<HTMLImageElement> {
+  if (!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) return Promise.reject(new Error("Dovoljen je samo lokalni PNG data URL."));
+  return new Promise((resolve, reject) => {
+    const image = new window.Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Diagnostične OCR slike ni bilo mogoče naložiti."));
+    image.src = dataUrl;
+  });
+}
+
 export function OcrSmoke() {
   const [state, setState] = useState<SmokeState>({
     kind: "idle",
     message: "OCR je pripravljen za lokalni preizkus.",
   });
+  const [diagnosticDataUrl, setDiagnosticDataUrl] = useState("");
+  const [diagnosticMode, setDiagnosticMode] = useState<BrowserOcrSegmentationMode>("single_line");
   const provider = useMemo(() => new BrowserOcrProvider(), []);
+
+  useEffect(() => () => { void provider.terminate(); }, [provider]);
 
   async function runSmokeTest() {
     setState({ kind: "running", message: "Preverjam lokalne OCR datoteke ..." });
@@ -99,6 +114,39 @@ export function OcrSmoke() {
     setState({ kind: "idle", message: "OCR worker je zaprt." });
   }
 
+  async function runDiagnosticDataUrl() {
+    setState({ kind: "running", message: "Berem diagnostični PNG izrez ..." });
+    try {
+      const before = performance.getEntriesByType("resource").map((entry) => entry.name);
+      const image = await dataUrlToImage(diagnosticDataUrl);
+      const result = await provider.recognize({
+        image,
+        pixel_bbox: { x0: 0, y0: 0, x1: image.naturalWidth, y1: image.naturalHeight },
+        pdf_bbox: null,
+        reason: "diagnostic_data_url",
+        preprocessing_method: "diagnostic-data-url",
+        segmentation_mode: diagnosticMode,
+      });
+      const after = performance.getEntriesByType("resource").map((entry) => entry.name);
+      const observedUrls = after.filter((entry) => !before.includes(entry));
+      setState({
+        kind: "success",
+        message: "OCR je prebral diagnostični izrez.",
+        result,
+        runtimeUrls: [
+          "/vendor/tesseract/worker.min.js",
+          "/vendor/tesseract/tesseract-core.wasm.js",
+          "/vendor/tesseract/tesseract-core.wasm",
+          "/vendor/tesseract/lang/eng.traineddata.gz",
+        ],
+        observedUrls,
+        externalUrls: findExternalOcrRuntimeUrls(observedUrls),
+      });
+    } catch (error) {
+      setState({ kind: "error", message: explainBrowserOcrError(error) });
+    }
+  }
+
   return (
     <main className="app-shell">
       <section className="workspace">
@@ -114,6 +162,30 @@ export function OcrSmoke() {
             </button>
             <button type="button" onClick={stopWorker}>
               Zapri worker
+            </button>
+          </div>
+          <div className="ocr-smoke-diagnostic">
+            <label>
+              Diagnostični data URL
+              <textarea
+                value={diagnosticDataUrl}
+                onChange={(event) => setDiagnosticDataUrl(event.target.value)}
+                placeholder="data:image/png;base64,..."
+              />
+            </label>
+            <label>
+              Segmentacija
+              <select
+                value={diagnosticMode}
+                onChange={(event) => setDiagnosticMode(event.target.value as BrowserOcrSegmentationMode)}
+              >
+                <option value="single_line">ena vrstica</option>
+                <option value="single_block">blok besedila</option>
+                <option value="sparse_text">redko besedilo</option>
+              </select>
+            </label>
+            <button type="button" onClick={runDiagnosticDataUrl} disabled={state.kind === "running" || !diagnosticDataUrl}>
+              Preberi diagnostični izrez
             </button>
           </div>
           {state.kind === "success" || state.kind === "error" ? (

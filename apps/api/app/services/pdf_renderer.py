@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 
 from PIL import Image
+import pymupdf
 
 from app.models import RenderedPage, RenderResult
 
@@ -14,7 +15,16 @@ def render_pdf_pages(
     filename: str | None = None,
     dpi: int = 150,
     pdftoppm_bin: str = "pdftoppm",
+    page_number: int | None = None,
 ) -> RenderResult:
+    if not 72 <= dpi <= 400:
+        raise ValueError("DPI must be between 72 and 400.")
+    with pymupdf.open(path) as document:
+        if page_number is not None and not 1 <= page_number <= document.page_count:
+            raise ValueError("Requested page does not exist.")
+        selected_pages = [document[page_number - 1]] if page_number else list(document)
+        if any(page.rect.width * page.rect.height * (dpi / 72) ** 2 > 40_000_000 for page in selected_pages):
+            raise ValueError("Rendered page exceeds the pixel limit.")
     render_id = uuid.uuid4().hex
     output_dir = output_root / render_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -26,6 +36,7 @@ def render_pdf_pages(
             "-png",
             "-r",
             str(dpi),
+            *(["-f", str(page_number), "-l", str(page_number)] if page_number else []),
             str(path),
             str(output_prefix),
         ],
@@ -60,6 +71,7 @@ def render_pdf_pages_as_data_urls(
     filename: str | None = None,
     dpi: int = 150,
     pdftoppm_bin: str = "pdftoppm",
+    page_number: int | None = None,
 ) -> RenderResult:
     result = render_pdf_pages(
         path=path,
@@ -67,6 +79,7 @@ def render_pdf_pages_as_data_urls(
         filename=filename,
         dpi=dpi,
         pdftoppm_bin=pdftoppm_bin,
+        page_number=page_number,
     )
 
     embedded_pages: list[RenderedPage] = []

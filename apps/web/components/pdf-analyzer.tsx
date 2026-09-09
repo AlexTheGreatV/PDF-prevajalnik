@@ -3,8 +3,29 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 
-import { analyzePdf, getOcrStatus, ocrPdf, renderPdf } from "../lib/pdf-client";
-import type { OcrResponse, OcrStatus, PdfAnalysis, RenderResult, StructuredBlock } from "../lib/pdf-types";
+import {
+  checkBrowserOcrRuntime,
+  explainBrowserOcrError,
+} from "../lib/browser-ocr-provider";
+import { ManualRegionSelector, type SelectionBox } from "./manual-region-selector";
+import { useOcrQueue } from "./use-ocr-queue";
+import { OcrReviewList, reasonLabel } from "./ocr-review-list";
+import { recognizeBestVariant, cropImageToCanvas, ensureImageReady } from "../lib/ocr-canvas";
+import { analyzePdf, renderPdf } from "../lib/pdf-client";
+import type { PdfAnalysis, RenderResult, StructuredBlock } from "../lib/pdf-types";
+import {
+  acceptOcrResult,
+  applyOcrSuggestion,
+  createManualOcrItem,
+  createOcrReviewItems,
+  displaySelectionToPdfBBox,
+  markOcrProcessing,
+  normalizeBBox,
+  pdfBBoxToPixelBBox,
+  relativeOcrPadding,
+  rejectOcrResult,
+  type OcrReviewItem,
+} from "../lib/ocr-review";
 import {
   blockOverlayStyle,
   countImages,
@@ -19,9 +40,12 @@ import {
 } from "../lib/pdf-view";
 
 type ProcessingState = "idle" | "ready" | "analyzing" | "done" | "error";
+type OcrAvailability = "checking" | "ready" | "unavailable";
+const MIN_SELECTION_SIZE = 3;
 
 export function PdfAnalyzer() {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const imageRefs = useRef<Record<number, HTMLImageElement | null>>({});
   const [file, setFile] = useState<File | null>(null);
   const [analysis, setAnalysis] = useState<PdfAnalysis | null>(null);
   const [renderResult, setRenderResult] = useState<RenderResult | null>(null);
@@ -31,44 +55,66 @@ export function PdfAnalyzer() {
   const [visibleBlocks, setVisibleBlocks] = useState<Record<number, boolean>>({});
   const [textMode, setTextMode] = useState<"original" | "normalized">("normalized");
   const [selectedBlockKey, setSelectedBlockKey] = useState<string | null>(null);
-  const [ocrStatus, setOcrStatus] = useState<OcrStatus | null>(null);
-  const [ocrResult, setOcrResult] = useState<OcrResponse | null>(null);
-  const [isOcrRunning, setIsOcrRunning] = useState(false);
+  const [ocrAvailability, setOcrAvailability] = useState<OcrAvailability>("checking");
+  const [ocrAvailabilityMessage, setOcrAvailabilityMessage] = useState("Preverjam lokalne OCR datoteke.");
+  const [ocrItems, setOcrItems] = useState<OcrReviewItem[]>([]);
+  const queue = useOcrQueue();
+  const { isRunning: isOcrRunning, progress: ocrProgress, externalUrls: ocrNetworkReport, setProgress: setOcrProgress, setExternalUrls: setOcrNetworkReport } = queue;
   const [ocrError, setOcrError] = useState<string | null>(null);
+  const [manualMode, setManualMode] = useState(false);
+  const [pendingSelection, setPendingSelection] = useState<SelectionBox | null>(null);
+  const [preparedSelection, setPreparedSelection] = useState<{
+    item: OcrReviewItem; image: HTMLImageElement; crop: string; width: number; height: number;
+  } | null>(null);
+  const [preparingSelection, setPreparingSelection] = useState(false);
+  const selectionGeneration = useRef(0);
 
   const selectedFileError = file ? validatePdfFile(file) : null;
   const totalBlocks = analysis ? countTextBlocks(analysis) : 0;
   const totalImages = analysis ? countImages(analysis) : 0;
+  const pendingOcrCount = ocrItems.filter((item) => item.status === "pending").length;
 
   useEffect(() => {
-    getOcrStatus()
-      .then(setOcrStatus)
-      .catch(() =>
-        setOcrStatus({
-          available: false,
-          provider: "unknown",
-          executable: null,
-          version: null,
-          languages: [],
-          tessdata_prefix: null,
-          pymupdf_ocr_available: false,
-          message: "Stanja lokalnega OCR ni bilo mogoče preveriti.",
-        }),
-      );
+    checkBrowserOcrRuntime()
+      .then((result) => {
+        if (result.ok) {
+          setOcrAvailability("ready");
+          setOcrAvailabilityMessage("OCR je pripravljen.");
+          return;
+        }
+        setOcrAvailability("unavailable");
+        setOcrAvailabilityMessage(`OCR ni na voljo. Manjka: ${result.missing.join(", ")}`);
+      })
+      .catch((caught) => {
+        setOcrAvailability("unavailable");
+        setOcrAvailabilityMessage(explainBrowserOcrError(caught));
+      });
+
   }, []);
 
   const renderPagesByNumber = useMemo(() => {
     return new Map(renderResult?.pages.map((page) => [page.page_number, page]) ?? []);
   }, [renderResult]);
 
+  const structuredPagesByNumber = useMemo(() => {
+    return new Map(analysis?.document?.pages.map((page) => [page.page_number, page]) ?? []);
+  }, [analysis]);
+
   function chooseFile(nextFile: File | null) {
+    queue.cancel();
+    selectionGeneration.current += 1;
+    setPreparedSelection(null);
     setFile(nextFile);
     setAnalysis(null);
     setRenderResult(null);
     setVisibleBlocks({});
     setSelectedBlockKey(null);
-    setOcrResult(null);
+    setOcrItems([]);
     setOcrError(null);
+    setOcrProgress({ done: 0, total: 0 });
+    setOcrNetworkReport([]);
+    setManualMode(false);
+    setPendingSelection(null);
     setError(nextFile ? validatePdfFile(nextFile) : null);
     setState(nextFile ? "ready" : "idle");
   }
@@ -88,8 +134,10 @@ export function PdfAnalyzer() {
     setAnalysis(null);
     setRenderResult(null);
     setSelectedBlockKey(null);
-    setOcrResult(null);
+    setOcrItems([]);
     setOcrError(null);
+    setOcrProgress({ done: 0, total: 0 });
+    setOcrNetworkReport([]);
 
     try {
       const [analysisPayload, renderPayload] = await Promise.all([
@@ -98,6 +146,7 @@ export function PdfAnalyzer() {
       ]);
       setAnalysis(analysisPayload);
       setRenderResult(renderPayload);
+      setOcrItems(createOcrReviewItems(analysisPayload));
       setState("done");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Analiza ni uspela.");
@@ -105,18 +154,83 @@ export function PdfAnalyzer() {
     }
   }
 
-  async function runOcr() {
-    if (!file) return;
-    setIsOcrRunning(true);
+  async function runOcrReview(targetItems?: OcrReviewItem[], preparedImage?: HTMLImageElement) {
+    if (!analysis || !renderResult) return;
     setOcrError(null);
-    try {
-      setOcrResult(await ocrPdf(file));
-      setOcrStatus((await getOcrStatus()));
-    } catch (caught) {
-      setOcrError(caught instanceof Error ? caught.message : "OCR preverjanje ni uspelo.");
-    } finally {
-      setIsOcrRunning(false);
+    await queue.run(
+      targetItems ?? ocrItems.filter((item) => item.status === "pending"),
+      async (item, provider, signal) => {
+        const page = structuredPagesByNumber.get(item.page_number);
+        if (!page) throw new Error("Stran za OCR ni več na voljo.");
+        const image = preparedImage ?? await loadOcrPage(item.page_number);
+        signal.throwIfAborted();
+        const base = pdfBBoxToPixelBBox(item.pdf_bbox, page, image, 0);
+        const padding = item.source === "manual" ? 4 : relativeOcrPadding(base);
+        const pixels = pdfBBoxToPixelBBox(item.pdf_bbox, page, image, padding);
+        updateOcrItem(item.id, () => markOcrProcessing(item, pixels));
+        const result = await recognizeBestVariant(provider, image, item, pixels, page, padding, signal);
+        return applyOcrSuggestion(item, result.best, result.attempts, result.cropImageUrl, result.cropDebug);
+      },
+      (item) => updateOcrItem(item.id, () => item),
+    );
+  }
+
+  function cancelOcrReview() { queue.cancel(); }
+
+  async function loadOcrPage(pageNumber: number): Promise<HTMLImageElement> {
+    if (!file) throw new Error("Izvorni PDF ni več na voljo.");
+    const rendered = await renderPdf(file, { dpi: 300, page_number: pageNumber });
+    const source = rendered.pages.find((page) => page.page_number === pageNumber);
+    if (!source) throw new Error("Zahtevana OCR stran ni na voljo.");
+    const image = new window.Image();
+    image.src = source.path;
+    await ensureImageReady(image);
+    return image;
+  }
+
+  async function runManualOcr() {
+    if (preparedSelection) {
+      const prepared = preparedSelection;
+      setPreparedSelection(null);
+      setPendingSelection(null);
+      setOcrItems((current) => [...current, prepared.item]);
+      await runOcrReview([prepared.item], prepared.image);
+      return;
     }
+    if (!analysis || !pendingSelection) return;
+    const page = structuredPagesByNumber.get(pendingSelection.page_number);
+    const image = imageRefs.current[pendingSelection.page_number];
+    if (!page || !image) return;
+    const selection = normalizeBBox(pendingSelection);
+    if (selection.x1 - selection.x0 < MIN_SELECTION_SIZE || selection.y1 - selection.y0 < MIN_SELECTION_SIZE) {
+      setOcrError("Izbrano območje je premajhno za OCR.");
+      return;
+    }
+    const rect = image.getBoundingClientRect();
+    const pdfBox = displaySelectionToPdfBBox(
+      selection,
+      { width: page.width, height: page.height },
+      { naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight, displayWidth: rect.width, displayHeight: rect.height },
+    );
+    const item = createManualOcrItem(page, pdfBox);
+    const generation = ++selectionGeneration.current;
+    setPreparingSelection(true);
+    try {
+      const highResolutionImage = await loadOcrPage(page.page_number);
+      const pixels = pdfBBoxToPixelBBox(pdfBox, page, highResolutionImage, 4);
+      const canvas = cropImageToCanvas(highResolutionImage, pixels, "original");
+      if (generation === selectionGeneration.current) {
+        setPreparedSelection({ item, image: highResolutionImage, crop: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height });
+      }
+    } catch (caught) {
+      setOcrError(explainBrowserOcrError(caught));
+    } finally {
+      setPreparingSelection(false);
+    }
+  }
+
+  function updateOcrItem(id: string, update: (item: OcrReviewItem) => OcrReviewItem) {
+    setOcrItems((current) => current.map((item) => (item.id === id ? update(item) : item)));
   }
 
   return (
@@ -181,17 +295,87 @@ export function PdfAnalyzer() {
 
       <section className="panel ocr-panel">
         <div>
-          <span>Lokalni OCR</span>
-          <strong>{ocrStatus?.available ? "OCR na voljo" : "Lokalni OCR ni na voljo"}</strong>
-          <small>{ocrStatus?.message ?? ocrStatus?.version ?? "Tesseract status se preverja."}</small>
+          <span>Lokalni browser OCR</span>
+          <strong>
+            {ocrAvailability === "ready"
+              ? "OCR je pripravljen"
+              : ocrAvailability === "checking"
+                ? "Preverjam OCR"
+                : "OCR ni na voljo"}
+          </strong>
+          <small>{ocrAvailabilityMessage}</small>
+          {ocrItems.length > 0 && (
+            <small>
+              {ocrItems.length} kandidatov · {pendingOcrCount} čakajočih
+            </small>
+          )}
         </div>
-        <button className="button secondary" disabled={!file || !analysis || isOcrRunning} onClick={runOcr}>
-          {isOcrRunning ? "Preverjam OCR..." : "OCR-preveri sumljive dele"}
-        </button>
+        <div className="actions">
+          <button
+            className="button secondary"
+            disabled={
+              !analysis ||
+              !renderResult ||
+              isOcrRunning ||
+              pendingOcrCount === 0 ||
+              ocrAvailability !== "ready"
+            }
+            onClick={() => void runOcrReview()}
+          >
+            {isOcrRunning ? "Preverjam sumljiva območja ..." : "OCR-preveri sumljive dele"}
+          </button>
+          {isOcrRunning && (
+            <button className="button secondary" onClick={cancelOcrReview}>
+              Prekliči OCR
+            </button>
+          )}
+          <button
+            className={`button secondary${manualMode ? " active" : ""}`}
+            disabled={!analysis || !renderResult || isOcrRunning || ocrAvailability !== "ready"}
+            onClick={() => setManualMode((current) => !current)}
+          >
+            Izberi območje za OCR
+          </button>
+        </div>
+        {isOcrRunning && <progress value={ocrProgress.done} max={ocrProgress.total || 1} />}
+        {manualMode && <small>Povlecite pravokotnik po predogledu strani in potrdite OCR območje.</small>}
+        {pendingSelection && (
+          <div className="actions">
+            <button className="button" disabled={preparingSelection || isOcrRunning} onClick={() => void runManualOcr()}>
+              {preparingSelection ? "Pripravljam izrez ..." : preparedSelection ? "Zaženi OCR izreza" : "Prikaži izrez pri 300 DPI"}
+            </button>
+            <button className="button secondary" onClick={() => { selectionGeneration.current += 1; setPendingSelection(null); setPreparedSelection(null); }}>
+              Ponovi izbor
+            </button>
+          </div>
+        )}
+        {preparedSelection && (
+          <div className="ocr-crop">
+            <label>
+              Razporeditev besedila
+              <select value={preparedSelection.item.segmentation_mode ?? "sparse_text"} onChange={(event) => setPreparedSelection({ ...preparedSelection, item: { ...preparedSelection.item, segmentation_mode: event.target.value as "single_line" | "single_block" | "sparse_text" } })}>
+                <option value="sparse_text">Redko besedilo</option>
+                <option value="single_line">Ena vrstica</option>
+                <option value="single_block">Blok besedila</option>
+              </select>
+            </label>
+            <Image src={preparedSelection.crop} alt="Izbrani izrez pred OCR" width={preparedSelection.width} height={preparedSelection.height} unoptimized />
+            <a href={preparedSelection.crop} download="ocr-selection.png">Prenesi izbrani izrez</a>
+          </div>
+        )}
       </section>
 
       {ocrError && <div className="error-box">{ocrError}</div>}
-      {ocrResult && <OcrCandidates result={ocrResult} />}
+      {ocrNetworkReport.length > 0 && (
+        <div className="error-box">OCR je zaznal zunanje zahteve: {ocrNetworkReport.join(", ")}</div>
+      )}
+      {ocrItems.length > 0 && (
+        <OcrReviewList
+          items={ocrItems}
+          onAccept={(id) => updateOcrItem(id, acceptOcrResult)}
+          onReject={(id) => updateOcrItem(id, rejectOcrResult)}
+        />
+      )}
 
       {analysis && (
         <>
@@ -221,6 +405,7 @@ export function PdfAnalyzer() {
                       (block) => `${page.page_number}-${block.reading_order}` === selectedBlockKey,
                     )
                   : null;
+              const pageOcrItems = ocrItems.filter((item) => item.page_number === page.page_number);
 
               return (
                 <article className="page-detail" key={page.page_number}>
@@ -274,12 +459,30 @@ export function PdfAnalyzer() {
                   {preview && (
                     <div className="preview-wrap">
                       <Image
+                        ref={(node) => {
+                          imageRefs.current[page.page_number] = node;
+                        }}
                         src={preview.path}
                         alt={`Predogled strani ${page.page_number}`}
                         width={preview.width_px ?? 850}
                         height={preview.height_px ?? 1100}
                         unoptimized
                       />
+                      {structuredPage && pageOcrItems.length > 0 && (
+                        <div className="ocr-overlay-layer">
+                          {pageOcrItems.map((item) => (
+                            <span
+                              key={item.id}
+                              className={`ocr-overlay ocr-${item.status}`}
+                              style={structuredBlockOverlayStyle(
+                                { bbox: item.pdf_bbox } as StructuredBlock,
+                                structuredPage,
+                              )}
+                              title={`${reasonLabel(item.reason)} · ${item.status}`}
+                            />
+                          ))}
+                        </div>
+                      )}
                       {showBlocks && (
                         <div className="block-layer">
                           {structuredPage
@@ -308,6 +511,15 @@ export function PdfAnalyzer() {
                                 />
                               ))}
                         </div>
+                      )}
+                      {manualMode && (
+                        <ManualRegionSelector pageNumber={page.page_number} selection={pendingSelection}
+                          onSelection={(selection) => {
+                            selectionGeneration.current += 1;
+                            setPreparedSelection(null);
+                            setPendingSelection(selection);
+                          }}
+                        />
                       )}
                     </div>
                   )}
@@ -378,78 +590,6 @@ export function PdfAnalyzer() {
       )}
     </div>
   );
-}
-
-function OcrCandidates({ result }: { result: OcrResponse }) {
-  return (
-    <section className="panel ocr-results">
-      <div className="page-header">
-        <div>
-          <h3>OCR kandidati</h3>
-          <p>
-            {result.candidates.length} kandidatov ·{" "}
-            {result.status.available ? "lokalni OCR izveden" : "lokalni OCR ni na voljo"}
-          </p>
-        </div>
-      </div>
-      {result.candidates.length === 0 && <p>Ni zaznanih kandidatov za OCR preverjanje.</p>}
-      {result.candidates.map((candidate, index) => (
-        <div className="ocr-candidate" key={`${candidate.page_number}-${candidate.source}-${index}`}>
-          <div>
-            <strong>
-              Stran {candidate.page_number} · {sourceLabel(candidate.source)}
-            </strong>
-            <span>
-              {candidate.reasons.map(reasonLabel).join(", ")} · {candidate.status}
-              {candidate.ocr_confidence !== null ? ` · ${candidate.ocr_confidence.toFixed(1)} %` : ""}
-            </span>
-            {candidate.linked_heading && <small>Povezano z: {candidate.linked_heading}</small>}
-            {candidate.message && <em>{candidate.message}</em>}
-          </div>
-          <div className="ocr-compare">
-            <div>
-              <h4>Izvorno</h4>
-              <pre>{candidate.native_text || "Ni izvornega besedila."}</pre>
-            </div>
-            <div>
-              <h4>OCR</h4>
-              <pre>{candidate.ocr_text || "Ni OCR rezultata."}</pre>
-            </div>
-          </div>
-          <div className="ocr-actions">
-            <button className="button secondary" disabled>
-              Ohrani izvirnik
-            </button>
-            <button className="button secondary" disabled>
-              Uporabi OCR rezultat
-            </button>
-          </div>
-        </div>
-      ))}
-    </section>
-  );
-}
-
-function sourceLabel(source: OcrResponse["candidates"][number]["source"]): string {
-  const labels = {
-    full_page: "cela stran",
-    image_region: "slikovno območje",
-    suspicious_block: "sumljiv blok",
-  };
-  return labels[source];
-}
-
-function reasonLabel(reason: OcrResponse["candidates"][number]["reasons"][number]): string {
-  const labels = {
-    scanned_page: "skenirana stran",
-    low_native_text_coverage: "malo izvornega besedila",
-    suspicious_glyph: "sumljiv znak",
-    image_text_candidate: "besedilo v sliki",
-    font_encoding_anomaly: "font encoding",
-    manual_request: "ročna zahteva",
-    ambiguous_hyphen: "dvoumen vezaj",
-  };
-  return labels[reason];
 }
 
 function BlockRow({

@@ -142,6 +142,34 @@ def _make_digital_pdf(path: Path) -> None:
     document.close()
 
 
+@pytest.mark.parametrize("dpi", [71, 401, "invalid"])
+def test_render_rejects_invalid_dpi(dpi) -> None:
+    response = client.post("/api/pdf/render", data={"dpi": dpi}, files={"file": ("a.pdf", b"%PDF-", "application/pdf")})
+    assert response.status_code == 422
+
+
+def test_render_selected_page_and_default_compatibility(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "two-pages.pdf"
+    with fitz.open() as document:
+        document.new_page(width=144, height=72)
+        document.new_page(width=72, height=144)
+        document.save(pdf_path)
+    files = {"file": ("two-pages.pdf", pdf_path.read_bytes(), "application/pdf")}
+    default = client.post("/api/pdf/render", files=files)
+    assert default.status_code == 200
+    assert default.json()["dpi"] == 150
+    assert [page["page_number"] for page in default.json()["pages"]] == [1, 2]
+    selected = client.post("/api/pdf/render", files=files, data={"dpi": 300, "page_number": 2})
+    assert selected.status_code == 200
+    assert selected.json()["dpi"] == 300
+    assert len(selected.json()["pages"]) == 1
+    assert selected.json()["pages"][0]["page_number"] == 2
+    assert selected.json()["pages"][0]["width_px"] == 300
+    assert selected.json()["pages"][0]["height_px"] == 600
+    assert client.post("/api/pdf/render", files=files, data={"page_number": 3}).status_code == 400
+    assert client.post("/api/pdf/render", files=files, data={"page_number": 0}).status_code == 422
+
+
 def _make_scanned_pdf(path: Path, image_path: Path) -> None:
     _make_scan_image(image_path)
     document = fitz.open()

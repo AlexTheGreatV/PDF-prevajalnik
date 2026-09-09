@@ -26,6 +26,14 @@ export type BrowserOcrWord = {
   pixel_bbox: OcrBBox;
 };
 
+export type BrowserOcrSegmentationMode = "single_line" | "single_block" | "sparse_text";
+
+const TESSERACT_PSM_BY_MODE: Record<BrowserOcrSegmentationMode, Tesseract.PSM> = {
+  single_line: "7" as Tesseract.PSM,
+  single_block: "6" as Tesseract.PSM,
+  sparse_text: "11" as Tesseract.PSM,
+};
+
 export type BrowserOcrResult = {
   text: string;
   words: BrowserOcrWord[];
@@ -35,6 +43,8 @@ export type BrowserOcrResult = {
   language: "eng";
   processing_time_ms: number;
   reason: string;
+  preprocessing_method: string;
+  segmentation_mode: BrowserOcrSegmentationMode;
 };
 
 export type BrowserOcrInput = {
@@ -42,6 +52,8 @@ export type BrowserOcrInput = {
   pixel_bbox: OcrBBox;
   pdf_bbox?: OcrBBox | null;
   reason: string;
+  preprocessing_method?: string;
+  segmentation_mode?: BrowserOcrSegmentationMode;
 };
 
 type RuntimeAvailability = {
@@ -125,9 +137,19 @@ export class BrowserOcrProvider {
   private workerPromise: Promise<Tesseract.Worker> | null = null;
 
   async recognize(input: BrowserOcrInput): Promise<BrowserOcrResult> {
-    assertImageLimits(input.pixel_bbox);
+    if (typeof input.image === "object" && input.image !== null && "width" in input.image && "height" in input.image) {
+      const image = input.image as { width: number; height: number; naturalWidth?: number; naturalHeight?: number };
+      assertImageLimits({ x0: 0, y0: 0, x1: image.naturalWidth ?? image.width, y1: image.naturalHeight ?? image.height });
+    } else {
+      assertImageLimits(input.pixel_bbox);
+    }
     const startedAt = performance.now();
     const worker = await this.getWorker();
+    const segmentationMode = input.segmentation_mode ?? "single_block";
+    await worker.setParameters({
+      tessedit_pageseg_mode: TESSERACT_PSM_BY_MODE[segmentationMode],
+      preserve_interword_spaces: "1",
+    });
     const result = await worker.recognize(
       input.image,
       {},
@@ -146,6 +168,8 @@ export class BrowserOcrProvider {
       language: OCR_RUNTIME_PATHS.language,
       processing_time_ms: Math.round(performance.now() - startedAt),
       reason: input.reason,
+      preprocessing_method: input.preprocessing_method ?? "original",
+      segmentation_mode: segmentationMode,
     };
   }
 
@@ -175,10 +199,6 @@ export class BrowserOcrProvider {
         cacheMethod: "none",
       },
     );
-    await worker.setParameters({
-      tessedit_pageseg_mode: "6" as Tesseract.PSM,
-      preserve_interword_spaces: "1",
-    });
     return worker;
   }
 }

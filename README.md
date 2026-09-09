@@ -33,8 +33,19 @@ No external AI services are called in this milestone. Documents stay local.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r apps/api/requirements-dev.txt
-pytest apps/api/tests
+python -m pytest
 ```
+
+Run tests from the repository root. On Windows, a project-local temporary directory
+can avoid permissions problems in the system temporary folder:
+
+```powershell
+python -m pytest --basetemp C:\Projects\PDF-prevajalnik\tmp\pytest -p no:cacheprovider
+```
+
+Page previews request 110 DPI. The render API defaults to 150 DPI and accepts
+72-400 DPI with an optional one-based `page_number`. Browser OCR requests only
+the selected page at 300 DPI; manual crops can be inspected before recognition.
 
 Run the API directly:
 
