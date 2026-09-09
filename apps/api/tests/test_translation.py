@@ -1,5 +1,8 @@
+import inspect
 import importlib.util
+import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -12,28 +15,33 @@ from app.services.translation import (
     MODEL_ID,
     REQUIRED_MODEL_FILES,
     TARGET_LANGUAGE_TOKEN,
+    LocalCTranslate2TranslationProvider,
     LocalOpusTranslationProvider,
     LocalTranslationUnavailableError,
     TranslationInput,
     encode_marian_source,
+    encode_sentencepiece_source,
+    load_runtime_model_spec,
 )
+from app.translation_profiles import MODEL_PROFILES, get_model_profile
 
 
 class FakeRuntime:
     def __init__(self, outputs: list[str | Exception] | None = None) -> None:
         self.outputs = outputs
-        self.calls: list[tuple[list[str], str]] = []
+        self.calls: list[list[str]] = []
 
-    def translate_batch(self, texts: list[str], target_language_token: str) -> list[str | Exception]:
-        self.calls.append((texts, target_language_token))
+    def translate_batch(self, texts: list[str]) -> list[str | Exception]:
+        self.calls.append(texts)
         return self.outputs if self.outputs is not None else [f"SL:{text}" for text in texts]
 
 
 def prepared_model(tmp_path: Path) -> Path:
     model_path = tmp_path / "model"
     model_path.mkdir()
+    manifest = {"schema_version": 1, "model_id": MODEL_ID}
     for name in REQUIRED_MODEL_FILES:
-        (model_path / name).write_text("{}" if name.endswith(".json") else "test", encoding="utf-8")
+        (model_path / name).write_text(json.dumps(manifest) if name == "manifest.json" else "test", encoding="utf-8")
     (model_path / "shared_vocabulary.json").write_text("{}", encoding="utf-8")
     return model_path
 
@@ -41,7 +49,7 @@ def prepared_model(tmp_path: Path) -> Path:
 def provider_with_runtime(tmp_path: Path, runtime: FakeRuntime) -> LocalOpusTranslationProvider:
     return LocalOpusTranslationProvider(
         prepared_model(tmp_path),
-        runtime_factory=lambda _path, _device, _compute: runtime,
+        runtime_factory=lambda _path, _device, _compute, _spec: runtime,
         dependency_checker=lambda _name: True,
     )
 
@@ -57,7 +65,7 @@ def test_provider_preserves_segment_ids_order_and_adds_target_tag(tmp_path: Path
 
     assert [result.segment_id for result in results] == ["a", "b"]
     assert [result.translated_text for result in results] == ["Prvi", "Drugi"]
-    assert runtime.calls == [(["First", "Second"], TARGET_LANGUAGE_TOKEN)]
+    assert runtime.calls == [["First", "Second"]]
 
 
 def test_marian_source_tokens_include_target_tag_and_eos() -> None:
@@ -75,6 +83,41 @@ def test_marian_source_tokens_include_target_tag_and_eos() -> None:
     ]
 
 
+def test_profiles_select_distinct_tokenizer_rules() -> None:
+    class FakeSentencePiece:
+        def encode(self, text: str, out_type: type) -> list[str]:
+            assert out_type is str
+            return [f"▁{text}"]
+
+    opus = get_model_profile("opus-en-sla")
+    hplt = get_model_profile("hplt-en-sl-v2")
+    assert encode_sentencepiece_source(FakeSentencePiece(), "Text", opus.tokenizer) == [">>slv<<", "▁Text", "</s>"]
+    assert encode_sentencepiece_source(FakeSentencePiece(), "Text", hplt.tokenizer) == ["▁Text"]
+    assert hplt.tokenizer.source_file == hplt.tokenizer.target_file
+
+
+def test_unknown_profile_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Neznan modelni profil"):
+        get_model_profile("unknown")
+
+
+def test_profiles_pin_official_model_revisions_and_manifests(tmp_path: Path) -> None:
+    for profile in MODEL_PROFILES.values():
+        assert len(profile.revision) == 40
+        int(profile.revision, 16)
+        assert profile.source_url.startswith("https://huggingface.co/")
+    model_path = prepared_model(tmp_path)
+    spec = load_runtime_model_spec(model_path)
+    assert spec.profile == "opus-en-sla"
+    assert spec.tokenizer.source_prefix == (TARGET_LANGUAGE_TOKEN,)
+
+
+def test_runtime_has_no_model_download_client() -> None:
+    source = inspect.getsource(LocalCTranslate2TranslationProvider)
+    assert "huggingface" not in source.lower()
+    assert "snapshot_download" not in source
+
+
 def test_provider_loads_runtime_once_for_multiple_batches(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     loads = 0
@@ -85,7 +128,7 @@ def test_provider_loads_runtime_once_for_multiple_batches(tmp_path: Path) -> Non
         return runtime
 
     provider = LocalOpusTranslationProvider(
-        prepared_model(tmp_path), runtime_factory=factory, dependency_checker=lambda _name: True
+        prepared_model(tmp_path), runtime_factory=lambda path, device, compute, _spec: factory(path, device, compute), dependency_checker=lambda _name: True
     )
     provider.translate_batch([TranslationInput(segment_id="a", text="One")])
     provider.translate_batch([TranslationInput(segment_id="b", text="Two")])
@@ -105,7 +148,7 @@ def test_missing_model_returns_safe_unavailable_status(tmp_path: Path) -> None:
 
 
 def test_load_error_is_controlled_and_path_is_not_exposed(tmp_path: Path) -> None:
-    def fail(_path: Path, _device: str, _compute: str) -> FakeRuntime:
+    def fail(_path: Path, _device: str, _compute: str, _spec: object) -> FakeRuntime:
         raise RuntimeError(f"secret path: {tmp_path}")
 
     provider = LocalOpusTranslationProvider(
@@ -186,8 +229,12 @@ def test_translate_endpoint_returns_unavailable_without_model(tmp_path: Path) ->
         app.dependency_overrides.clear()
 
 
+RUN_LOCAL_MODEL_INTEGRATION = os.getenv("RUN_LOCAL_MODEL_INTEGRATION") == "1"
+
+
 @pytest.mark.skipif(
-    not settings.local_translation_model_path.is_dir()
+    not RUN_LOCAL_MODEL_INTEGRATION
+    or not settings.local_translation_model_path.is_dir()
     or importlib.util.find_spec("ctranslate2") is None
     or importlib.util.find_spec("sentencepiece") is None,
     reason="Prepared local OPUS-MT model and optional runtime dependencies are required.",
@@ -203,3 +250,23 @@ def test_real_local_model_integration() -> None:
 
     assert result.translated_text
     assert result.error is None
+
+
+HPLT_MODEL_PATH = Path("local-models/hplt-en-sl-v2-ct2-int8")
+
+
+@pytest.mark.skipif(
+    not RUN_LOCAL_MODEL_INTEGRATION
+    or not HPLT_MODEL_PATH.is_dir()
+    or importlib.util.find_spec("ctranslate2") is None
+    or importlib.util.find_spec("sentencepiece") is None,
+    reason="Prepared local HPLT model and optional runtime dependencies are required.",
+)
+def test_real_hplt_model_integration() -> None:
+    provider = LocalCTranslate2TranslationProvider(HPLT_MODEL_PATH, device="cpu", compute_type="int8")
+
+    result = provider.translate_batch([TranslationInput(segment_id="integration-hplt", text="Product description")])[0]
+
+    assert result.translated_text
+    assert result.error is None
+    assert provider.status().model_id == "HPLT/translate-en-sl-v2.0-hplt"

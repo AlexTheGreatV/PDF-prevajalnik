@@ -5,27 +5,27 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.services.translation import (
-    LocalOpusTranslationProvider,
+    LocalCTranslate2TranslationProvider,
     LocalTranslationUnavailableError,
     TranslationInput,
 )
 from app.translation_models import LocalTranslationStatus, TranslationBatchRequest, TranslationBatchResponse
 
 router = APIRouter()
-_provider = LocalOpusTranslationProvider(
+_provider = LocalCTranslate2TranslationProvider(
     model_path=settings.local_translation_model_path,
     device=settings.local_translation_device,
     compute_type=settings.local_translation_compute_type,
 )
 
 
-def get_local_translation_provider() -> LocalOpusTranslationProvider:
+def get_local_translation_provider() -> LocalCTranslate2TranslationProvider:
     return _provider
 
 
 @router.get("/local/status", response_model=LocalTranslationStatus)
 def local_status(
-    provider: LocalOpusTranslationProvider = Depends(get_local_translation_provider),
+    provider: LocalCTranslate2TranslationProvider = Depends(get_local_translation_provider),
 ) -> LocalTranslationStatus:
     return provider.status()
 
@@ -34,7 +34,7 @@ def local_status(
 async def local_translate(
     payload: TranslationBatchRequest,
     request: Request,
-    provider: LocalOpusTranslationProvider = Depends(get_local_translation_provider),
+    provider: LocalCTranslate2TranslationProvider = Depends(get_local_translation_provider),
 ) -> TranslationBatchResponse:
     if await request.is_disconnected():
         raise HTTPException(status_code=499, detail={"code": "cancelled", "message": "Zahteva je bila preklicana."})

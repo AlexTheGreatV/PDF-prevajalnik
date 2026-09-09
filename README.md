@@ -68,10 +68,18 @@ Preparing a model additionally requires the heavier conversion dependencies:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r apps/api/requirements-translation-prep.txt
-.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --download
+.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --profile opus-en-sla --download
 ```
 
-The preparation command downloads the pinned official `Helsinki-NLP/opus-mt-en-sla` revision only when explicitly invoked, converts it to CTranslate2 INT8, and writes hashes to a local manifest. It never runs during API startup, tests, or frontend builds. The model is stored under ignored `local-models/`; use `--source-dir` instead of `--download` when an approved snapshot was transferred separately. Existing output is not replaced unless `--force` is explicitly passed.
+The preparation command supports the pinned `opus-en-sla` and `hplt-en-sl-v2` profiles. It downloads an official revision only when explicitly invoked, converts it to CTranslate2 INT8, and writes source and output hashes to a local manifest. It never runs during API startup, tests, or frontend builds. Models are stored under ignored `local-models/`; use `--source-dir` instead of `--download` when an approved snapshot was transferred separately. Existing output is not replaced unless `--force` is explicitly passed.
+
+The direct HPLT English-to-Slovenian comparison model can be prepared separately without changing the default OPUS model:
+
+```powershell
+.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --profile hplt-en-sl-v2 --download
+```
+
+HPLT publishes a shared SentencePiece model and a score-based TSV vocabulary. The preparation script verifies both official files, derives the ID-based YAML vocabulary required by CTranslate2's Marian converter, and records that derivation in the model manifest.
 
 Runtime configuration:
 

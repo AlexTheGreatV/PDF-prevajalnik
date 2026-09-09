@@ -18,4 +18,7 @@ This project optionally uses the following local translation components. Their i
 - Helsinki-NLP/opus-mt-en-sla — Apache License 2.0 — https://huggingface.co/Helsinki-NLP/opus-mt-en-sla
 - Pinned source revision: `0bc26914f2f82c3dd5b235e420aa2c711a5ed3d8`
 
+- HPLT/translate-en-sl-v2.0-hplt — HPLT project contributors — Creative Commons Attribution 4.0 International (CC BY 4.0) — https://huggingface.co/HPLT/translate-en-sl-v2.0-hplt
+- Pinned source revision: `6604d94dd36c3e29fe0ebbf8de8197668445ec0c`
+
 Model weights, converted runtime files, local manifests, and generated translations are not distributed in this Git repository. They are prepared locally only by an explicit user command.

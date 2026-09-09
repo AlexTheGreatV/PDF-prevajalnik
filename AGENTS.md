@@ -6,18 +6,19 @@ Build an internal document translation application for JUB/KOOP, starting with a
 
 ## Current Milestone
 
-Build provider-independent translation workflows and a local OPUS-MT/CTranslate2 prototype behind local FastAPI endpoints.
+Compare local OPUS-MT and HPLT English-to-Slovenian CTranslate2 profiles without changing the default model.
 
 Allowed:
 
 - Provider-independent translation logic
-- Local OPUS-MT/CTranslate2 inference
+- Local OPUS-MT and HPLT/CTranslate2 inference and diagnostics
 - Local FastAPI translation endpoints
 
 Guardrails:
 
 - Do not call external translation APIs without explicit user approval.
 - Never download models during app startup, tests, or builds.
+- Download or prepare a model only through an explicit user-run profile command pinned to an official revision.
 - Keep models, test-document translations, and temporary results out of Git.
 - Preserve `native_text`, OCR results, and the source document model.
 - Do not hardcode translations or silently repair damaged placeholders.
