@@ -3,6 +3,7 @@
 import { useMemo, useRef, useState } from "react";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
+import { createDefaultGlossary } from "../lib/default-glossary";
 import {
   createTranslationJob,
   editTranslation,
@@ -27,7 +28,7 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
   const importRef = useRef<HTMLInputElement | null>(null);
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("sl");
-  const [glossary, setGlossary] = useState<GlossaryEntry[]>([]);
+  const [glossary, setGlossary] = useState<GlossaryEntry[]>(createDefaultGlossary);
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
@@ -55,7 +56,15 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
   }
 
   function addGlossaryEntry() {
-    changeGlossary([...glossary, { id: `glossary-${Date.now()}`, source_term: "", target_term: "", case_sensitive: false, exact_match: true, do_not_translate: false }]);
+    changeGlossary([...glossary, {
+      id: `glossary-${Date.now()}`,
+      source_term: "",
+      target_term: "",
+      case_sensitive: true,
+      mode: "exact_segment",
+      enabled: true,
+      origin: "user",
+    }]);
   }
 
   function exportJob() {
@@ -90,7 +99,7 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
     <section className="translation-workspace">
       <div className="translation-header">
         <div>
-          <span>Mejnik 6B</span>
+          <span>Mejnik 6D</span>
           <h2>Pregled prevodov</h2>
           <p>{message}</p>
         </div>
@@ -112,7 +121,8 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
 
       <div className={`translation-provider-status ${local.status?.available ? "available" : "unavailable"}`}>
         <strong>{local.status?.available ? "Lokalni prevajalnik je pripravljen" : "Lokalni prevajalnik ni nameščen"}</strong>
-        <span>{local.statusError ?? local.status?.message ?? (local.status ? `${local.status.model_id} · ${local.status.device}/${local.status.compute_type}` : "Preverjam stanje lokalnega prevajalnika …")}</span>
+        {local.status && <span>Aktivni profil: {local.status.profile_id} · {local.status.model_id} · {local.status.device}/{local.status.compute_type}</span>}
+        <span>{local.statusError ?? local.status?.message ?? (!local.status ? "Preverjam stanje lokalnega prevajalnika …" : "Model je naložen samo lokalno.")}</span>
       </div>
 
       <div className="translation-actions">
@@ -158,7 +168,7 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry }: 
     <article className={`translation-segment translation-${segment.status}`}>
       <header>
         <strong>Stran {segment.page_number} · {segment.block_type}</strong>
-        <span>{segment.status} · vir: {segment.source_text_origin === "accepted_ocr" ? "potrjeni OCR" : "native"}</span>
+        <span>{segment.status} · besedilo: {segment.source_text_origin === "accepted_ocr" ? "potrjeni OCR" : "native"} · prevod: {segment.translation_origin ?? "še ni"}</span>
       </header>
       <div className="translation-columns">
         <div><h3>Izvorno</h3><pre>{segment.source_text || "Ni izvornega besedila."}</pre></div>
@@ -166,7 +176,21 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry }: 
           ? <div><h3>Prevod</h3><p className="translation-skip">Preskočeno: {segment.skip_reason}</p></div>
           : <label><span>Prevod</span><textarea value={segment.edited_translation} onChange={(event) => onEdit(event.target.value)} placeholder="Vnesite slovenski prevod" /></label>}
       </div>
-      {segment.glossary_matches.length > 0 && <div className="glossary-matches">Slovar: {segment.glossary_matches.map((match) => `${match.matched_text} → ${match.do_not_translate ? "ne prevajaj" : match.target_term}`).join(", ")}</div>}
+      {segment.glossary_matches.length > 0 && <div className="glossary-matches">Slovar: {segment.glossary_matches.map((match) => `${match.matched_text} → ${match.mode === "do_not_translate" ? "ne prevajaj" : match.target_term} (${match.mode})`).join(", ")}</div>}
+      {segment.glossary_entry_id && <div className="translation-origin">Uporabljen slovarski vnos: {segment.glossary_entry_id}</div>}
+      {segment.model_id && <div className="translation-origin">Model: {segment.model_id}</div>}
+      {segment.needs_review && <p className="translation-warning">Potreben je ročni pregled.</p>}
+      {segment.warnings.length > 0 && <div className="translation-origin">Opozorila: {segment.warnings.join(", ")}</div>}
+      {segment.chunks.length > 1 && <details className="translation-chunks">
+        <summary>Modelni deli: {segment.chunks.filter((chunk) => chunk.status === "translated").length}/{segment.chunks.length}</summary>
+        {segment.chunks.map((chunk) => <div key={chunk.chunk_id} className={`translation-chunk ${chunk.status}`}>
+          <strong>{chunk.chunk_id} · {chunk.status}</strong>
+          <p>{chunk.source_text}</p>
+          {chunk.translated_text && <p>{chunk.translated_text}</p>}
+          {chunk.decoding && <small>{chunk.source_token_count} vhodnih tokenov · {chunk.decoding.output_token_count}/{chunk.decoding.max_decoding_length} izhodnih</small>}
+          {chunk.warnings.length > 0 && <small>Opozorila: {chunk.warnings.join(", ")}</small>}
+        </div>)}
+      </details>}
       {segment.error && <p className="translation-error">{segment.error}</p>}
       {!segment.skip_reason && <div className="translation-row-actions">
         <button className="button secondary" disabled={!segment.edited_translation.trim()} onClick={onReview}>Potrdi prevod</button>
@@ -179,15 +203,26 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry }: 
 
 function GlossaryEditor({ entries, onChange, onAdd }: { entries: GlossaryEntry[]; onChange: (entries: GlossaryEntry[]) => void; onAdd: () => void }) {
   function update(id: string, value: Partial<GlossaryEntry>) { onChange(entries.map((entry) => entry.id === id ? { ...entry, ...value } : entry)); }
+  function restore(entry: GlossaryEntry) {
+    if (entry.origin === "built_in" && entry.default_target_term) update(entry.id, { target_term: entry.default_target_term, enabled: true });
+  }
   return <div className="glossary-editor">
-    <div className="translation-subhead"><div><h3>Slovar izrazov</h3><p>Slovar je shranjen samo v izvoženem opravilu.</p></div><button className="button secondary" onClick={onAdd}>Dodaj izraz</button></div>
+    <div className="translation-subhead"><div><h3>Slovar izrazov</h3><p>Privzeti in uporabniški vnosi se shranijo v izvoženo opravilo.</p></div><button className="button secondary" onClick={onAdd}>Dodaj izraz</button></div>
     {entries.map((entry) => <div className="glossary-row" key={entry.id}>
-      <input aria-label="Izvorni izraz" placeholder="Izvorni izraz" value={entry.source_term} onChange={(event) => update(entry.id, { source_term: event.target.value })} />
-      <input aria-label="Ciljni izraz" placeholder="Ciljni izraz" value={entry.target_term} disabled={entry.do_not_translate} onChange={(event) => update(entry.id, { target_term: event.target.value })} />
-      <label><input type="checkbox" checked={entry.case_sensitive} onChange={(event) => update(entry.id, { case_sensitive: event.target.checked })} /> Velike/male črke</label>
-      <label><input type="checkbox" checked={entry.exact_match} onChange={(event) => update(entry.id, { exact_match: event.target.checked })} /> Točen izraz</label>
-      <label><input type="checkbox" checked={entry.do_not_translate} onChange={(event) => update(entry.id, { do_not_translate: event.target.checked })} /> Ne prevajaj</label>
-      <button className="button secondary" onClick={() => onChange(entries.filter((item) => item.id !== entry.id))}>Odstrani</button>
+      <span className={`glossary-origin ${entry.origin}`}>{entry.origin === "built_in" ? "Privzeto" : "Uporabniško"}</span>
+      <label><input type="checkbox" checked={entry.enabled} onChange={(event) => update(entry.id, { enabled: event.target.checked })} /> Vključeno</label>
+      <input aria-label="Izvorni izraz" placeholder="Izvorni izraz" value={entry.source_term} disabled={entry.origin === "built_in"} onChange={(event) => update(entry.id, { source_term: event.target.value })} />
+      <input aria-label="Ciljni izraz" placeholder="Ciljni izraz" value={entry.target_term} disabled={entry.mode === "do_not_translate"} onChange={(event) => update(entry.id, { target_term: event.target.value })} />
+      <select aria-label="Način slovarja" value={entry.mode} onChange={(event) => update(entry.id, { mode: event.target.value as GlossaryEntry["mode"] })}>
+        <option value="exact_segment">Celoten segment</option>
+        <option value="do_not_translate">Ne prevajaj</option>
+        <option value="preferred">Priporočilo</option>
+        <option value="locked_inline">Zaklenjeno v povedi</option>
+      </select>
+      <label><input type="checkbox" checked={entry.case_sensitive} onChange={(event) => update(entry.id, { case_sensitive: event.target.checked })} /> Razlikuj črke</label>
+      {entry.origin === "built_in"
+        ? <button className="button secondary" onClick={() => restore(entry)}>Obnovi</button>
+        : <button className="button secondary" onClick={() => onChange(entries.filter((item) => item.id !== entry.id))}>Odstrani</button>}
     </div>)}
   </div>;
 }

@@ -9,7 +9,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.translation import get_local_translation_provider
-from app.core.config import settings
 from app.main import app
 from app.services.translation import (
     MODEL_ID,
@@ -19,6 +18,8 @@ from app.services.translation import (
     LocalOpusTranslationProvider,
     LocalTranslationUnavailableError,
     TranslationInput,
+    RuntimeTranslation,
+    decoding_length_for_source_tokens,
     encode_marian_source,
     encode_sentencepiece_source,
     load_runtime_model_spec,
@@ -49,6 +50,7 @@ def prepared_model(tmp_path: Path) -> Path:
 def provider_with_runtime(tmp_path: Path, runtime: FakeRuntime) -> LocalOpusTranslationProvider:
     return LocalOpusTranslationProvider(
         prepared_model(tmp_path),
+        profile_name="opus-en-sla",
         runtime_factory=lambda _path, _device, _compute, _spec: runtime,
         dependency_checker=lambda _name: True,
     )
@@ -128,7 +130,7 @@ def test_provider_loads_runtime_once_for_multiple_batches(tmp_path: Path) -> Non
         return runtime
 
     provider = LocalOpusTranslationProvider(
-        prepared_model(tmp_path), runtime_factory=lambda path, device, compute, _spec: factory(path, device, compute), dependency_checker=lambda _name: True
+        prepared_model(tmp_path), profile_name="opus-en-sla", runtime_factory=lambda path, device, compute, _spec: factory(path, device, compute), dependency_checker=lambda _name: True
     )
     provider.translate_batch([TranslationInput(segment_id="a", text="One")])
     provider.translate_batch([TranslationInput(segment_id="b", text="Two")])
@@ -147,12 +149,28 @@ def test_missing_model_returns_safe_unavailable_status(tmp_path: Path) -> None:
     assert str(tmp_path) not in (status.message or "")
 
 
+def test_missing_default_hplt_model_returns_preparation_instruction(tmp_path: Path) -> None:
+    provider = LocalCTranslate2TranslationProvider(
+        tmp_path / "missing-hplt",
+        profile_name="hplt-en-sl-v2",
+        dependency_checker=lambda _name: True,
+    )
+
+    status = provider.status()
+
+    assert status.available is False
+    assert status.profile_id == "hplt-en-sl-v2"
+    assert status.model_id == "HPLT/translate-en-sl-v2.0-hplt"
+    assert "--profile hplt-en-sl-v2 --download" in (status.message or "")
+    assert str(tmp_path) not in (status.message or "")
+
+
 def test_load_error_is_controlled_and_path_is_not_exposed(tmp_path: Path) -> None:
     def fail(_path: Path, _device: str, _compute: str, _spec: object) -> FakeRuntime:
         raise RuntimeError(f"secret path: {tmp_path}")
 
     provider = LocalOpusTranslationProvider(
-        prepared_model(tmp_path), runtime_factory=fail, dependency_checker=lambda _name: True
+        prepared_model(tmp_path), profile_name="opus-en-sla", runtime_factory=fail, dependency_checker=lambda _name: True
     )
 
     with pytest.raises(LocalTranslationUnavailableError, match="ni bilo mogoče naložiti"):
@@ -175,6 +193,17 @@ def test_partial_error_and_placeholder_text_remain_structured(tmp_path: Path) ->
     assert "private failure" not in results[1].error.message
 
 
+def test_runtime_metadata_and_dynamic_decoding_limit_are_exposed(tmp_path: Path) -> None:
+    runtime = FakeRuntime(outputs=[RuntimeTranslation("Prevod", 40, 22, 112, False, True, raw_output_tokens=("▁Prevod", "</s>"))])
+    result = provider_with_runtime(tmp_path, runtime).translate_batch([TranslationInput(segment_id="chunk", text="Source")])[0]
+    assert result.source_token_count == 40
+    assert result.output_token_count == 22
+    assert result.max_decoding_length == 112
+    assert result.has_end_token is True
+    assert decoding_length_for_source_tokens(16) == 64
+    assert decoding_length_for_source_tokens(400) == 768
+
+
 def test_status_and_translate_endpoints(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     runtime = FakeRuntime(outputs=["Prevod"])
     provider = provider_with_runtime(tmp_path, runtime)
@@ -192,6 +221,7 @@ def test_status_and_translate_endpoints(tmp_path: Path, caplog: pytest.LogCaptur
             )
         assert status.status_code == 200
         assert status.json()["available"] is True
+        assert status.json()["profile_id"] == "opus-en-sla"
         assert response.status_code == 200
         assert response.json()["model_id"] == MODEL_ID
         assert response.json()["results"][0]["segment_id"] == "segment-1"
@@ -232,24 +262,24 @@ def test_translate_endpoint_returns_unavailable_without_model(tmp_path: Path) ->
 RUN_LOCAL_MODEL_INTEGRATION = os.getenv("RUN_LOCAL_MODEL_INTEGRATION") == "1"
 
 
+OPUS_MODEL_PATH = Path("local-models/opus-mt-en-sla-ct2-int8")
+
+
 @pytest.mark.skipif(
     not RUN_LOCAL_MODEL_INTEGRATION
-    or not settings.local_translation_model_path.is_dir()
+    or not OPUS_MODEL_PATH.is_dir()
     or importlib.util.find_spec("ctranslate2") is None
     or importlib.util.find_spec("sentencepiece") is None,
     reason="Prepared local OPUS-MT model and optional runtime dependencies are required.",
 )
 def test_real_local_model_integration() -> None:
-    provider = LocalOpusTranslationProvider(
-        settings.local_translation_model_path,
-        device=settings.local_translation_device,
-        compute_type=settings.local_translation_compute_type,
-    )
+    provider = LocalOpusTranslationProvider(OPUS_MODEL_PATH, profile_name="opus-en-sla", device="cpu", compute_type="int8")
 
     result = provider.translate_batch([TranslationInput(segment_id="integration", text="Product description")])[0]
 
     assert result.translated_text
     assert result.error is None
+    assert provider.status().model_id == "Helsinki-NLP/opus-mt-en-sla"
 
 
 HPLT_MODEL_PATH = Path("local-models/hplt-en-sl-v2-ct2-int8")
@@ -263,7 +293,7 @@ HPLT_MODEL_PATH = Path("local-models/hplt-en-sl-v2-ct2-int8")
     reason="Prepared local HPLT model and optional runtime dependencies are required.",
 )
 def test_real_hplt_model_integration() -> None:
-    provider = LocalCTranslate2TranslationProvider(HPLT_MODEL_PATH, device="cpu", compute_type="int8")
+    provider = LocalCTranslate2TranslationProvider(HPLT_MODEL_PATH, profile_name="hplt-en-sl-v2", device="cpu", compute_type="int8")
 
     result = provider.translate_batch([TranslationInput(segment_id="integration-hplt", text="Product description")])[0]
 

@@ -6,13 +6,14 @@ Build an internal document translation application for JUB/KOOP, starting with a
 
 ## Current Milestone
 
-Compare local OPUS-MT and HPLT English-to-Slovenian CTranslate2 profiles without changing the default model.
+Use HPLT as the default local English-to-Slovenian model, retain OPUS-MT as an override, and provide a reviewable technical glossary with safe placeholder retry.
 
 Allowed:
 
 - Provider-independent translation logic
 - Local OPUS-MT and HPLT/CTranslate2 inference and diagnostics
 - Local FastAPI translation endpoints
+- User-controlled exact, preferred, do-not-translate, and explicitly locked glossary entries
 
 Guardrails:
 
@@ -22,6 +23,7 @@ Guardrails:
 - Keep models, test-document translations, and temporary results out of Git.
 - Preserve `native_text`, OCR results, and the source document model.
 - Do not hardcode translations or silently repair damaged placeholders.
+- Never auto-review glossary or model translations; a successful placeholder retry must require manual review.
 - Do not add payments, public registration, or remote document uploads.
 
 ## Architecture

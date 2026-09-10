@@ -1,17 +1,21 @@
-import { findGlossaryMatches } from "./glossary";
+import { findExactSegmentGlossaryMatch, findGlossaryMatches, orderedGlossary } from "./glossary";
 import type { OcrReviewItem } from "./ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "./pdf-types";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
 import type {
   GlossaryEntry,
+  PlaceholderAttempt,
+  PlaceholderStrategy,
   ProtectedToken,
+  TranslationChunk,
   TranslationJob,
   TranslationProvider,
+  TranslationProviderResult,
   TranslationRequest,
   TranslationSegment,
 } from "./translation-types";
 
-export const TRANSLATION_JOB_SCHEMA_VERSION = 1 as const;
+export const TRANSLATION_JOB_SCHEMA_VERSION = 3 as const;
 
 export function createTranslationJob(
   analysis: PdfAnalysis,
@@ -19,7 +23,7 @@ export function createTranslationJob(
   options: { source_language: string; target_language: string; glossary?: GlossaryEntry[]; created_at?: string },
 ): TranslationJob {
   const created_at = options.created_at ?? new Date().toISOString();
-  const glossary = options.glossary ?? [];
+  const glossary = cloneGlossary(options.glossary ?? []);
   const segments: TranslationSegment[] = [];
   const pages = [...(analysis.document?.pages ?? [])].sort((a, b) => a.page_number - b.page_number);
 
@@ -76,6 +80,7 @@ export function createTranslationJob(
     target_language: options.target_language,
     created_at,
     glossary,
+    glossary_snapshot: cloneGlossary(glossary),
     segments,
   };
 }
@@ -97,8 +102,7 @@ type SegmentInput = {
 function createSegment(sourceText: string, input: SegmentInput): TranslationSegment {
   const source_text = sourceText.trim();
   const skip_reason = getSkipReason(source_text, input.block_type, input.region.kind);
-  const protected_tokens = protectForTranslation(source_text, input.glossary).tokens;
-  return {
+  const segment: TranslationSegment = {
     segment_id: input.segment_id,
     page_number: input.page_number,
     block_id: input.block_id,
@@ -113,10 +117,20 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     quality: null,
     error: null,
     skip_reason,
-    protected_tokens,
+    protected_tokens: protectForTranslation(source_text, input.glossary).tokens,
     glossary_matches: findGlossaryMatches(source_text, input.glossary),
+    translation_origin: null,
+    glossary_entry_id: null,
+    model_id: null,
+    provider_id: null,
+    placeholder_attempts: [],
+    needs_review: false,
+    warnings: [],
+    chunks: [],
+    forced_chunking: false,
     created_at: input.created_at,
   };
+  return skip_reason ? segment : applyExactSegmentGlossary(segment, input.glossary);
 }
 
 export function getSkipReason(
@@ -128,32 +142,37 @@ export function getSkipReason(
   if (!value) return "Prazno besedilo.";
   if (blockType === "list") return "Vsebnik seznama; prevajajo se posamezne alineje.";
   if (blockType === "table") return "Tabela brez strukturiranih celic.";
-  if (!["heading", "paragraph", "list_item", "table_cell", "caption"].includes(blockType) && !["header", "footer"].includes(regionKind)) {
-    return "Vrsta bloka ni vključena v prevod.";
-  }
+  if (!["heading", "paragraph", "list_item", "table_cell", "caption"].includes(blockType) && !["header", "footer"].includes(regionKind)) return "Vrsta bloka ni vključena v prevod.";
   if (/^(?:page\s*)?\d+(?:\s*\/\s*\d+)?$/i.test(value)) return "Samostojna številka strani.";
   if (/^(?:https?:\/\/|www\.|[\w.+-]+@[\w.-]+\.)/i.test(value) && !/\s/.test(value)) return "Samostojen URL ali e-poštni naslov.";
   if (!/\p{L}/u.test(value)) return "Besedilo ne vsebuje črk.";
-  if (/^(?:RAL\s+\d+|[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}|CO[₂2]|°C|MPa)$/u.test(value)) {
-    return "Samostojen tehnični identifikator.";
-  }
+  if (/^(?:RAL\s+\d+|[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}|CO[₂2]|°C|MPa)$/u.test(value)) return "Samostojen tehnični identifikator.";
   return null;
 }
 
-export function protectForTranslation(text: string, glossary: GlossaryEntry[]) {
-  const technical = protectTechnicalTokens(text);
+export function protectForTranslation(
+  text: string,
+  glossary: GlossaryEntry[],
+  strategy: PlaceholderStrategy = "primary_tk",
+) {
+  const technical = protectTechnicalTokens(text, strategy);
   const tokens = [...technical.tokens];
   let protected_text = technical.protected_text;
-  for (const entry of glossary.filter((item) => item.source_term.trim() && (item.do_not_translate || item.target_term.trim()))) {
+  for (const entry of orderedGlossary(glossary).filter((item) =>
+    item.enabled &&
+    item.source_term.trim() &&
+    (item.mode === "do_not_translate" || (item.mode === "locked_inline" && item.target_term.trim())),
+  )) {
     const flags = entry.case_sensitive ? "gu" : "giu";
     const escaped = entry.source_term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = new RegExp(entry.exact_match ? `(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])` : escaped, flags);
+    const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, flags);
     protected_text = protected_text.replace(pattern, (value) => {
-      const placeholder = `GLS${String(tokens.length).padStart(3, "0")}GLS`;
+      const index = String(tokens.length).padStart(3, "0");
+      const placeholder = strategy === "primary_tk" ? `GLS${index}GLS` : `PHX${index}XHP`;
       tokens.push({
         placeholder,
         value,
-        replacement_value: entry.do_not_translate ? value : entry.target_term,
+        replacement_value: entry.mode === "do_not_translate" ? value : entry.target_term,
         kind: "glossary",
       });
       return placeholder;
@@ -165,28 +184,49 @@ export function protectForTranslation(text: string, glossary: GlossaryEntry[]) {
 export function restoreProtectedTokens(text: string, tokens: ProtectedToken[]): string {
   const technical = tokens.filter((token) => token.kind !== "glossary");
   let restored = restoreTechnicalTokens(text, technical);
-  const glossary = tokens.filter((token) => token.kind === "glossary");
-  for (const token of glossary) {
-    if (restored.split(token.placeholder).length !== 2) {
-      throw new Error("Prevod vsebuje manjkajoč ali poškodovan slovarski placeholder.");
-    }
+  for (const token of tokens.filter((item) => item.kind === "glossary")) {
+    if (restored.split(token.placeholder).length !== 2) throw new Error("Prevod vsebuje manjkajoč ali poškodovan slovarski placeholder.");
     restored = restored.replace(token.placeholder, token.replacement_value ?? token.value);
   }
-  if (/(?:TK\d{3}TK|GLS\d{3}GLS)/.test(restored)) throw new Error("Prevod vsebuje neobnovljen placeholder.");
+  if (/(?:TK\d{3}TK|GLS\d{3}GLS|PHX\d{3}XHP)/.test(restored)) throw new Error("Prevod vsebuje neobnovljen placeholder.");
   return restored;
 }
 
 export function editTranslation(segment: TranslationSegment, text: string): TranslationSegment {
-  return { ...segment, edited_translation: text, status: text.trim() ? "translated" : segment.skip_reason ? "skipped" : "pending", error: null };
+  return {
+    ...segment,
+    edited_translation: text,
+    status: text.trim() ? "translated" : segment.skip_reason ? "skipped" : "pending",
+    error: null,
+    translation_origin: text.trim() ? "manual" : null,
+    glossary_entry_id: null,
+    needs_review: false,
+  };
 }
 
 export function reviewTranslation(segment: TranslationSegment): TranslationSegment {
   if (!segment.edited_translation.trim() && !segment.translated_text.trim()) return segment;
-  return { ...segment, status: "reviewed", edited_translation: segment.edited_translation || segment.translated_text, error: null };
+  return { ...segment, status: "reviewed", edited_translation: segment.edited_translation || segment.translated_text, error: null, needs_review: false };
 }
 
 export function resetTranslation(segment: TranslationSegment): TranslationSegment {
-  return { ...segment, translated_text: "", edited_translation: "", status: segment.skip_reason ? "skipped" : "pending", quality: null, error: null };
+  return {
+    ...segment,
+    translated_text: "",
+    edited_translation: "",
+    status: segment.skip_reason ? "skipped" : "pending",
+    quality: null,
+    error: null,
+    translation_origin: null,
+    glossary_entry_id: null,
+    model_id: null,
+    provider_id: null,
+    placeholder_attempts: [],
+    needs_review: false,
+    warnings: [],
+    chunks: [],
+    forced_chunking: false,
+  };
 }
 
 export function retryFailedTranslation(segment: TranslationSegment): TranslationSegment {
@@ -194,14 +234,20 @@ export function retryFailedTranslation(segment: TranslationSegment): Translation
 }
 
 export function updateJobGlossary(job: TranslationJob, glossary: GlossaryEntry[]): TranslationJob {
+  const snapshot = cloneGlossary(glossary);
   return {
     ...job,
-    glossary,
-    segments: job.segments.map((segment) => ({
-      ...segment,
-      protected_tokens: protectForTranslation(segment.source_text, glossary).tokens,
-      glossary_matches: findGlossaryMatches(segment.source_text, glossary),
-    })),
+    glossary: snapshot,
+    glossary_snapshot: cloneGlossary(snapshot),
+    segments: job.segments.map((segment) => {
+      const refreshed = {
+        ...segment,
+        protected_tokens: protectForTranslation(segment.source_text, snapshot).tokens,
+        glossary_matches: findGlossaryMatches(segment.source_text, snapshot),
+      };
+      if (segment.status === "reviewed" || segment.translation_origin === "manual" || segment.translation_origin === "provider") return refreshed;
+      return applyExactSegmentGlossary(resetTranslation(refreshed), snapshot);
+    }),
   };
 }
 
@@ -211,80 +257,222 @@ export async function translateJobBatch(
   signal?: AbortSignal,
   onProgress?: (completed: number, total: number) => void,
 ): Promise<TranslationJob> {
-  const selected = job.segments.filter((segment) => ["pending", "failed"].includes(segment.status) && !segment.skip_reason);
   if (signal?.aborted) return job;
-  const prepared = new Map<string, { request: TranslationRequest; tokens: ProtectedToken[] }>();
-  for (const segment of selected) {
-    const protectedValue = protectForTranslation(segment.source_text, job.glossary);
-    prepared.set(segment.segment_id, {
-      tokens: protectedValue.tokens,
-      request: {
-        segment_id: segment.segment_id,
-        text: protectedValue.protected_text,
-        context: { segment_id: segment.segment_id, page_number: segment.page_number, block_type: segment.block_type, glossary_matches: segment.glossary_matches },
-      },
-    });
-  }
-  let results;
-  try {
-    results = await provider.translateBatch([...prepared.values()].map((item) => item.request), {
-      source_language: job.source_language,
-      target_language: job.target_language,
-      signal,
-      onProgress,
-    });
-  } catch (error) {
-    if (signal?.aborted) return job;
-    const message = error instanceof Error ? error.message : String(error);
-    return { ...job, segments: job.segments.map((segment) => prepared.has(segment.segment_id) ? { ...segment, status: "failed", error: message } : segment) };
-  }
-  if (signal?.aborted) return job;
-  const byId = new Map(results.map((result) => [result.segment_id, result]));
-  return {
+  const glossary = cloneGlossary(job.glossary);
+  const withGlossary = {
     ...job,
-    segments: job.segments.map((segment) => {
-      const preparedItem = prepared.get(segment.segment_id);
-      if (!preparedItem) return segment;
-      const result = byId.get(segment.segment_id);
-      if (!result) return { ...segment, status: "failed", error: "Ponudnik ni vrnil rezultata za segment." };
-      if (result.error || result.translated_text === null) return { ...segment, status: "failed", error: result.error?.message ?? "Prevod ni uspel." };
-      try {
-        const translated_text = restoreProtectedTokens(result.translated_text, preparedItem.tokens);
-        return { ...segment, translated_text, edited_translation: translated_text, status: "translated", quality: result.confidence, error: null };
-      } catch (error) {
-        return { ...segment, status: "failed", error: error instanceof Error ? error.message : String(error) };
-      }
-    }),
+    glossary_snapshot: cloneGlossary(glossary),
+    segments: job.segments.map((segment) =>
+      ["pending", "failed"].includes(segment.status) && !segment.skip_reason
+        ? applyExactSegmentGlossary(segment, glossary)
+        : segment,
+    ),
+  };
+  const selected = withGlossary.segments.filter((segment) => ["pending", "failed"].includes(segment.status) && !segment.skip_reason);
+  const initialChunks = new Map(selected.map((segment) => [segment.segment_id, createTranslationChunks(segment)]));
+  let translated = await translateChunkSet(initialChunks, selected, glossary, provider, job, "primary_tk", signal, onProgress);
+  if (signal?.aborted) return job;
+
+  const forced = new Map<string, TranslationChunk[]>();
+  for (const segment of translated) {
+    const replacements = segment.chunks.flatMap((chunk) =>
+      chunk.status === "failed" && chunk.warnings.some((warning) => ["source_token_limit", "decoding_limit"].includes(warning))
+        ? splitOversizedChunk(chunk) ?? [chunk]
+        : [chunk],
+    );
+    if (replacements.length !== segment.chunks.length) forced.set(segment.segment_id, replacements);
+  }
+  if (forced.size) {
+    const forcedSegments = translated.filter((segment) => forced.has(segment.segment_id));
+    const retried = await translateChunkSet(forced, forcedSegments, glossary, provider, job, "primary_tk", signal);
+    const byId = new Map(retried.map((segment) => [segment.segment_id, { ...segment, forced_chunking: true, needs_review: true, warnings: [...new Set([...segment.warnings, "forced_chunking"])] }]));
+    translated = translated.map((segment) => byId.get(segment.segment_id) ?? segment);
+  }
+  if (signal?.aborted) return job;
+
+  const placeholderRetry = new Map<string, TranslationChunk[]>();
+  for (const segment of translated) {
+    const failed = segment.chunks.filter((chunk) => chunk.status === "failed" && chunk.warnings.includes("placeholder_integrity"));
+    if (failed.length) placeholderRetry.set(segment.segment_id, failed);
+  }
+  if (placeholderRetry.size) {
+    const retrySegments = translated.filter((segment) => placeholderRetry.has(segment.segment_id));
+    const retries = await translateChunkSet(placeholderRetry, retrySegments, glossary, provider, job, "retry_phx", signal);
+    const retryBySegment = new Map(retries.map((segment) => [segment.segment_id, segment.chunks]));
+    translated = translated.map((segment) => {
+      const retryChunks = retryBySegment.get(segment.segment_id);
+      if (!retryChunks) return segment;
+      const byChunk = new Map(retryChunks.map((chunk) => [chunk.chunk_id, chunk]));
+      return assembleSegment(segment, segment.chunks.map((chunk) => byChunk.get(chunk.chunk_id) ?? chunk), true);
+    });
+  }
+  const translatedById = new Map(translated.map((segment) => [segment.segment_id, segment]));
+  return { ...withGlossary, segments: withGlossary.segments.map((segment) => translatedById.get(segment.segment_id) ?? segment) };
+}
+
+type PreparedChunk = { chunk: TranslationChunk; request: TranslationRequest; tokens: ProtectedToken[] };
+
+async function translateChunkSet(chunksBySegment: Map<string, TranslationChunk[]>, segments: TranslationSegment[], glossary: GlossaryEntry[], provider: TranslationProvider, job: TranslationJob, strategy: PlaceholderStrategy, signal?: AbortSignal, onProgress?: (completed: number, total: number) => void): Promise<TranslationSegment[]> {
+  const segmentById = new Map(segments.map((segment) => [segment.segment_id, segment]));
+  const prepared = [...chunksBySegment.values()].flat().map((chunk): PreparedChunk => {
+    const protectedValue = protectForTranslation(chunk.source_text, glossary, strategy);
+    const segment = segmentById.get(chunk.segment_id)!;
+    return { chunk, tokens: protectedValue.tokens, request: { segment_id: chunk.chunk_id, text: protectedValue.protected_text, context: { segment_id: segment.segment_id, page_number: segment.page_number, block_type: segment.block_type, glossary_matches: segment.glossary_matches } } };
+  });
+  let results: TranslationProviderResult[];
+  try {
+    results = await provider.translateBatch(prepared.map((item) => item.request), { source_language: job.source_language, target_language: job.target_language, signal, onProgress });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return segments.map((segment) => assembleSegment(segment, (chunksBySegment.get(segment.segment_id) ?? []).map((chunk) => ({ ...chunk, status: "failed", warnings: [message] }))));
+  }
+  const resultCounts = new Map<string, number>();
+  for (const result of results) resultCounts.set(result.segment_id, (resultCounts.get(result.segment_id) ?? 0) + 1);
+  const byId = new Map(results.map((result) => [result.segment_id, result]));
+  const completed = new Map<string, TranslationChunk[]>();
+  for (const item of prepared) {
+    const result = byId.get(item.chunk.chunk_id);
+    const chunk = resultCounts.get(item.chunk.chunk_id) === 1
+      ? applyChunkResult(item, result, strategy)
+      : { ...item.chunk, status: "failed" as const, warnings: [result ? "duplicate_chunk_result" : "missing_chunk_result"] };
+    completed.set(chunk.segment_id, [...(completed.get(chunk.segment_id) ?? []), chunk]);
+  }
+  return segments.map((segment) => {
+    const firstResult = prepared
+      .filter((item) => item.chunk.segment_id === segment.segment_id)
+      .map((item) => byId.get(item.chunk.chunk_id))
+      .find(Boolean);
+    const lockedInline = segment.glossary_matches.some((match) => match.mode === "locked_inline");
+    return assembleSegment({
+      ...segment,
+      model_id: firstResult?.model_id ?? segment.model_id,
+      provider_id: firstResult?.provider_id ?? provider.id,
+      needs_review: segment.needs_review || lockedInline,
+      warnings: lockedInline ? [...new Set([...segment.warnings, "locked_inline_glossary"])] : segment.warnings,
+    }, completed.get(segment.segment_id) ?? []);
+  });
+}
+
+function applyChunkResult(prepared: PreparedChunk, result: TranslationProviderResult | undefined, strategy: PlaceholderStrategy): TranslationChunk {
+  const decoding = result?.max_decoding_length == null ? null : { max_decoding_length: result.max_decoding_length, output_token_count: result.output_token_count ?? 0, reached_limit: result.reached_decoding_limit === true, has_end_token: result.has_end_token ?? null, beam_size: result.beam_size ?? 2 };
+  const metadata = { source_token_count: result?.source_token_count ?? null, decoding };
+  if (!result) return { ...prepared.chunk, ...metadata, status: "failed", warnings: ["missing_chunk_result"] };
+  if (result.error || result.translated_text === null) return { ...prepared.chunk, ...metadata, status: "failed", warnings: [result.error?.code ?? "empty_chunk_result"] };
+  if (result.reached_decoding_limit) return { ...prepared.chunk, ...metadata, status: "failed", warnings: ["decoding_limit"] };
+  try {
+    const translated_text = restoreProtectedTokens(result.translated_text, prepared.tokens);
+    const retainedWarnings = prepared.chunk.warnings.filter((warning) => warning === "forced_chunking");
+    return { ...prepared.chunk, ...metadata, translated_text, status: translated_text.trim() ? "translated" : "failed", warnings: translated_text.trim() ? retainedWarnings : [...retainedWarnings, "empty_chunk_result"], placeholder_attempts: [...prepared.chunk.placeholder_attempts, placeholderAttempt(strategy, result.translated_text, true, null)] };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ...prepared.chunk, ...metadata, status: "failed", warnings: ["placeholder_integrity"], placeholder_attempts: [...prepared.chunk.placeholder_attempts, placeholderAttempt(strategy, result.translated_text, false, message)] };
+  }
+}
+
+function assembleSegment(segment: TranslationSegment, chunks: TranslationChunk[], placeholderRetry = false): TranslationSegment {
+  const complete = chunks.length > 0 && chunks.every((chunk) => chunk.status === "translated" && chunk.translated_text.trim());
+  const warnings = [...new Set([...segment.warnings, ...chunks.flatMap((chunk) => chunk.warnings)])];
+  if (placeholderRetry && complete) warnings.push("placeholder_retry_succeeded");
+  if (placeholderRetry && !complete) warnings.push("placeholder_retry_failed");
+  const translated = complete ? chunks.map((chunk) => chunk.translated_text + chunk.separator_after).join("").trimEnd() : "";
+  return { ...segment, chunks, translated_text: translated, edited_translation: translated, status: complete ? "translated" : "failed", error: complete ? null : "Vsaj en modelni del segmenta ni bil uspešno preveden.", translation_origin: complete ? "provider" : segment.translation_origin, placeholder_attempts: chunks.flatMap((chunk) => chunk.placeholder_attempts), needs_review: segment.needs_review || placeholderRetry || segment.forced_chunking, warnings, model_id: segment.model_id, provider_id: segment.provider_id };
+}
+
+function placeholderAttempt(strategy: PlaceholderStrategy, provider_text: string | null, valid: boolean, error: string | null): PlaceholderAttempt {
+  return { strategy, provider_text, valid, error };
+}
+
+export function createTranslationChunks(segment: TranslationSegment): TranslationChunk[] {
+  const parts = ["paragraph", "list_item"].includes(segment.block_type)
+    ? sentenceRanges(segment.source_text)
+    : [{ source_text: segment.source_text, source_start: 0, source_end: segment.source_text.length, separator_after: "" }];
+  return parts.map((part, index) => ({
+    chunk_id: `${segment.segment_id}-c${index + 1}`,
+    segment_id: segment.segment_id,
+    ...part,
+    source_token_count: null,
+    translated_text: "",
+    status: "pending",
+    warnings: [],
+    placeholder_attempts: [],
+    decoding: null,
+  }));
+}
+
+function sentenceRanges(text: string): Array<Pick<TranslationChunk, "source_text" | "source_start" | "source_end" | "separator_after">> {
+  const ranges: Array<Pick<TranslationChunk, "source_text" | "source_start" | "source_end" | "separator_after">> = [];
+  let start = 0;
+  const boundary = /[.!?](?=(?:\r?\n|[ \t])+\S)/g;
+  for (const match of text.matchAll(boundary)) {
+    const end = match.index! + 1;
+    const candidate = text.slice(start, end);
+    if (/(?:\be\.g\.|\bi\.e\.|(?:^|\s)[A-Z]\.)$/i.test(candidate)) continue;
+    let next = end;
+    while (next < text.length && /\s/.test(text[next])) next += 1;
+    ranges.push({ source_text: text.slice(start, end), source_start: start, source_end: end, separator_after: text.slice(end, next) });
+    start = next;
+  }
+  if (start < text.length) ranges.push({ source_text: text.slice(start), source_start: start, source_end: text.length, separator_after: "" });
+  return ranges.length ? ranges : [{ source_text: text, source_start: 0, source_end: text.length, separator_after: "" }];
+}
+
+export function splitOversizedChunk(chunk: TranslationChunk): TranslationChunk[] | null {
+  const candidates = [...chunk.source_text.matchAll(/[;:,](?=\s)/g)].map((match) => match.index! + 1);
+  if (!candidates.length) return null;
+  const middle = chunk.source_text.length / 2;
+  const split = candidates.sort((a, b) => Math.abs(a - middle) - Math.abs(b - middle))[0];
+  let right = split;
+  while (right < chunk.source_text.length && /\s/.test(chunk.source_text[right])) right += 1;
+  const leftText = chunk.source_text.slice(0, split);
+  const rightText = chunk.source_text.slice(right);
+  if (!leftText.trim() || !rightText.trim() || /(?:TK|GLS|PHX)\d*$/.test(leftText)) return null;
+  return [
+    { ...chunk, chunk_id: `${chunk.chunk_id}.1`, source_text: leftText, source_end: chunk.source_start + split, separator_after: chunk.source_text.slice(split, right), status: "pending", translated_text: "", warnings: ["forced_chunking"], placeholder_attempts: [], decoding: null },
+    { ...chunk, chunk_id: `${chunk.chunk_id}.2`, source_text: rightText, source_start: chunk.source_start + right, separator_after: chunk.separator_after, status: "pending", translated_text: "", warnings: ["forced_chunking"], placeholder_attempts: [], decoding: null },
+  ];
+}
+
+function applyExactSegmentGlossary(segment: TranslationSegment, glossary: GlossaryEntry[]): TranslationSegment {
+  const entry = findExactSegmentGlossaryMatch(segment.source_text, glossary);
+  if (!entry?.target_term.trim()) return segment;
+  return {
+    ...segment,
+    translated_text: entry.target_term,
+    edited_translation: entry.target_term,
+    status: "translated",
+    quality: null,
+    error: null,
+    glossary_matches: findGlossaryMatches(segment.source_text, glossary),
+    translation_origin: "glossary",
+    glossary_entry_id: entry.id,
+    model_id: null,
+    provider_id: null,
+    placeholder_attempts: [],
+    needs_review: false,
+    warnings: [],
   };
 }
 
 export function exportTranslationJob(job: TranslationJob): string {
-  return JSON.stringify(job, null, 2);
+  return JSON.stringify({ ...job, glossary_snapshot: cloneGlossary(job.glossary) }, null, 2);
 }
 
 export function importTranslationJob(value: string): TranslationJob {
   let parsed: unknown;
   try { parsed = JSON.parse(value); }
   catch { throw new Error("Datoteka ni veljaven JSON."); }
-  if (!isRecord(parsed) || parsed.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
-  if (typeof parsed.source_language !== "string" || typeof parsed.target_language !== "string" || typeof parsed.source_filename !== "string" || !Array.isArray(parsed.glossary) || !Array.isArray(parsed.segments)) {
-    throw new Error("JSON nima veljavne strukture prevajalskega opravila.");
-  }
-  for (const segment of parsed.segments) {
-    if (!isRecord(segment) || typeof segment.segment_id !== "string" || typeof segment.block_id !== "string" || typeof segment.source_text !== "string" || typeof segment.edited_translation !== "string" || !["pending", "translating", "translated", "reviewed", "failed", "skipped"].includes(String(segment.status))) {
-      throw new Error("JSON vsebuje neveljaven prevajalski segment.");
-    }
-  }
-  return parsed as TranslationJob;
+  if (!isRecord(parsed)) throw new Error("JSON nima veljavne strukture prevajalskega opravila.");
+  const migrated = parsed.schema_version === 1
+    ? migrateSchemaTwo(migrateSchemaOne(parsed))
+    : parsed.schema_version === 2 ? migrateSchemaTwo(parsed) : parsed;
+  if (!isRecord(migrated) || migrated.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
+  validateJobShape(migrated);
+  return migrated as TranslationJob;
 }
 
 export function validateTranslationJobCompatibility(imported: TranslationJob, expected: TranslationJob): void {
-  if (imported.source_filename !== expected.source_filename) {
-    throw new Error("Opravilo pripada drugemu izvornemu dokumentu.");
-  }
-  if (imported.segments.length !== expected.segments.length) {
-    throw new Error("Opravilo ni združljivo s trenutnim dokumentnim modelom.");
-  }
+  if (imported.source_filename !== expected.source_filename) throw new Error("Opravilo pripada drugemu izvornemu dokumentu.");
+  if (imported.segments.length !== expected.segments.length) throw new Error("Opravilo ni združljivo s trenutnim dokumentnim modelom.");
   const expectedById = new Map(expected.segments.map((segment) => [segment.segment_id, segment]));
   for (const segment of imported.segments) {
     const source = expectedById.get(segment.segment_id);
@@ -297,6 +485,138 @@ export function validateTranslationJobCompatibility(imported: TranslationJob, ex
       throw new Error("Opravilo vsebuje spremenjene ali nezdružljive izvorne segmente.");
     }
   }
+}
+
+function migrateSchemaOne(job: Record<string, unknown>): Record<string, unknown> {
+  validateBaseJob(job);
+  const glossary = (job.glossary as unknown[]).map((value, index) => migrateGlossaryEntry(value, index));
+  const segments = (job.segments as unknown[]).map((value) => {
+    if (!isRecord(value) || typeof value.source_text !== "string") throw new Error("JSON vsebuje neveljaven prevajalski segment.");
+    const translated =
+      (typeof value.edited_translation === "string" && value.edited_translation.trim()) ||
+      (typeof value.translated_text === "string" && value.translated_text.trim());
+    return {
+      ...value,
+      protected_tokens: protectForTranslation(value.source_text, glossary).tokens,
+      glossary_matches: findGlossaryMatches(value.source_text, glossary),
+      translation_origin: translated ? "manual" : null,
+      glossary_entry_id: null,
+      model_id: null,
+      provider_id: null,
+      placeholder_attempts: [],
+      needs_review: false,
+      warnings: [],
+    };
+  });
+  return { ...job, schema_version: 2, glossary, glossary_snapshot: cloneGlossary(glossary), segments };
+}
+
+function migrateSchemaTwo(job: Record<string, unknown>): Record<string, unknown> {
+  validateBaseJob(job);
+  return {
+    ...job,
+    schema_version: 3,
+    segments: (job.segments as unknown[]).map((value) => {
+      if (!isRecord(value)) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
+      return { ...value, chunks: [], forced_chunking: false };
+    }),
+  };
+}
+
+function migrateGlossaryEntry(value: unknown, index: number): GlossaryEntry {
+  if (!isRecord(value) || typeof value.source_term !== "string" || typeof value.target_term !== "string") throw new Error("JSON vsebuje neveljaven slovarski vnos.");
+  return {
+    id: typeof value.id === "string" ? value.id : `migrated-${index}`,
+    source_term: value.source_term,
+    target_term: value.target_term,
+    case_sensitive: value.case_sensitive === true,
+    mode: value.do_not_translate === true ? "do_not_translate" : "locked_inline",
+    enabled: true,
+    origin: "user",
+  };
+}
+
+function validateJobShape(job: Record<string, unknown>): void {
+  validateBaseJob(job);
+  if (!Array.isArray(job.glossary_snapshot)) throw new Error("JSON nima posnetka uporabljenega slovarja.");
+  for (const entry of [...job.glossary as unknown[], ...job.glossary_snapshot]) validateGlossaryEntry(entry);
+  for (const segment of job.segments as unknown[]) {
+    if (!isRecord(segment) ||
+      typeof segment.segment_id !== "string" ||
+      typeof segment.page_number !== "number" ||
+      typeof segment.block_id !== "string" ||
+      typeof segment.block_type !== "string" ||
+      typeof segment.source_language !== "string" ||
+      typeof segment.target_language !== "string" ||
+      typeof segment.source_text !== "string" ||
+      !["native", "accepted_ocr"].includes(String(segment.source_text_origin)) ||
+      typeof segment.translated_text !== "string" ||
+      typeof segment.edited_translation !== "string" ||
+      !["pending", "translating", "translated", "reviewed", "failed", "skipped"].includes(String(segment.status)) ||
+      ![null, "glossary", "provider", "manual"].includes(segment.translation_origin as null | string) ||
+      !isStringOrNull(segment.glossary_entry_id) ||
+      !isStringOrNull(segment.model_id) ||
+      !isStringOrNull(segment.provider_id) ||
+      typeof segment.needs_review !== "boolean" ||
+      !Array.isArray(segment.placeholder_attempts) ||
+      !segment.placeholder_attempts.every(isPlaceholderAttempt) ||
+      !Array.isArray(segment.chunks) ||
+      !segment.chunks.every(isTranslationChunk) ||
+      typeof segment.forced_chunking !== "boolean" ||
+      !Array.isArray(segment.warnings) ||
+      !segment.warnings.every((warning) => typeof warning === "string")) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
+  }
+}
+
+function validateGlossaryEntry(value: unknown): void {
+  if (!isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.source_term !== "string" ||
+    typeof value.target_term !== "string" ||
+    typeof value.case_sensitive !== "boolean" ||
+    !["exact_segment", "do_not_translate", "preferred", "locked_inline"].includes(String(value.mode)) ||
+    typeof value.enabled !== "boolean" ||
+    !["built_in", "user"].includes(String(value.origin)) ||
+    (value.default_target_term !== undefined && typeof value.default_target_term !== "string")) {
+    throw new Error("JSON vsebuje neveljaven slovarski vnos.");
+  }
+}
+
+function isPlaceholderAttempt(value: unknown): boolean {
+  return isRecord(value) &&
+    ["primary_tk", "retry_phx"].includes(String(value.strategy)) &&
+    isStringOrNull(value.provider_text) &&
+    typeof value.valid === "boolean" &&
+    isStringOrNull(value.error);
+}
+
+function isTranslationChunk(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.chunk_id === "string" &&
+    typeof value.segment_id === "string" &&
+    typeof value.source_text === "string" &&
+    typeof value.source_start === "number" &&
+    typeof value.source_end === "number" &&
+    typeof value.separator_after === "string" &&
+    ["pending", "translated", "failed"].includes(String(value.status)) &&
+    Array.isArray(value.warnings) &&
+    Array.isArray(value.placeholder_attempts);
+}
+
+function isStringOrNull(value: unknown): boolean {
+  return value === null || typeof value === "string";
+}
+
+function validateBaseJob(job: Record<string, unknown>): void {
+  if (typeof job.source_language !== "string" ||
+    typeof job.target_language !== "string" ||
+    typeof job.source_filename !== "string" ||
+    !Array.isArray(job.glossary) ||
+    !Array.isArray(job.segments)) throw new Error("JSON nima veljavne strukture prevajalskega opravila.");
+}
+
+function cloneGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
+  return entries.map((entry) => ({ ...entry }));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

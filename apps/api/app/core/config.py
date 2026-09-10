@@ -1,6 +1,6 @@
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import Any, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
@@ -13,7 +13,8 @@ class Settings(BaseSettings):
     processing_tmp_dir: Path = Path(tempfile.gettempdir()) / "jub-koop-pdf-pipeline"
     max_upload_bytes: int = 50 * 1024 * 1024
     poppler_pdftoppm: str = "pdftoppm"
-    local_translation_model_path: Path = Path("local-models/opus-mt-en-sla-ct2-int8")
+    local_translation_profile: Literal["hplt-en-sl-v2", "opus-en-sla"] = "hplt-en-sl-v2"
+    local_translation_model_path: Path = Path("local-models/hplt-en-sl-v2-ct2-int8")
     local_translation_device: str = "cpu"
     local_translation_compute_type: str = "int8"
 

@@ -27,15 +27,16 @@ test("rejects external translation API origins", () => {
   );
 });
 
-test("reports an unavailable local provider without presenting a test provider", async () => {
+test("reports the active HPLT profile when the local model is unavailable", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input) => {
     assert.match(String(input), /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/translation\/providers\/local\/status$/);
     return new Response(JSON.stringify({
       available: false,
       loaded: false,
-      provider_id: "local-opus-ctranslate2",
-      model_id: "Helsinki-NLP/opus-mt-en-sla",
+      provider_id: "local-hplt-ctranslate2",
+      model_id: "HPLT/translate-en-sl-v2.0-hplt",
+      profile_id: "hplt-en-sl-v2",
       device: "cpu",
       compute_type: "int8",
       message: "Lokalni prevajalnik ni nameščen.",
@@ -45,7 +46,8 @@ test("reports an unavailable local provider without presenting a test provider",
   try {
     const status = await getLocalTranslationStatus();
     assert.equal(status.available, false);
-    assert.equal(status.provider_id, "local-opus-ctranslate2");
+    assert.equal(status.provider_id, "local-hplt-ctranslate2");
+    assert.equal(status.profile_id, "hplt-en-sl-v2");
     assert.doesNotMatch(status.provider_id, /test/i);
   } finally {
     globalThis.fetch = originalFetch;
@@ -63,8 +65,8 @@ test("batches locally, preserves order and reports progress", async () => {
     assert.equal(payload.source_language, "en");
     assert.equal(payload.target_language, "sl");
     return new Response(JSON.stringify({
-      provider_id: "local-opus-ctranslate2",
-      model_id: "Helsinki-NLP/opus-mt-en-sla",
+      provider_id: "local-hplt-ctranslate2",
+      model_id: "HPLT/translate-en-sl-v2.0-hplt",
       processing_time_ms: 1,
       results: payload.segments.map((segment) => ({
         segment_id: segment.segment_id,

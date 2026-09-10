@@ -2,6 +2,10 @@ import type { StructuredBlockKind } from "./pdf-types";
 
 export type TranslationStatus = "pending" | "translating" | "translated" | "reviewed" | "failed" | "skipped";
 export type TranslationSourceOrigin = "native" | "accepted_ocr";
+export type TranslationOrigin = "glossary" | "provider" | "manual" | null;
+export type GlossaryMode = "exact_segment" | "do_not_translate" | "preferred" | "locked_inline";
+export type GlossaryOrigin = "built_in" | "user";
+export type PlaceholderStrategy = "primary_tk" | "retry_phx";
 
 export type ProtectedToken = {
   placeholder: string;
@@ -15,8 +19,10 @@ export type GlossaryEntry = {
   source_term: string;
   target_term: string;
   case_sensitive: boolean;
-  exact_match: boolean;
-  do_not_translate: boolean;
+  mode: GlossaryMode;
+  enabled: boolean;
+  origin: GlossaryOrigin;
+  default_target_term?: string;
 };
 
 export type GlossaryMatch = {
@@ -24,7 +30,36 @@ export type GlossaryMatch = {
   source_term: string;
   target_term: string;
   matched_text: string;
-  do_not_translate: boolean;
+  mode: GlossaryMode;
+  origin: GlossaryOrigin;
+};
+
+export type PlaceholderAttempt = {
+  strategy: PlaceholderStrategy;
+  provider_text: string | null;
+  valid: boolean;
+  error: string | null;
+};
+
+export type TranslationChunk = {
+  chunk_id: string;
+  segment_id: string;
+  source_text: string;
+  source_start: number;
+  source_end: number;
+  separator_after: string;
+  source_token_count: number | null;
+  translated_text: string;
+  status: "pending" | "translated" | "failed";
+  warnings: string[];
+  placeholder_attempts: PlaceholderAttempt[];
+  decoding: {
+    max_decoding_length: number;
+    output_token_count: number;
+    reached_limit: boolean;
+    has_end_token: boolean | null;
+    beam_size: number;
+  } | null;
 };
 
 export type TranslationSegment = {
@@ -44,16 +79,26 @@ export type TranslationSegment = {
   skip_reason: string | null;
   protected_tokens: ProtectedToken[];
   glossary_matches: GlossaryMatch[];
+  translation_origin: TranslationOrigin;
+  glossary_entry_id: string | null;
+  model_id: string | null;
+  provider_id: string | null;
+  placeholder_attempts: PlaceholderAttempt[];
+  needs_review: boolean;
+  warnings: string[];
+  chunks: TranslationChunk[];
+  forced_chunking: boolean;
   created_at: string;
 };
 
 export type TranslationJob = {
-  schema_version: 1;
+  schema_version: 3;
   source_filename: string;
   source_language: string;
   target_language: string;
   created_at: string;
   glossary: GlossaryEntry[];
+  glossary_snapshot: GlossaryEntry[];
   segments: TranslationSegment[];
 };
 
@@ -75,6 +120,14 @@ export type TranslationProviderResult = {
   translated_text: string | null;
   confidence: number | null;
   error: { code: string; message: string; retryable: boolean } | null;
+  provider_id?: string | null;
+  model_id?: string | null;
+  source_token_count?: number | null;
+  output_token_count?: number | null;
+  max_decoding_length?: number | null;
+  reached_decoding_limit?: boolean;
+  has_end_token?: boolean | null;
+  beam_size?: number | null;
 };
 
 export interface TranslationProvider {

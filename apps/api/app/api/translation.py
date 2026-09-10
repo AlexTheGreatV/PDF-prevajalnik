@@ -14,6 +14,7 @@ from app.translation_models import LocalTranslationStatus, TranslationBatchReque
 router = APIRouter()
 _provider = LocalCTranslate2TranslationProvider(
     model_path=settings.local_translation_model_path,
+    profile_name=settings.local_translation_profile,
     device=settings.local_translation_device,
     compute_type=settings.local_translation_compute_type,
 )

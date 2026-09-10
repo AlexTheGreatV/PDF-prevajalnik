@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from app.services.translation import LocalCTranslate2TranslationProvider, load_runtime_model_spec
-from app.translation_profiles import MODEL_PROFILES, get_model_profile
+from app.core.config import Settings
+from app.translation_profiles import DEFAULT_TRANSLATION_PROFILE, MODEL_PROFILES, get_model_profile
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
@@ -30,6 +31,19 @@ def test_profiles_are_pinned_and_keep_default_opus_output() -> None:
     assert hplt.license == "CC-BY-4.0"
     assert all(len(profile.revision) == 40 for profile in MODEL_PROFILES.values())
     assert hplt.expected_sha256["model.npz.best-chrf.npz"] == "e2a9d7f680e6fbd9de1bf909ed6fae282d8e96418430b10d2eb9f7c3edb90fe6"
+
+
+def test_hplt_is_default_and_opus_is_a_valid_override() -> None:
+    assert DEFAULT_TRANSLATION_PROFILE == "hplt-en-sl-v2"
+    defaults = Settings(_env_file=None)
+    assert defaults.local_translation_profile == "hplt-en-sl-v2"
+    assert defaults.local_translation_model_path.as_posix() == "local-models/hplt-en-sl-v2-ct2-int8"
+    override = Settings(
+        _env_file=None,
+        local_translation_profile="opus-en-sla",
+        local_translation_model_path="local-models/opus-mt-en-sla-ct2-int8",
+    )
+    assert override.local_translation_profile == "opus-en-sla"
 
 
 def test_hplt_manifest_selects_shared_tokenizer_without_prefix(tmp_path: Path) -> None:

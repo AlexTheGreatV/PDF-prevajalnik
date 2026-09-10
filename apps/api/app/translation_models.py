@@ -38,6 +38,12 @@ class TranslationTextResult(BaseModel):
     confidence: float | None = None
     error: TranslationError | None = None
     processing_time_ms: int
+    source_token_count: int | None = None
+    output_token_count: int | None = None
+    max_decoding_length: int | None = None
+    reached_decoding_limit: bool = False
+    has_end_token: bool | None = None
+    beam_size: int | None = None
 
 
 class TranslationBatchResponse(BaseModel):
@@ -54,6 +60,7 @@ class LocalTranslationStatus(BaseModel):
     loaded: bool
     provider_id: str
     model_id: str
+    profile_id: str
     device: str
     compute_type: str
     message: str | None = None

@@ -68,15 +68,15 @@ Preparing a model additionally requires the heavier conversion dependencies:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r apps/api/requirements-translation-prep.txt
-.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --profile opus-en-sla --download
+.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --profile hplt-en-sl-v2 --download
 ```
 
 The preparation command supports the pinned `opus-en-sla` and `hplt-en-sl-v2` profiles. It downloads an official revision only when explicitly invoked, converts it to CTranslate2 INT8, and writes source and output hashes to a local manifest. It never runs during API startup, tests, or frontend builds. Models are stored under ignored `local-models/`; use `--source-dir` instead of `--download` when an approved snapshot was transferred separately. Existing output is not replaced unless `--force` is explicitly passed.
 
-The direct HPLT English-to-Slovenian comparison model can be prepared separately without changing the default OPUS model:
+HPLT is the default local English-to-Slovenian profile. OPUS-MT remains available as an explicit alternative:
 
 ```powershell
-.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --profile hplt-en-sl-v2 --download
+.\.venv\Scripts\python.exe apps/api/scripts/prepare_local_translation_model.py --profile opus-en-sla --download
 ```
 
 HPLT publishes a shared SentencePiece model and a score-based TSV vocabulary. The preparation script verifies both official files, derives the ID-based YAML vocabulary required by CTranslate2's Marian converter, and records that derivation in the model manifest.
@@ -84,10 +84,17 @@ HPLT publishes a shared SentencePiece model and a score-based TSV vocabulary. Th
 Runtime configuration:
 
 ```text
-LOCAL_TRANSLATION_MODEL_PATH=local-models/opus-mt-en-sla-ct2-int8
+LOCAL_TRANSLATION_PROFILE=hplt-en-sl-v2
+LOCAL_TRANSLATION_MODEL_PATH=local-models/hplt-en-sl-v2-ct2-int8
 LOCAL_TRANSLATION_DEVICE=cpu
 LOCAL_TRANSLATION_COMPUTE_TYPE=int8
 ```
+
+To use the OPUS-MT alternative, set `LOCAL_TRANSLATION_PROFILE=opus-en-sla` together with `LOCAL_TRANSLATION_MODEL_PATH=local-models/opus-mt-en-sla-ct2-int8`. The application never downloads either model during startup, tests, or builds.
+
+Translation jobs include a configurable technical glossary. Built-in entries use whole-segment matching and produce unreviewed translation candidates that still require manual confirmation; inline locking is opt-in and always marks the result for review. Exported schema version 3 jobs include a glossary snapshot and model-inference chunks, and can safely import schema versions 1 and 2 through explicit migrations.
+
+Paragraphs and list items are translated sentence by sentence while remaining one reviewable segment. The local runtime counts actual SentencePiece tokens, uses a dynamic decoding limit between 64 and 768 tokens, rejects truncated output, and permits one safe punctuation-based split when a single chunk exceeds a model limit.
 
 Local translation endpoints:
 

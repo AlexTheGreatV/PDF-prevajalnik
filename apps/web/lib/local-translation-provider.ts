@@ -9,6 +9,7 @@ export type LocalTranslationStatus = {
   loaded: boolean;
   provider_id: string;
   model_id: string;
+  profile_id: string;
   device: string;
   compute_type: string;
   message: string | null;
@@ -36,7 +37,7 @@ export async function getLocalTranslationStatus(signal?: AbortSignal): Promise<L
 }
 
 export class LocalTranslationProvider implements TranslationProvider {
-  readonly id = "local-opus-ctranslate2";
+  readonly id = "local-ctranslate2";
 
   async translateBatch(
     requests: TranslationRequest[],
@@ -49,7 +50,7 @@ export class LocalTranslationProvider implements TranslationProvider {
   ): Promise<TranslationProviderResult[]> {
     const sourceLanguage = options.source_language === "auto" ? "en" : options.source_language;
     if (sourceLanguage !== "en" || options.target_language !== "sl") {
-      throw new Error("Lokalni OPUS-MT prototip podpira samo prevod iz angleščine v slovenščino.");
+      throw new Error("Lokalni prevajalnik podpira samo prevod iz angleščine v slovenščino.");
     }
     const results: TranslationProviderResult[] = [];
     for (let offset = 0; offset < requests.length; offset += MAX_BATCH_SIZE) {
@@ -66,7 +67,11 @@ export class LocalTranslationProvider implements TranslationProvider {
         signal: options.signal,
       });
       const payload = await parseResponse<LocalTranslationResponse>(response);
-      results.push(...payload.results);
+      results.push(...payload.results.map((result) => ({
+        ...result,
+        provider_id: payload.provider_id,
+        model_id: payload.model_id,
+      })));
       options.onProgress?.(results.length, requests.length);
     }
     const byId = new Map(results.map((result) => [result.segment_id, result]));

@@ -5,6 +5,7 @@ from typing import Literal
 
 
 ConverterKind = Literal["transformers", "marian"]
+DEFAULT_TRANSLATION_PROFILE = "hplt-en-sl-v2"
 
 
 @dataclass(frozen=True)
