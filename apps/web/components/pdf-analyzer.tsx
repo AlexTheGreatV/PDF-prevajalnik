@@ -378,7 +378,7 @@ export function PdfAnalyzer() {
         />
       )}
 
-      {analysis?.document && <TranslationWorkspace analysis={analysis} ocrItems={ocrItems} />}
+      {analysis?.document && file && <TranslationWorkspace analysis={analysis} ocrItems={ocrItems} sourceFile={file} />}
 
       {analysis && (
         <>

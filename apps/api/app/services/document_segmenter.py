@@ -87,7 +87,7 @@ def segment_pdf(path: Path) -> DocumentModel:
         metadata["pymupdf_version"] = fitz.VersionBind
         metadata["table_detection"] = "pymupdf_find_tables" if hasattr(fitz.Page, "find_tables") else "none"
 
-        extracted_pages: list[tuple[fitz.Rect, list[RawLine], list[RawTable], list[DocumentImage], PdfKind]] = []
+        extracted_pages: list[tuple[fitz.Rect, int, list[RawLine], list[RawTable], list[DocumentImage], PdfKind]] = []
         for page_index, page in enumerate(document):
             page_number = page_index + 1
             rect = page.rect
@@ -103,16 +103,17 @@ def segment_pdf(path: Path) -> DocumentModel:
                 if line.y0 >= rect.height * 0.92:
                     repeated_footers[_fingerprint(line.original_text)] += 1
 
-            extracted_pages.append((rect, lines, tables, images, page_kind))
+            extracted_pages.append((rect, page.rotation, lines, tables, images, page_kind))
 
         header_texts = _repeated_texts(repeated_headers, len(extracted_pages))
         footer_texts = _repeated_texts(repeated_footers, len(extracted_pages))
 
-        for page_index, (rect, lines, tables, images, page_kind) in enumerate(extracted_pages):
+        for page_index, (rect, rotation, lines, tables, images, page_kind) in enumerate(extracted_pages):
             pages.append(
                 _build_page(
                     page_number=page_index + 1,
                     rect=rect,
+                    rotation=rotation,
                     lines=lines,
                     tables=tables,
                     images=images,
@@ -301,6 +302,7 @@ def _extract_images(page: fitz.Page) -> list[DocumentImage]:
 def _build_page(
     page_number: int,
     rect: fitz.Rect,
+    rotation: int,
     lines: list[RawLine],
     tables: list[RawTable],
     images: list[DocumentImage],
@@ -348,6 +350,7 @@ def _build_page(
         page_number=page_number,
         width=float(rect.width),
         height=height,
+        rotation=rotation,
         page_type=page_kind,
         regions=regions,
         images=images,

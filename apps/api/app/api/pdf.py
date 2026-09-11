@@ -3,18 +3,24 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Iterator
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
+from pydantic import ValidationError
 
 from app.core.config import settings
 from app.models import OcrResponse, PdfAnalysis, RenderResult
+from app.pdf_export_models import ExportMode, PdfExportJob, PdfExportPlan
 from app.services.ocr import run_selective_ocr
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_renderer import render_pdf_pages_as_data_urls
+from app.services.pdf_exporter import PdfExportValidationError, export_translated_pdf, plan_pdf_export
 
 router = APIRouter()
 PDF_MAGIC = b"%PDF-"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+MAX_TRANSLATION_JOB_BYTES = 5 * 1024 * 1024
 
 
 @router.post("/analyze", response_model=PdfAnalysis)
@@ -68,6 +74,58 @@ async def ocr(file: UploadFile = File(...), language: str = Form("eng"), dpi: in
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail="OCR priprava PDF-ja ni uspela.") from exc
+
+
+@router.post("/export-translated/plan", response_model=PdfExportPlan)
+async def plan_translated_export(
+    file: UploadFile = File(...),
+    translation_job: str = Form(...),
+    mode: ExportMode = Form(...),
+) -> PdfExportPlan:
+    job = _parse_export_job(translation_job)
+    with _processing_tempdir() as temp_dir:
+        temp_path = Path(temp_dir)
+        path = await _save_upload(file, temp_path)
+        try:
+            return plan_pdf_export(path, job, mode, temp_path)
+        except PdfExportValidationError as exc:
+            raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Načrta izvoza PDF ni bilo mogoče pripraviti.") from exc
+
+
+@router.post("/export-translated")
+async def translated_export(
+    file: UploadFile = File(...),
+    translation_job: str = Form(...),
+    mode: ExportMode = Form(...),
+) -> Response:
+    job = _parse_export_job(translation_job)
+    with _processing_tempdir() as temp_dir:
+        temp_path = Path(temp_dir)
+        path = await _save_upload(file, temp_path)
+        try:
+            artifact = export_translated_pdf(path, job, mode, temp_path)
+            content = artifact.path.read_bytes()
+        except PdfExportValidationError as exc:
+            raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Izvoza PDF ni bilo mogoče izdelati.") from exc
+    encoded_name = quote(artifact.plan.filename)
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
+    )
+
+
+def _parse_export_job(value: str) -> PdfExportJob:
+    if len(value.encode("utf-8")) > MAX_TRANSLATION_JOB_BYTES:
+        raise HTTPException(status_code=413, detail="Prevajalsko opravilo je preveliko.")
+    try:
+        return PdfExportJob.model_validate_json(value)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="Prevajalsko opravilo ni veljavno za izvoz PDF.") from exc
 
 
 async def _save_upload(file: UploadFile, upload_dir: Path) -> Path:

@@ -38,13 +38,16 @@ class PageAnalysis(BaseModel):
     kind: PdfKind
     extracted_text_chars: int
     dimensions: PageDimensions
+    rotation: int = 0
     text_blocks: list[TextBlock] = Field(default_factory=list)
     image_count: int = 0
 
 
 class PdfAnalysis(BaseModel):
     filename: str
+    sha256: str
     page_count: int
+    document_model_version: int = 1
     kind: PdfKind
     extracted_text_chars: int
     pages: list[PageAnalysis]
@@ -147,6 +150,7 @@ class DocumentPage(BaseModel):
     page_number: int
     width: float
     height: float
+    rotation: int = 0
     page_type: PdfKind
     regions: list[DocumentRegion] = Field(default_factory=list)
     images: list[DocumentImage] = Field(default_factory=list)

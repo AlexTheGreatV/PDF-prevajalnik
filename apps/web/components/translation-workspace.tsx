@@ -4,7 +4,9 @@ import { useMemo, useRef, useState } from "react";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
+import { PdfExportPanel } from "./pdf-export-panel";
 import {
+  bindTranslationJobToAnalysis,
   createTranslationJob,
   editTranslation,
   exportTranslationJob,
@@ -24,7 +26,7 @@ const FILTER_LABELS: Record<(typeof FILTERS)[number], string> = {
   all: "Vsi", pending: "Čakajo", translated: "Prevedeni", reviewed: "Potrjeni", failed: "Napake", skipped: "Preskočeni",
 };
 
-export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnalysis; ocrItems: OcrReviewItem[] }) {
+export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analysis: PdfAnalysis; ocrItems: OcrReviewItem[]; sourceFile: File }) {
   const importRef = useRef<HTMLInputElement | null>(null);
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("sl");
@@ -83,8 +85,9 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
       const imported = importTranslationJob(await file.text());
       const expected = createTranslationJob(analysis, ocrItems, { source_language: imported.source_language, target_language: imported.target_language, glossary: imported.glossary, created_at: imported.created_at });
       validateTranslationJobCompatibility(imported, expected);
-      setJob(imported);
-      setGlossary(imported.glossary);
+      const compatible = bindTranslationJobToAnalysis(imported, expected);
+      setJob(compatible);
+      setGlossary(compatible.glossary);
       setSourceLanguage(imported.source_language);
       setTargetLanguage(imported.target_language);
       setMessage("Prevajalsko opravilo je bilo uspešno uvoženo.");
@@ -99,7 +102,7 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
     <section className="translation-workspace">
       <div className="translation-header">
         <div>
-          <span>Mejnik 6D</span>
+          <span>Mejnik 7A</span>
           <h2>Pregled prevodov</h2>
           <p>{message}</p>
         </div>
@@ -142,6 +145,7 @@ export function TranslationWorkspace({ analysis, ocrItems }: { analysis: PdfAnal
             <span>{completed} od {actionable} prevodov potrjenih</span>
             <progress value={completed} max={actionable || 1} />
           </div>
+          <PdfExportPanel sourceFile={sourceFile} job={job} />
           <div className="translation-filters" aria-label="Filtri prevodov">
             {FILTERS.map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{FILTER_LABELS[value]}</button>)}
           </div>

@@ -900,6 +900,39 @@ pre {
 .translation-chunk p { margin: 4px 0; white-space: pre-wrap; }
 .translation-chunk small { display: block; color: #59636e; }
 
+.pdf-export-panel {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 18px 0;
+}
+
+.export-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(90px, 1fr));
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.export-summary div {
+  min-width: 0;
+  padding: 10px;
+  border-right: 1px solid var(--border);
+}
+
+.export-summary div:last-child { border-right: 0; }
+.export-summary span, .export-summary strong { display: block; }
+.export-summary span { color: var(--muted); font-size: 12px; }
+.export-summary strong { margin-top: 3px; font-size: 18px; }
+.export-skips { margin-top: 12px; }
+.export-skips p { margin: 6px 0; font-size: 13px; }
+
+@media (max-width: 800px) {
+  .export-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .export-summary div { border-bottom: 1px solid var(--border); }
+}
+
 .translation-skipped {
   background: #f7f8fa;
 }

@@ -15,7 +15,7 @@ import type {
   TranslationSegment,
 } from "./translation-types";
 
-export const TRANSLATION_JOB_SCHEMA_VERSION = 3 as const;
+export const TRANSLATION_JOB_SCHEMA_VERSION = 4 as const;
 
 export function createTranslationJob(
   analysis: PdfAnalysis,
@@ -38,6 +38,8 @@ export function createTranslationJob(
               block_id: blockId,
               block_type: "table_cell",
               page_number: page.page_number,
+              page_type: page.page_type,
+              page_rotation: page.rotation,
               region,
               block,
               source_origin: "native",
@@ -61,6 +63,8 @@ export function createTranslationJob(
           block_id: blockId,
           block_type: block.kind,
           page_number: page.page_number,
+          page_type: page.page_type,
+          page_rotation: page.rotation,
           region,
           block,
           source_origin: acceptedOcr ? "accepted_ocr" : "native",
@@ -79,6 +83,17 @@ export function createTranslationJob(
     source_language: options.source_language,
     target_language: options.target_language,
     created_at,
+    document_identity: {
+      sha256: analysis.sha256,
+      page_count: analysis.page_count,
+      document_model_version: analysis.document_model_version,
+      pages: analysis.pages.map((page) => ({
+        page_number: page.page_number,
+        width: page.dimensions.width,
+        height: page.dimensions.height,
+        rotation: page.rotation,
+      })),
+    },
     glossary,
     glossary_snapshot: cloneGlossary(glossary),
     segments,
@@ -90,6 +105,8 @@ type SegmentInput = {
   block_id: string;
   block_type: TranslationSegment["block_type"];
   page_number: number;
+  page_type: TranslationSegment["source_page_type"];
+  page_rotation: number;
   region: StructuredRegion;
   block: StructuredBlock;
   source_origin: TranslationSegment["source_text_origin"];
@@ -111,6 +128,10 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     target_language: input.target_language,
     source_text,
     source_text_origin: input.source_origin,
+    source_bbox: input.block_type === "table_cell" ? null : { ...input.block.bbox },
+    source_page_type: input.page_type,
+    source_rotation: input.page_rotation,
+    source_style: input.block_type === "table_cell" ? null : { ...input.block.style },
     translated_text: "",
     edited_translation: "",
     status: skip_reason ? "skipped" : "pending",
@@ -463,8 +484,10 @@ export function importTranslationJob(value: string): TranslationJob {
   catch { throw new Error("Datoteka ni veljaven JSON."); }
   if (!isRecord(parsed)) throw new Error("JSON nima veljavne strukture prevajalskega opravila.");
   const migrated = parsed.schema_version === 1
-    ? migrateSchemaTwo(migrateSchemaOne(parsed))
-    : parsed.schema_version === 2 ? migrateSchemaTwo(parsed) : parsed;
+    ? migrateSchemaThree(migrateSchemaTwo(migrateSchemaOne(parsed)))
+    : parsed.schema_version === 2
+      ? migrateSchemaThree(migrateSchemaTwo(parsed))
+      : parsed.schema_version === 3 ? migrateSchemaThree(parsed) : parsed;
   if (!isRecord(migrated) || migrated.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
   validateJobShape(migrated);
   return migrated as TranslationJob;
@@ -485,6 +508,29 @@ export function validateTranslationJobCompatibility(imported: TranslationJob, ex
       throw new Error("Opravilo vsebuje spremenjene ali nezdružljive izvorne segmente.");
     }
   }
+  if (imported.document_identity && expected.document_identity &&
+    JSON.stringify(imported.document_identity) !== JSON.stringify(expected.document_identity)) {
+    throw new Error("Opravilo pripada drugi različici izvornega PDF-ja.");
+  }
+}
+
+export function bindTranslationJobToAnalysis(imported: TranslationJob, expected: TranslationJob): TranslationJob {
+  validateTranslationJobCompatibility(imported, expected);
+  const expectedById = new Map(expected.segments.map((segment) => [segment.segment_id, segment]));
+  return {
+    ...imported,
+    document_identity: expected.document_identity,
+    segments: imported.segments.map((segment) => {
+      const source = expectedById.get(segment.segment_id)!;
+      return {
+        ...segment,
+        source_bbox: source.source_bbox,
+        source_page_type: source.source_page_type,
+        source_rotation: source.source_rotation,
+        source_style: source.source_style,
+      };
+    }),
+  };
 }
 
 function migrateSchemaOne(job: Record<string, unknown>): Record<string, unknown> {
@@ -523,6 +569,25 @@ function migrateSchemaTwo(job: Record<string, unknown>): Record<string, unknown>
   };
 }
 
+function migrateSchemaThree(job: Record<string, unknown>): Record<string, unknown> {
+  validateBaseJob(job);
+  return {
+    ...job,
+    schema_version: 4,
+    document_identity: null,
+    segments: (job.segments as unknown[]).map((value) => {
+      if (!isRecord(value)) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
+      return {
+        ...value,
+        source_bbox: null,
+        source_page_type: null,
+        source_rotation: null,
+        source_style: null,
+      };
+    }),
+  };
+}
+
 function migrateGlossaryEntry(value: unknown, index: number): GlossaryEntry {
   if (!isRecord(value) || typeof value.source_term !== "string" || typeof value.target_term !== "string") throw new Error("JSON vsebuje neveljaven slovarski vnos.");
   return {
@@ -538,6 +603,7 @@ function migrateGlossaryEntry(value: unknown, index: number): GlossaryEntry {
 
 function validateJobShape(job: Record<string, unknown>): void {
   validateBaseJob(job);
+  if (job.document_identity !== null && !isDocumentIdentity(job.document_identity)) throw new Error("JSON vsebuje neveljavno identiteto PDF-ja.");
   if (!Array.isArray(job.glossary_snapshot)) throw new Error("JSON nima posnetka uporabljenega slovarja.");
   for (const entry of [...job.glossary as unknown[], ...job.glossary_snapshot]) validateGlossaryEntry(entry);
   for (const segment of job.segments as unknown[]) {
@@ -550,6 +616,10 @@ function validateJobShape(job: Record<string, unknown>): void {
       typeof segment.target_language !== "string" ||
       typeof segment.source_text !== "string" ||
       !["native", "accepted_ocr"].includes(String(segment.source_text_origin)) ||
+      (segment.source_bbox !== null && !isBBox(segment.source_bbox)) ||
+      ![null, "digital", "scanned", "mixed", "empty"].includes(segment.source_page_type as null | string) ||
+      !(segment.source_rotation === null || typeof segment.source_rotation === "number") ||
+      !(segment.source_style === null || isRecord(segment.source_style)) ||
       typeof segment.translated_text !== "string" ||
       typeof segment.edited_translation !== "string" ||
       !["pending", "translating", "translated", "reviewed", "failed", "skipped"].includes(String(segment.status)) ||
@@ -566,6 +636,24 @@ function validateJobShape(job: Record<string, unknown>): void {
       !Array.isArray(segment.warnings) ||
       !segment.warnings.every((warning) => typeof warning === "string")) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
   }
+}
+
+function isDocumentIdentity(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.sha256 === "string" && /^[a-f0-9]{64}$/.test(value.sha256) &&
+    typeof value.page_count === "number" &&
+    typeof value.document_model_version === "number" &&
+    Array.isArray(value.pages) && value.pages.every((page) =>
+      isRecord(page) &&
+      typeof page.page_number === "number" &&
+      typeof page.width === "number" &&
+      typeof page.height === "number" &&
+      typeof page.rotation === "number",
+    );
+}
+
+function isBBox(value: unknown): boolean {
+  return isRecord(value) && [value.x0, value.y0, value.x1, value.y1].every((coordinate) => typeof coordinate === "number" && Number.isFinite(coordinate));
 }
 
 function validateGlossaryEntry(value: unknown): void {

@@ -92,7 +92,9 @@ LOCAL_TRANSLATION_COMPUTE_TYPE=int8
 
 To use the OPUS-MT alternative, set `LOCAL_TRANSLATION_PROFILE=opus-en-sla` together with `LOCAL_TRANSLATION_MODEL_PATH=local-models/opus-mt-en-sla-ct2-int8`. The application never downloads either model during startup, tests, or builds.
 
-Translation jobs include a configurable technical glossary. Built-in entries use whole-segment matching and produce unreviewed translation candidates that still require manual confirmation; inline locking is opt-in and always marks the result for review. Exported schema version 3 jobs include a glossary snapshot and model-inference chunks, and can safely import schema versions 1 and 2 through explicit migrations.
+Translation jobs include a configurable technical glossary. Built-in entries use whole-segment matching and produce unreviewed translation candidates that still require manual confirmation; inline locking is opt-in and always marks the result for review. Schema version 3 introduced the glossary snapshot and model-inference chunks.
+
+Translation job schema version 4 binds the job to the analyzed source through its SHA-256, page count, page geometry, rotation, and document-model version. Versions 1 through 3 remain importable, but their missing identity and layout fields are populated only after every immutable source segment has been checked against the current analysis.
 
 Paragraphs and list items are translated sentence by sentence while remaining one reviewable segment. The local runtime counts actual SentencePiece tokens, uses a dynamic decoding limit between 64 and 768 tokens, rejects truncated output, and permits one safe punctuation-based split when a single chunk exceeds a model limit.
 
@@ -100,6 +102,13 @@ Local translation endpoints:
 
 - `GET /api/translation/providers/local/status`
 - `POST /api/translation/providers/local/translate`
+
+Translated PDF preview endpoints:
+
+- `POST /api/pdf/export-translated/plan` validates identity, source text, coordinates, conflicts, glyphs, and fit without changing a PDF.
+- `POST /api/pdf/export-translated` returns a new `<original-name>-sl-preview.pdf` in `diagnostic` or `replacement_preview` mode.
+
+Only manually reviewed digital text blocks are eligible. Tables, OCR-only content, rotated pages, boxes that overlap embedded images, overlapping replacements, source mismatches, and overflow are skipped with structured reasons. Replacement preflight completes before text redaction; the source PDF is never modified, temporary files are removed after each request, and images and vector graphics are preserved. The preview embeds the `Droid Sans Fallback Regular` font bundled with pinned PyMuPDF 1.28.2, without downloads or system-font lookup.
 
 The prototype supports English to Slovenian only. Documents and translations are not sent to an external translation service, and translated segments always require manual review.
 

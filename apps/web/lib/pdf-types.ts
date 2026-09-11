@@ -24,13 +24,16 @@ export type PageAnalysis = {
   kind: PdfKind;
   extracted_text_chars: number;
   dimensions: { width: number; height: number; unit: string };
+  rotation: number;
   text_blocks: TextBlock[];
   image_count: number;
 };
 
 export type PdfAnalysis = {
   filename: string;
+  sha256: string;
   page_count: number;
+  document_model_version: number;
   kind: PdfKind;
   extracted_text_chars: number;
   pages: PageAnalysis[];
@@ -189,6 +192,7 @@ export type StructuredPage = {
   page_number: number;
   width: number;
   height: number;
+  rotation: number;
   page_type: PdfKind;
   regions: StructuredRegion[];
   images: StructuredImage[];

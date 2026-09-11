@@ -5,6 +5,7 @@ import { createDefaultGlossary } from "../lib/default-glossary";
 import { findGlossaryMatches } from "../lib/glossary";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "../lib/technical-tokens";
 import {
+  bindTranslationJobToAnalysis,
   createTranslationJob,
   createTranslationChunks,
   editTranslation,
@@ -42,7 +43,16 @@ function fixture(): PdfAnalysis {
     ] },
     { kind: "header", bbox: { x0: 0, y0: 0, x1: 100, y1: 10 }, reading_order: 1, blocks: [block(1, "heading", "qPPLICATIONS")] },
   ];
-  return { filename: "fixture.pdf", page_count: 1, kind: "digital", extracted_text_chars: 120, pages: [], document: { metadata: {}, pages: [{ page_number: 1, width: 100, height: 100, page_type: "digital", regions, images: [] }] } };
+  return {
+    filename: "fixture.pdf",
+    sha256: "a".repeat(64),
+    page_count: 1,
+    document_model_version: 1,
+    kind: "digital",
+    extracted_text_chars: 120,
+    pages: [{ page_number: 1, kind: "digital", extracted_text_chars: 120, dimensions: { width: 100, height: 100, unit: "pt" }, rotation: 0, text_blocks: [], image_count: 0 }],
+    document: { metadata: {}, pages: [{ page_number: 1, width: 100, height: 100, rotation: 0, page_type: "digital", regions, images: [] }] },
+  };
 }
 
 function acceptedOcr(): OcrReviewItem {
@@ -158,7 +168,7 @@ test("JSON roundtrip retains work and rejects unsupported versions", () => {
   const job = { ...base, segments: base.segments.map((segment, index) => index === 0 ? reviewTranslation(editTranslation(segment, "UPORABA")) : segment) };
   assert.deepEqual(importTranslationJob(exportTranslationJob(job)), job);
   assert.throws(() => importTranslationJob("not-json"), /veljaven JSON/);
-  assert.throws(() => importTranslationJob('{"schema_version":4}'), /ni podprta/);
+  assert.throws(() => importTranslationJob('{"schema_version":5}'), /ni podprta/);
 });
 
 test("import compatibility rejects changes to immutable source text", () => {
@@ -278,7 +288,7 @@ test("schema one import migrates explicitly and retains immutable source identit
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 3);
+  assert.equal(migrated.schema_version, 4);
   assert.equal(migrated.glossary[0].mode, "do_not_translate");
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.glossary_snapshot, migrated.glossary);
@@ -387,9 +397,28 @@ test("schema two job migrates chunk fields without changing source identity", ()
     return legacySegment;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 3);
+  assert.equal(migrated.schema_version, 4);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.segments[0].chunks, []);
+});
+
+test("schema three job migrates without inventing identity and can be safely rebound", () => {
+  const current = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const legacy = JSON.parse(exportTranslationJob(current)) as Record<string, unknown>;
+  legacy.schema_version = 3;
+  delete legacy.document_identity;
+  legacy.segments = (legacy.segments as Array<Record<string, unknown>>).map((segment) => {
+    const copy = { ...segment };
+    for (const key of ["source_bbox", "source_page_type", "source_rotation", "source_style"]) delete copy[key];
+    return copy;
+  });
+  const migrated = importTranslationJob(JSON.stringify(legacy));
+  assert.equal(migrated.schema_version, 4);
+  assert.equal(migrated.document_identity, null);
+  assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
+  const rebound = bindTranslationJobToAnalysis(migrated, current);
+  assert.deepEqual(rebound.document_identity, current.document_identity);
+  assert.deepEqual(rebound.segments[0].source_bbox, current.segments[0].source_bbox);
 });
 
 test("cancellation during chunk translation returns the unchanged job", async () => {

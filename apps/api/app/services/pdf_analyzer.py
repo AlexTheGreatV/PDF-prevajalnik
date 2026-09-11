@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pymupdf as fitz
@@ -6,6 +7,7 @@ from app.models import PageAnalysis, PageDimensions, PdfAnalysis, PdfKind, TextB
 from app.services.document_segmenter import segment_pdf
 
 TEXT_PAGE_THRESHOLD = 25
+DOCUMENT_MODEL_VERSION = 1
 
 
 def analyze_pdf(path: Path, filename: str | None = None) -> PdfAnalysis:
@@ -28,6 +30,7 @@ def analyze_pdf(path: Path, filename: str | None = None) -> PdfAnalysis:
                     kind=page_kind,
                     extracted_text_chars=text_chars,
                     dimensions=PageDimensions(width=rect.width, height=rect.height),
+                    rotation=page.rotation,
                     text_blocks=text_blocks,
                     image_count=image_count,
                 )
@@ -36,12 +39,22 @@ def analyze_pdf(path: Path, filename: str | None = None) -> PdfAnalysis:
     total_text_chars = sum(page.extracted_text_chars for page in pages)
     return PdfAnalysis(
         filename=source_name,
+        sha256=_sha256(path),
         page_count=len(pages),
+        document_model_version=DOCUMENT_MODEL_VERSION,
         kind=_classify_document([page.kind for page in pages]),
         extracted_text_chars=total_text_chars,
         pages=pages,
         document=document_model,
     )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _extract_text_blocks(page: fitz.Page, page_number: int) -> list[TextBlock]:

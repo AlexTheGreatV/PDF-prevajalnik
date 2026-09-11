@@ -1,4 +1,4 @@
-import type { StructuredBlockKind } from "./pdf-types";
+import type { BBox, PdfKind, StructuredBlockKind, StructuredStyle } from "./pdf-types";
 
 export type TranslationStatus = "pending" | "translating" | "translated" | "reviewed" | "failed" | "skipped";
 export type TranslationSourceOrigin = "native" | "accepted_ocr";
@@ -71,6 +71,10 @@ export type TranslationSegment = {
   target_language: string;
   source_text: string;
   source_text_origin: TranslationSourceOrigin;
+  source_bbox: BBox | null;
+  source_page_type: PdfKind | null;
+  source_rotation: number | null;
+  source_style: StructuredStyle | null;
   translated_text: string;
   edited_translation: string;
   status: TranslationStatus;
@@ -92,14 +96,29 @@ export type TranslationSegment = {
 };
 
 export type TranslationJob = {
-  schema_version: 3;
+  schema_version: 4;
   source_filename: string;
   source_language: string;
   target_language: string;
   created_at: string;
+  document_identity: PdfDocumentIdentity | null;
   glossary: GlossaryEntry[];
   glossary_snapshot: GlossaryEntry[];
   segments: TranslationSegment[];
+};
+
+export type PdfPageIdentity = {
+  page_number: number;
+  width: number;
+  height: number;
+  rotation: number;
+};
+
+export type PdfDocumentIdentity = {
+  sha256: string;
+  page_count: number;
+  document_model_version: number;
+  pages: PdfPageIdentity[];
 };
 
 export type TranslationContext = {

@@ -23,7 +23,9 @@ import type { PdfAnalysis } from "../lib/pdf-types";
 
 const analysis: PdfAnalysis = {
   filename: "test.pdf",
+  sha256: "a".repeat(64),
   page_count: 1,
+  document_model_version: 1,
   kind: "digital",
   extracted_text_chars: 11,
   pages: [
@@ -32,6 +34,7 @@ const analysis: PdfAnalysis = {
       kind: "digital",
       extracted_text_chars: 11,
       dimensions: { width: 200, height: 100, unit: "pt" },
+      rotation: 0,
       image_count: 2,
       text_blocks: [
         {
@@ -119,6 +122,7 @@ test("summarizes structured document blocks", () => {
           page_number: 1,
           width: 200,
           height: 100,
+          rotation: 0,
           page_type: "digital",
           images: [],
           regions: [

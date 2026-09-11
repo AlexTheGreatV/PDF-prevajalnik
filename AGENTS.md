@@ -6,7 +6,7 @@ Build an internal document translation application for JUB/KOOP, starting with a
 
 ## Current Milestone
 
-Use HPLT as the default local English-to-Slovenian model, retain OPUS-MT as an override, and provide a reviewable technical glossary with safe placeholder retry.
+Build a safe translated-PDF export preview for manually reviewed digital text blocks without attempting full document reconstruction.
 
 Allowed:
 
@@ -14,6 +14,7 @@ Allowed:
 - Local OPUS-MT and HPLT/CTranslate2 inference and diagnostics
 - Local FastAPI translation endpoints
 - User-controlled exact, preferred, do-not-translate, and explicitly locked glossary entries
+- Local diagnostic and replacement-preview PDF export into a new temporary file
 
 Guardrails:
 
@@ -24,6 +25,8 @@ Guardrails:
 - Preserve `native_text`, OCR results, and the source document model.
 - Do not hardcode translations or silently repair damaged placeholders.
 - Never auto-review glossary or model translations; a successful placeholder retry must require manual review.
+- Never overwrite a source PDF. Export only reviewed, identity-matched, geometry-checked digital text blocks after fit preflight.
+- Preserve images and vector graphics, and skip ambiguous, overlapping, OCR-only, rotated, table, or overflowing regions with a structured reason.
 - Do not add payments, public registration, or remote document uploads.
 
 ## Architecture

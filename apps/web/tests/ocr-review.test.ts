@@ -53,6 +53,7 @@ function page(overrides: Partial<StructuredPage> = {}): StructuredPage {
     page_number: 1,
     width: 200,
     height: 100,
+    rotation: 0,
     page_type: "digital",
     images: [],
     regions: [
@@ -70,7 +71,9 @@ function page(overrides: Partial<StructuredPage> = {}): StructuredPage {
 function analysis(structuredPage = page()): PdfAnalysis {
   return {
     filename: "test.pdf",
+    sha256: "a".repeat(64),
     page_count: 1,
+    document_model_version: 1,
     kind: structuredPage.page_type,
     extracted_text_chars: 12,
     pages: [
@@ -79,6 +82,7 @@ function analysis(structuredPage = page()): PdfAnalysis {
         kind: structuredPage.page_type,
         extracted_text_chars: 12,
         dimensions: { width: structuredPage.width, height: structuredPage.height, unit: "pt" },
+        rotation: structuredPage.rotation,
         text_blocks: [],
         image_count: structuredPage.images.length,
       },

@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pymupdf as fitz
@@ -20,6 +21,8 @@ def test_analyzes_digital_pdf(tmp_path: Path) -> None:
 
     result = analyze_pdf(pdf_path)
 
+    assert result.sha256 == hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    assert result.document_model_version == 1
     assert result.page_count == 1
     assert result.kind == "digital"
     assert result.extracted_text_chars > 25
