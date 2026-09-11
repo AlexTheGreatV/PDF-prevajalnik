@@ -5,6 +5,7 @@ This project optionally uses the following local translation components. Their i
 ## Runtime
 
 - PyMuPDF 1.28.2 — GNU Affero General Public License v3 or Artifex commercial license — https://github.com/pymupdf/PyMuPDF
+- pymupdf-fonts 1.0.5, including FiraGO OpenType 1.001 Regular/Bold/Italic/Bold Italic — SIL Open Font License 1.1 — https://github.com/pymupdf/pymupdf-fonts and https://github.com/bBoxType/FiraGO/blob/master/OFL.txt
 - Droid Sans Fallback Regular — bundled in the PyMuPDF binary, copyright Google Corporation, Apache License 2.0 — https://android.googlesource.com/platform/frameworks/base/+/master/data/fonts/
 - CTranslate2 4.8.2 — MIT License — https://github.com/OpenNMT/CTranslate2
 - SentencePiece 0.2.2 — Apache License 2.0 — https://github.com/google/sentencepiece

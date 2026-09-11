@@ -927,10 +927,22 @@ pre {
 .export-summary strong { margin-top: 3px; font-size: 18px; }
 .export-skips { margin-top: 12px; }
 .export-skips p { margin: 6px 0; font-size: 13px; }
+.export-typography { border-top: 1px solid var(--border); padding-top: 10px; }
+.export-typography-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(170px, 1.4fr) minmax(120px, 0.8fr) minmax(150px, 1fr);
+  gap: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 9px 0;
+  font-size: 13px;
+}
+.export-typography-row .translation-warning { grid-column: 1 / -1; margin: 0; }
 
 @media (max-width: 800px) {
   .export-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .export-summary div { border-bottom: 1px solid var(--border); }
+  .export-typography-row { grid-template-columns: 1fr; }
+  .export-typography-row .translation-warning { grid-column: auto; }
 }
 
 .translation-skipped {

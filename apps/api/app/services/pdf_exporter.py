@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pymupdf
 
+from app.models import BBox
 from app.pdf_export_models import (
     ExportMode,
+    FitStrategy,
     PdfExportJob,
     PdfExportPlan,
     PdfExportSegment,
@@ -17,13 +19,13 @@ from app.pdf_export_models import (
     PdfReplacement,
     SkipReason,
 )
+from app.services.pdf_typography import FontAsset, PdfTypographyResolver
 
 DOCUMENT_MODEL_VERSION = 1
-FONT_NAME = "Droid Sans Fallback Regular"
-PDF_FONT_NAME = "jubpreview"
 MIN_FONT_SIZE = 6.0
-MAX_FONT_REDUCTION = 0.30
 GEOMETRY_TOLERANCE = 0.5
+HEADING_MIN_SCALE = 0.85
+BODY_MIN_SCALE = 0.75
 
 
 class PdfExportValidationError(ValueError):
@@ -38,40 +40,18 @@ class ExportArtifact:
     plan: PdfExportPlan
 
 
-def prepare_export_font(temp_dir: Path) -> Path:
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    font = pymupdf.Font("china-s")
-    required = "čšžČŠŽ₂°C"
-    if any(font.has_glyph(ord(character)) == 0 for character in required):
-        raise PdfExportValidationError("font_missing_glyph", "Lokalna PDF pisava nima vseh zahtevanih znakov.")
-    path = temp_dir / "DroidSansFallback.ttf"
-    path.write_bytes(font.buffer)
-    return path
-
-
 def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: Path) -> PdfExportPlan:
-    font_path = prepare_export_font(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    typography = PdfTypographyResolver(temp_dir)
     with pymupdf.open(path) as document:
         _validate_document_identity(path, document, job)
-        replacements = [_plan_segment(document, segment, font_path) for segment in job.segments]
+        replacements = [_plan_segment(document, segment, typography) for segment in job.segments]
         _mark_overlap_conflicts(replacements)
         for replacement in replacements:
             if replacement.skip_reason is not None:
                 continue
             page = document[replacement.page_number - 1]
-            fitted_size = _fit_font_size(
-                page.rect,
-                _rect(replacement.source_bbox),
-                replacement.translated_text,
-                replacement.proposed_font_size,
-                font_path,
-            )
-            if fitted_size is None:
-                _skip(replacement, "overflow", "Prevod se ne prilega niti pri dovoljeni najmanjši velikosti.", "overflow")
-            else:
-                replacement.fitted_font_size = fitted_size
-                replacement.fit_status = "fits"
-                replacement.eligible = True
+            _fit_replacement(page, replacement, replacements, typography)
 
     return PdfExportPlan(
         filename=_output_filename(job.source_filename),
@@ -89,7 +69,7 @@ def export_translated_pdf(path: Path, job: PdfExportJob, mode: ExportMode, temp_
         if mode == "diagnostic":
             _write_diagnostics(document, plan)
         else:
-            _write_replacements(document, plan, temp_dir / "DroidSansFallback.ttf")
+            _write_replacements(document, plan, PdfTypographyResolver(temp_dir))
         document.subset_fonts()
         document.save(output_path, garbage=4, deflate=True)
     if mode == "replacement_preview":
@@ -114,8 +94,9 @@ def _validate_document_identity(path: Path, document: pymupdf.Document, job: Pdf
             raise PdfExportValidationError("page_geometry_mismatch", f"Geometrija strani {page_number} se ne ujema.")
 
 
-def _plan_segment(document: pymupdf.Document, segment: PdfExportSegment, font_path: Path) -> PdfReplacement:
+def _plan_segment(document: pymupdf.Document, segment: PdfExportSegment, typography: PdfTypographyResolver) -> PdfReplacement:
     proposed_size = _bounded_font_size(segment.source_style.font_size if segment.source_style else None)
+    source_color = _style_color(segment.source_style.color if segment.source_style else None)
     replacement = PdfReplacement(
         segment_id=segment.segment_id,
         page_number=segment.page_number,
@@ -125,9 +106,14 @@ def _plan_segment(document: pymupdf.Document, segment: PdfExportSegment, font_pa
         translation_origin=segment.translation_origin,
         reviewed=segment.status == "reviewed",
         block_type=segment.block_type,
-        proposed_font=FONT_NAME,
+        proposed_font="FiraGO",
         proposed_font_size=proposed_size,
-        text_color=_style_color(segment.source_style.color if segment.source_style else None),
+        requested_font_size=proposed_size,
+        text_color=source_color,
+        color=_color_hex(source_color),
+        font_family="FiraGO",
+        original_bbox=segment.source_bbox,
+        fitted_bbox=segment.source_bbox,
         fit_status="not_checked",
     )
     if segment.status != "reviewed":
@@ -155,12 +141,23 @@ def _plan_segment(document: pymupdf.Document, segment: PdfExportSegment, font_pa
     extracted = page.get_text("text", clip=rect, sort=True)
     if not _text_matches(segment.source_text, extracted):
         return _skip(replacement, "source_text_mismatch", "Besedilo v navedenem območju se ne ujema z izvornim segmentom.")
-    font = pymupdf.Font(fontfile=str(font_path))
-    missing = sorted({character for character in segment.edited_translation if not character.isspace() and font.has_glyph(ord(character)) == 0})
-    if missing:
-        return _skip(replacement, "missing_glyph", "Lokalna pisava nima vseh znakov prevoda.")
-    if segment.source_style and (segment.source_style.bold or segment.source_style.italic):
-        replacement.warnings.append("font_style_fallback")
+    style, asset, warnings, line_count = typography.resolve(page, rect, segment)
+    replacement.typography = style
+    replacement.typography_warnings.extend(warnings)
+    replacement.requested_font_size = style.font_size
+    replacement.proposed_font_size = style.font_size
+    replacement.text_color = _style_color(style.color)
+    replacement.color = style.color
+    replacement.alignment = style.alignment
+    replacement.line_height = style.line_height
+    replacement.original_line_count = line_count
+    replacement.font_weight = "bold" if style.bold else "regular"
+    replacement.font_style = "italic" if style.italic else "normal"
+    if asset is None:
+        replacement.fit_strategy = "missing_glyph"
+        return _skip(replacement, "missing_glyph", "Lokalni pisavi nimata vseh znakov prevoda.")
+    replacement.font_family = asset.family
+    replacement.proposed_font = asset.family
     return replacement
 
 
@@ -180,60 +177,133 @@ def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> None:
             _skip(replacement, "overlap_conflict", "Območje se prekriva z drugim replacementom.")
 
 
-def _fit_font_size(page_rect: pymupdf.Rect, rect: pymupdf.Rect, text: str, proposed: float, font_path: Path) -> float | None:
-    minimum = max(MIN_FONT_SIZE, proposed * (1 - MAX_FONT_REDUCTION))
-    candidate = proposed
-    while candidate + 0.001 >= minimum:
-        with pymupdf.open() as scratch:
-            page = scratch.new_page(width=page_rect.width, height=page_rect.height)
-            spare = page.insert_textbox(
-                rect,
-                text,
-                fontname=PDF_FONT_NAME,
-                fontfile=str(font_path),
-                fontsize=candidate,
-                lineheight=1.1,
-                set_simple=0,
-            )
-        if spare >= 0:
-            return round(candidate, 2)
-        candidate -= 0.5
-    return None
+def _fit_replacement(
+    page: pymupdf.Page,
+    replacement: PdfReplacement,
+    replacements: list[PdfReplacement],
+    typography: PdfTypographyResolver,
+) -> None:
+    original = _rect(replacement.original_bbox)
+    asset = _asset_for(replacement, typography)
+    exact = _htmlbox_preflight(page.rect, original, replacement, typography, asset, 1.0)
+    if exact[0] >= 0:
+        return _accept_fit(replacement, original, exact, "exact")
+
+    expanded = _safe_expansion(page, original, replacement, replacements)
+    if expanded != original:
+        expanded_fit = _htmlbox_preflight(page.rect, expanded, replacement, typography, asset, 1.0)
+        if expanded_fit[0] >= 0:
+            return _accept_fit(replacement, expanded, expanded_fit, "expanded_bbox")
+
+    fit_rect = expanded if expanded != original else original
+    minimum_scale = max(MIN_FONT_SIZE / replacement.requested_font_size, HEADING_MIN_SCALE if replacement.block_type == "heading" else BODY_MIN_SCALE)
+    scaled = _htmlbox_preflight(page.rect, fit_rect, replacement, typography, asset, minimum_scale)
+    if scaled[0] >= 0 and scaled[1] + 0.0001 >= minimum_scale:
+        return _accept_fit(replacement, fit_rect, scaled, "scaled")
+
+    replacement.fit_strategy = "overflow"
+    _skip(replacement, "overflow", "Prevod se ne prilega znotraj dovoljene tipografske meje.", "overflow")
+
+
+def _accept_fit(replacement: PdfReplacement, rect: pymupdf.Rect, result: tuple[float, float, int], strategy: FitStrategy) -> None:
+    _, scale, line_count = result
+    replacement.fitted_bbox = _bbox(rect)
+    replacement.scale = round(scale, 4)
+    replacement.fitted_font_size = round(replacement.requested_font_size * scale, 2)
+    replacement.fitted_line_count = line_count
+    replacement.fit_strategy = strategy
+    replacement.fit_status = "fits"
+    replacement.eligible = True
+
+
+def _htmlbox_preflight(
+    page_rect: pymupdf.Rect,
+    rect: pymupdf.Rect,
+    replacement: PdfReplacement,
+    typography: PdfTypographyResolver,
+    asset: FontAsset,
+    scale_low: float,
+) -> tuple[float, float, int]:
+    html_text, css = typography.html_and_css(replacement.translated_text, replacement.typography, asset)
+    with pymupdf.open() as scratch:
+        page = scratch.new_page(width=page_rect.width, height=page_rect.height)
+        spare, scale = page.insert_htmlbox(rect, html_text, css=css, scale_low=scale_low, archive=typography.archive)
+        line_count = sum(len(block.get("lines", [])) for block in page.get_text("dict", clip=rect).get("blocks", []))
+    return spare, scale, line_count
+
+
+def _safe_expansion(
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+    replacement: PdfReplacement,
+    replacements: list[PdfReplacement],
+) -> pymupdf.Rect:
+    midpoint = page.rect.x0 + page.rect.width / 2
+    if rect.x1 <= midpoint:
+        right_limit = midpoint - 6
+    elif rect.x0 >= midpoint:
+        right_limit = page.rect.x1 - 12
+    else:
+        right_limit = min(page.rect.x1 - 12, rect.x1 + rect.width)
+    candidate = pymupdf.Rect(
+        rect.x0,
+        max(page.rect.y0 + 12, rect.y0 - max(6.0, rect.height * 0.5)),
+        min(right_limit, rect.x1 + max(36.0, rect.width * 1.5)),
+        min(page.rect.y1 - 12, rect.y1 + max(12.0, rect.height * 1.2)),
+    )
+    obstacles = _text_span_rects(page)
+    obstacles.extend(pymupdf.Rect(image["bbox"]) for image in page.get_image_info())
+    obstacles.extend(pymupdf.Rect(drawing["rect"]) for drawing in page.get_drawings())
+    obstacles.extend(
+        _rect(item.original_bbox)
+        for item in replacements
+        if item is not replacement and item.page_number == replacement.page_number and item.original_bbox is not None
+    )
+    for obstacle in obstacles:
+        if not (obstacle & rect).is_empty:
+            continue
+        if obstacle.x0 >= rect.x1 and not (pymupdf.Rect(rect.x1, rect.y0, candidate.x1, rect.y1) & obstacle).is_empty:
+            candidate.x1 = min(candidate.x1, obstacle.x0 - 1)
+        if obstacle.y0 >= rect.y1 and not (pymupdf.Rect(rect.x0, rect.y1, candidate.x1, candidate.y1) & obstacle).is_empty:
+            candidate.y1 = min(candidate.y1, obstacle.y0 - 1)
+        if obstacle.y1 <= rect.y0 and not (pymupdf.Rect(rect.x0, candidate.y0, candidate.x1, rect.y0) & obstacle).is_empty:
+            candidate.y0 = max(candidate.y0, obstacle.y1 + 1)
+    if candidate.x1 <= rect.x1 + GEOMETRY_TOLERANCE and candidate.y1 <= rect.y1 + GEOMETRY_TOLERANCE and candidate.y0 >= rect.y0 - GEOMETRY_TOLERANCE:
+        return rect
+    if any(not (candidate & obstacle).is_empty and (obstacle & rect).is_empty for obstacle in obstacles):
+        return rect
+    return candidate
 
 
 def _write_diagnostics(document: pymupdf.Document, plan: PdfExportPlan) -> None:
     for replacement in plan.replacements:
-        if not replacement.eligible or replacement.source_bbox is None:
+        if replacement.source_bbox is None:
             continue
         page = document[replacement.page_number - 1]
-        rect = _rect(replacement.source_bbox)
-        page.draw_rect(rect, color=(0.08, 0.45, 0.76), width=0.8, overlay=True)
+        rect = _rect(replacement.fitted_bbox or replacement.source_bbox)
+        colors = {"exact": (0.12, 0.55, 0.28), "expanded_bbox": (0.08, 0.45, 0.76), "scaled": (0.92, 0.48, 0.08)}
+        color = colors.get(replacement.fit_strategy, (0.78, 0.12, 0.16))
+        page.draw_rect(rect, color=color, width=0.8, overlay=True)
         label_y = rect.y0 - 2 if rect.y0 >= 8 else rect.y0 + 7
-        page.insert_text((rect.x0, label_y), replacement.segment_id, fontname="helv", fontsize=5, color=(0.08, 0.35, 0.65), overlay=True)
+        page.insert_text((rect.x0, label_y), f"{replacement.segment_id} {replacement.fit_strategy}", fontname="helv", fontsize=5, color=color, overlay=True)
 
 
-def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, font_path: Path) -> None:
+def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typography: PdfTypographyResolver) -> None:
     eligible = [item for item in plan.replacements if item.eligible and item.source_bbox is not None]
     pages = sorted({item.page_number for item in eligible})
     for page_number in pages:
         page = document[page_number - 1]
         page_items = [item for item in eligible if item.page_number == page_number]
         for item in page_items:
-            page.add_redact_annot(_rect(item.source_bbox), fill=False, cross_out=False)
+            page.add_redact_annot(_rect(item.original_bbox), fill=False, cross_out=False)
         page.apply_redactions(images=0, graphics=0, text=0)
         for item in page_items:
-            spare = page.insert_textbox(
-                _rect(item.source_bbox),
-                item.translated_text,
-                fontname=PDF_FONT_NAME,
-                fontfile=str(font_path),
-                fontsize=item.fitted_font_size or item.proposed_font_size,
-                lineheight=1.1,
-                color=_text_color(item),
-                set_simple=0,
-                overlay=True,
+            asset = _asset_for(item, typography)
+            html_text, css = typography.html_and_css(item.translated_text, item.typography, asset)
+            spare, scale = page.insert_htmlbox(
+                _rect(item.fitted_bbox), html_text, css=css, scale_low=item.scale or 1.0, archive=typography.archive, overlay=True
             )
-            if spare < 0:
+            if spare < 0 or scale + 0.0001 < (item.scale or 1.0):
                 raise PdfExportValidationError("insert_failed", f"Prevod segmenta {item.segment_id} se pri končnem zapisu ni prilegal.")
 
 
@@ -242,29 +312,39 @@ def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
         for item in plan.replacements:
             if not item.eligible or item.source_bbox is None:
                 continue
-            extracted = document[item.page_number - 1].get_text("text", clip=_rect(item.source_bbox), sort=True)
+            extracted = document[item.page_number - 1].get_text("text", clip=_rect(item.fitted_bbox or item.source_bbox), sort=True)
             if not _text_matches(item.translated_text, extracted):
                 raise PdfExportValidationError("output_verification_failed", f"Vstavljenega prevoda segmenta {item.segment_id} ni bilo mogoče preveriti.")
-
-
-def _text_color(replacement: PdfReplacement) -> tuple[float, float, float]:
-    return replacement.text_color
 
 
 def _rect(bbox) -> pymupdf.Rect:
     return pymupdf.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
 
 
+def _bbox(rect: pymupdf.Rect) -> BBox:
+    return BBox(x0=rect.x0, y0=rect.y0, x1=rect.x1, y1=rect.y1)
+
+
+def _asset_for(replacement: PdfReplacement, typography: PdfTypographyResolver) -> FontAsset:
+    if replacement.font_family == typography.fallback.family:
+        return typography.fallback
+    return typography.assets[(replacement.font_weight == "bold", replacement.font_style == "italic")]
+
+
 def _style_color(value: int | str | None) -> tuple[float, float, float]:
     if isinstance(value, str):
-        candidate = value.removeprefix("#")
         try:
-            value = int(candidate, 16)
+            value = int(value[1:], 16) if value.startswith("#") else int(value, 10)
         except ValueError:
             return (0.0, 0.0, 0.0)
     if not isinstance(value, int) or not 0 <= value <= 0xFFFFFF:
         return (0.0, 0.0, 0.0)
     return (((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255)
+
+
+def _color_hex(value: tuple[float, float, float]) -> str:
+    red, green, blue = (round(channel * 255) for channel in value)
+    return f"#{red:02x}{green:02x}{blue:02x}"
 
 
 def _bounded_font_size(value: float | None) -> float:
@@ -286,12 +366,22 @@ def _overlaps_embedded_image(page: pymupdf.Page, rect: pymupdf.Rect) -> bool:
     return any(not (pymupdf.Rect(image["bbox"]) & rect).is_empty for image in page.get_image_info())
 
 
+def _text_span_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
+    rectangles: list[pymupdf.Rect] = []
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            rectangles.extend(pymupdf.Rect(span["bbox"]) for span in line.get("spans", []) if span.get("text", "").strip())
+    return rectangles
+
+
 def _text_matches(source: str, extracted: str) -> bool:
     expected = _canonical_text(source)
     actual = _canonical_text(extracted)
     if not expected or not actual:
         return False
-    if expected == actual or expected in actual:
+    if expected == actual:
+        return True
+    if expected in actual and len(expected) / len(actual) >= 0.85:
         return True
     return SequenceMatcher(None, expected, actual).ratio() >= 0.78
 
@@ -316,6 +406,8 @@ def _skip(replacement: PdfReplacement, reason: SkipReason, warning: str, fit_sta
     replacement.skip_reason = reason
     replacement.fit_status = fit_status
     replacement.eligible = False
+    if replacement.fit_strategy == "not_checked":
+        replacement.fit_strategy = "overflow" if reason == "overflow" else "skipped"
     replacement.warnings.append(warning)
     return replacement
 
@@ -328,6 +420,9 @@ def _summarize(replacements: list[PdfReplacement]) -> PdfExportSummary:
         skipped=sum(not item.eligible for item in replacements),
         overflow=sum(item.skip_reason == "overflow" for item in replacements),
         conflicts=sum(item.skip_reason == "overlap_conflict" for item in replacements),
+        exact=sum(item.fit_strategy == "exact" for item in replacements),
+        expanded=sum(item.fit_strategy == "expanded_bbox" for item in replacements),
+        scaled=sum(item.fit_strategy == "scaled" for item in replacements),
     )
 
 

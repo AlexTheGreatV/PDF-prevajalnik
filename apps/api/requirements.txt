@@ -3,6 +3,7 @@ uvicorn[standard]>=0.52,<1
 python-multipart>=0.0.21,<1
 pydantic-settings>=2.12,<3
 PyMuPDF==1.28.2
+pymupdf-fonts==1.0.5
 Pillow>=11.3,<12
 redis>=7.1,<8
 psycopg[binary]>=3.3,<4

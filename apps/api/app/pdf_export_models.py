@@ -6,6 +6,8 @@ from app.models import BBox, PdfKind, SpanStyle
 
 ExportMode = Literal["diagnostic", "replacement_preview"]
 FitStatus = Literal["not_checked", "fits", "overflow", "skipped"]
+FitStrategy = Literal["not_checked", "exact", "expanded_bbox", "scaled", "overflow", "unsupported_style", "missing_glyph", "skipped"]
+TextAlignment = Literal["left", "center", "right", "justify"]
 SkipReason = Literal[
     "not_reviewed",
     "empty_translation",
@@ -72,6 +74,20 @@ class PdfExportJob(BaseModel):
         return self
 
 
+class PdfTextStyle(BaseModel):
+    source_font_name: str | None = None
+    source_font_xref: int | None = None
+    font_size: float
+    bold: bool = False
+    italic: bool = False
+    color: str = "#000000"
+    line_height: float = 1.2
+    alignment: TextAlignment = "left"
+    writing_direction: tuple[float, float] = (1.0, 0.0)
+    rotation: int = 0
+    dominant_style_confidence: float = 1.0
+
+
 class PdfReplacement(BaseModel):
     segment_id: str
     page_number: int
@@ -83,7 +99,22 @@ class PdfReplacement(BaseModel):
     block_type: str
     proposed_font: str
     proposed_font_size: float
+    requested_font_size: float
     text_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    color: str = "#000000"
+    font_family: str
+    font_weight: Literal["regular", "bold"] = "regular"
+    font_style: Literal["normal", "italic"] = "normal"
+    alignment: TextAlignment = "left"
+    line_height: float = 1.2
+    original_bbox: BBox | None = None
+    fitted_bbox: BBox | None = None
+    original_line_count: int = 0
+    fitted_line_count: int | None = None
+    scale: float | None = None
+    fit_strategy: FitStrategy = "not_checked"
+    typography: PdfTextStyle | None = None
+    typography_warnings: list[str] = Field(default_factory=list)
     fitted_font_size: float | None = None
     fit_status: FitStatus
     eligible: bool = False
@@ -98,6 +129,9 @@ class PdfExportSummary(BaseModel):
     skipped: int
     overflow: int
     conflicts: int
+    exact: int = 0
+    expanded: int = 0
+    scaled: int = 0
 
 
 class PdfExportPlan(BaseModel):

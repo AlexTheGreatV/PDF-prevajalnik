@@ -8,12 +8,25 @@ export type PdfExportReplacement = {
   segment_id: string;
   page_number: number;
   source_bbox: BBox | null;
+  original_bbox: BBox | null;
+  fitted_bbox: BBox | null;
   translated_text: string;
   reviewed: boolean;
   fit_status: "not_checked" | "fits" | "overflow" | "skipped";
   eligible: boolean;
   warnings: string[];
   skip_reason: string | null;
+  requested_font_size: number;
+  fitted_font_size: number | null;
+  scale: number | null;
+  original_line_count: number;
+  fitted_line_count: number | null;
+  font_family: string;
+  font_weight: "regular" | "bold";
+  font_style: "normal" | "italic";
+  color: string;
+  fit_strategy: "not_checked" | "exact" | "expanded_bbox" | "scaled" | "overflow" | "unsupported_style" | "missing_glyph" | "skipped";
+  typography_warnings: string[];
 };
 
 export type PdfExportPlan = {
@@ -27,6 +40,9 @@ export type PdfExportPlan = {
     skipped: number;
     overflow: number;
     conflicts: number;
+    exact: number;
+    expanded: number;
+    scaled: number;
   };
   replacements: PdfExportReplacement[];
 };

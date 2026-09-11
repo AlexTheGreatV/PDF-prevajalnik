@@ -81,7 +81,20 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
         <ExportMetric label="Preskočeni" value={plan.summary.skipped} />
         <ExportMetric label="Overflow" value={plan.summary.overflow} />
         <ExportMetric label="Konflikti" value={plan.summary.conflicts} />
+        <ExportMetric label="Exact" value={plan.summary.exact} />
+        <ExportMetric label="Razširjeni" value={plan.summary.expanded} />
+        <ExportMetric label="Pomanjšani" value={plan.summary.scaled} />
       </div>
+      <details className="export-typography">
+        <summary>Tipografske podrobnosti</summary>
+        {plan.replacements.map((item) => <div key={item.segment_id} className="export-typography-row">
+          <strong>{item.segment_id}</strong>
+          <span>{item.font_family} · {item.font_weight}{item.font_style === "italic" ? " italic" : ""}</span>
+          <span>{formatSize(item.requested_font_size)} → {item.fitted_font_size === null ? "—" : formatSize(item.fitted_font_size)}</span>
+          <span>{FIT_LABELS[item.fit_strategy] ?? item.fit_strategy}{item.scale !== null && item.scale < 1 ? ` · −${Math.round((1 - item.scale) * 100)} %` : ""}</span>
+          {item.typography_warnings.length > 0 && <span className="translation-warning">{item.typography_warnings.map((warning) => TYPOGRAPHY_WARNING_LABELS[warning] ?? warning).join(", ")}</span>}
+        </div>)}
+      </details>
       {plan.replacements.some((item) => !item.eligible) && <details className="export-skips">
         <summary>Razlogi za preskok</summary>
         {plan.replacements.filter((item) => !item.eligible).map((item) => <p key={item.segment_id}><strong>{item.segment_id}</strong>: {REASON_LABELS[item.skip_reason ?? ""] ?? item.skip_reason ?? "ni upravičen"}</p>)}
@@ -92,4 +105,25 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
 
 function ExportMetric({ label, value }: { label: string; value: number }) {
   return <div><span>{label}</span><strong>{value}</strong></div>;
+}
+
+const FIT_LABELS: Record<string, string> = {
+  exact: "brez prilagoditve",
+  expanded_bbox: "varen razširjen okvir",
+  scaled: "pomanjšano",
+  overflow: "se ne prilega",
+  skipped: "preskočeno",
+  missing_glyph: "manjkajoč znak",
+  unsupported_style: "nepodprt slog",
+};
+
+const TYPOGRAPHY_WARNING_LABELS: Record<string, string> = {
+  mixed_source_style: "mešan izvorni slog",
+  source_style_fallback: "izvornega sloga ni bilo mogoče natančno določiti",
+  droid_glyph_fallback: "uporabljena je nadomestna pisava Droid Sans Fallback",
+  font_style_fallback: "nadomestna pisava ne ohrani reza",
+};
+
+function formatSize(value: number): string {
+  return `${value.toLocaleString("sl-SI", { maximumFractionDigits: 2 })} pt`;
 }
