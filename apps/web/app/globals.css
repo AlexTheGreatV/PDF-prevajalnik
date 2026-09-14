@@ -937,6 +937,8 @@ pre {
   font-size: 13px;
 }
 .export-typography-row .translation-warning { grid-column: 1 / -1; margin: 0; }
+.export-overlap-detail { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; }
+.color-swatch { width: 14px; height: 14px; border: 1px solid var(--border); display: inline-block; }
 
 @media (max-width: 800px) {
   .export-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }

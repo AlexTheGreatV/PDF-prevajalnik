@@ -6,7 +6,7 @@ Build an internal document translation application for JUB/KOOP, starting with a
 
 ## Current Milestone
 
-Improve the safe translated-PDF preview with locally resolved typography, bounded fitting, and diagnostic metrics without attempting full document reconstruction.
+Allow reviewed native text duplicated in an image layer to be exported only when a local 300-DPI analysis proves a uniform background suitable for a minimal opaque patch.
 
 Allowed:
 
@@ -16,6 +16,7 @@ Allowed:
 - User-controlled exact, preferred, do-not-translate, and explicitly locked glossary entries
 - Local diagnostic and replacement-preview PDF export into a new temporary file
 - Local FiraGO typography resolution with regular, bold, italic, and bold-italic faces
+- Local background patching over demonstrably uniform image regions without modifying image XObjects
 
 Guardrails:
 
@@ -29,6 +30,7 @@ Guardrails:
 - Never overwrite a source PDF. Export only reviewed, identity-matched, geometry-checked digital text blocks after fit preflight.
 - Preserve images and vector graphics, and skip ambiguous, overlapping, OCR-only, rotated, table, or overflowing regions with a structured reason.
 - Keep Droid Sans Fallback as a final glyph fallback, never download fonts at runtime, and never reuse an embedded source font without clear embedding rights and complete glyph coverage.
+- Never patch photographs, gradients, textures, icons, lines, image-only OCR text, or uncertain regions. Do not add inpainting or full-page rasterization.
 - Do not add payments, public registration, or remote document uploads.
 
 ## Architecture

@@ -84,6 +84,8 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
         <ExportMetric label="Exact" value={plan.summary.exact} />
         <ExportMetric label="Razširjeni" value={plan.summary.expanded} />
         <ExportMetric label="Pomanjšani" value={plan.summary.scaled} />
+        <ExportMetric label="Lokalni patchi" value={plan.summary.background_patches} />
+        <ExportMetric label="Slikovni preskoki" value={plan.summary.image_overlap_skipped} />
       </div>
       <details className="export-typography">
         <summary>Tipografske podrobnosti</summary>
@@ -92,7 +94,12 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
           <span>{item.font_family} · {item.font_weight}{item.font_style === "italic" ? " italic" : ""}</span>
           <span>{formatSize(item.requested_font_size)} → {item.fitted_font_size === null ? "—" : formatSize(item.fitted_font_size)}</span>
           <span>{FIT_LABELS[item.fit_strategy] ?? item.fit_strategy}{item.scale !== null && item.scale < 1 ? ` · −${Math.round((1 - item.scale) * 100)} %` : ""}</span>
+          {item.image_overlap_kind !== "none" && <span className="export-overlap-detail">
+            {OVERLAP_LABELS[item.image_overlap_kind]} · Ocena varnosti ozadja: {Math.round(item.overlap_confidence * 100)} %
+            {item.background_color && <> · <i className="color-swatch" style={{ backgroundColor: item.background_color }} /> {item.background_color}</>}
+          </span>}
           {item.typography_warnings.length > 0 && <span className="translation-warning">{item.typography_warnings.map((warning) => TYPOGRAPHY_WARNING_LABELS[warning] ?? warning).join(", ")}</span>}
+          {item.image_overlap_warnings.length > 0 && <span className="translation-warning">{item.image_overlap_warnings.map((warning) => OVERLAP_WARNING_LABELS[warning] ?? warning).join(", ")}</span>}
         </div>)}
       </details>
       {plan.replacements.some((item) => !item.eligible) && <details className="export-skips">
@@ -122,6 +129,22 @@ const TYPOGRAPHY_WARNING_LABELS: Record<string, string> = {
   source_style_fallback: "izvornega sloga ni bilo mogoče natančno določiti",
   droid_glyph_fallback: "uporabljena je nadomestna pisava Droid Sans Fallback",
   font_style_fallback: "nadomestna pisava ne ohrani reza",
+};
+
+const OVERLAP_LABELS: Record<string, string> = {
+  simple_background: "varno popravljeno slikovno prekrivanje",
+  complex_background: "kompleksno slikovno ozadje",
+  image_only_text: "besedilo samo v sliki",
+  uncertain: "negotovo slikovno območje",
+};
+
+const OVERLAP_WARNING_LABELS: Record<string, string> = {
+  image_layer_contains_visible_text: "slikovna plast vsebuje vidno kopijo besedila",
+  expanded_background_checked: "razširjeno območje je ponovno preverjeno",
+  expanded_background_not_safe: "razširjeno območje ni varno",
+  background_complexity_exceeds_limit: "ozadje presega dovoljeno kompleksnost",
+  background_metrics_near_threshold: "meritve so preblizu varnostnemu pragu",
+  image_only_text_requires_manual_ocr_workflow: "potreben je ročni OCR potek",
 };
 
 function formatSize(value: number): string {

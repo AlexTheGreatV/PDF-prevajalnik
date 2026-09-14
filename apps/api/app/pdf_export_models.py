@@ -8,6 +8,7 @@ ExportMode = Literal["diagnostic", "replacement_preview"]
 FitStatus = Literal["not_checked", "fits", "overflow", "skipped"]
 FitStrategy = Literal["not_checked", "exact", "expanded_bbox", "scaled", "overflow", "unsupported_style", "missing_glyph", "skipped"]
 TextAlignment = Literal["left", "center", "right", "justify"]
+ImageOverlapKind = Literal["none", "simple_background", "complex_background", "image_only_text", "uncertain"]
 SkipReason = Literal[
     "not_reviewed",
     "empty_translation",
@@ -88,6 +89,16 @@ class PdfTextStyle(BaseModel):
     dominant_style_confidence: float = 1.0
 
 
+class PdfBackgroundMetrics(BaseModel):
+    dpi: int = 300
+    sample_count: int = 0
+    color_variance: float | None = None
+    edge_density: float | None = None
+    texture_score: float | None = None
+    side_color_delta: float | None = None
+    near_threshold: bool = False
+
+
 class PdfReplacement(BaseModel):
     segment_id: str
     page_number: int
@@ -115,6 +126,16 @@ class PdfReplacement(BaseModel):
     fit_strategy: FitStrategy = "not_checked"
     typography: PdfTextStyle | None = None
     typography_warnings: list[str] = Field(default_factory=list)
+    image_overlap_kind: ImageOverlapKind = "none"
+    overlapping_image_xrefs: list[int] = Field(default_factory=list)
+    overlap_ratio: float = 0.0
+    background_patch_used: bool = False
+    background_color: str | None = None
+    patch_rects: list[BBox] = Field(default_factory=list)
+    redaction_rects: list[BBox] = Field(default_factory=list)
+    overlap_confidence: float = 1.0
+    background_metrics: PdfBackgroundMetrics | None = None
+    image_overlap_warnings: list[str] = Field(default_factory=list)
     fitted_font_size: float | None = None
     fit_status: FitStatus
     eligible: bool = False
@@ -132,6 +153,8 @@ class PdfExportSummary(BaseModel):
     exact: int = 0
     expanded: int = 0
     scaled: int = 0
+    background_patches: int = 0
+    image_overlap_skipped: int = 0
 
 
 class PdfExportPlan(BaseModel):

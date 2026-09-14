@@ -20,6 +20,7 @@ from app.pdf_export_models import (
     SkipReason,
 )
 from app.services.pdf_typography import FontAsset, PdfTypographyResolver
+from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer
 
 DOCUMENT_MODEL_VERSION = 1
 MIN_FONT_SIZE = 6.0
@@ -43,15 +44,18 @@ class ExportArtifact:
 def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: Path) -> PdfExportPlan:
     temp_dir.mkdir(parents=True, exist_ok=True)
     typography = PdfTypographyResolver(temp_dir)
+    overlap_analyzer = PdfImageOverlapAnalyzer()
     with pymupdf.open(path) as document:
         _validate_document_identity(path, document, job)
-        replacements = [_plan_segment(document, segment, typography) for segment in job.segments]
+        replacements = [_plan_segment(document, segment, typography, overlap_analyzer) for segment in job.segments]
         _mark_overlap_conflicts(replacements)
         for replacement in replacements:
             if replacement.skip_reason is not None:
                 continue
             page = document[replacement.page_number - 1]
             _fit_replacement(page, replacement, replacements, typography)
+            if replacement.eligible and replacement.background_patch_used:
+                _validate_expanded_patch_area(page, replacement, overlap_analyzer)
 
     return PdfExportPlan(
         filename=_output_filename(job.source_filename),
@@ -94,7 +98,12 @@ def _validate_document_identity(path: Path, document: pymupdf.Document, job: Pdf
             raise PdfExportValidationError("page_geometry_mismatch", f"Geometrija strani {page_number} se ne ujema.")
 
 
-def _plan_segment(document: pymupdf.Document, segment: PdfExportSegment, typography: PdfTypographyResolver) -> PdfReplacement:
+def _plan_segment(
+    document: pymupdf.Document,
+    segment: PdfExportSegment,
+    typography: PdfTypographyResolver,
+    overlap_analyzer: PdfImageOverlapAnalyzer,
+) -> PdfReplacement:
     proposed_size = _bounded_font_size(segment.source_style.font_size if segment.source_style else None)
     source_color = _style_color(segment.source_style.color if segment.source_style else None)
     replacement = PdfReplacement(
@@ -126,21 +135,25 @@ def _plan_segment(document: pymupdf.Document, segment: PdfExportSegment, typogra
         return _skip(replacement, "missing_bbox", "Segment nima zanesljivega območja na strani.")
     if not 1 <= segment.page_number <= document.page_count:
         return _skip(replacement, "invalid_page", "Segment kaže na neobstoječo stran.")
-    if segment.source_text_origin != "native":
-        return _skip(replacement, "ocr_only_source", "OCR območje nima varne povezave z digitalnim besedilom.")
-    if segment.source_page_type != "digital":
-        return _skip(replacement, "non_digital_source", "Segment ni iz digitalne besedilne strani.")
     page = document[segment.page_number - 1]
     if page.rotation != 0 or segment.source_rotation not in {0, None}:
         return _skip(replacement, "rotated_page", "Rotirana stran je v prototipu varno preskočena.")
     rect = _rect(segment.source_bbox)
     if rect.is_empty or rect.is_infinite or not _inside(rect, page.rect):
         return _skip(replacement, "bbox_outside_page", "Območje segmenta ni v celoti znotraj strani.")
-    if _overlaps_embedded_image(page, rect):
-        return _skip(replacement, "image_overlap", "Območje se prekriva z vdelano sliko in ga ni mogoče varno odstraniti.")
+    if segment.source_text_origin != "native":
+        assessment = overlap_analyzer.analyze(page, rect, native_text=False)
+        _apply_overlap_assessment(replacement, assessment)
+        return _skip(replacement, "ocr_only_source", "OCR območje nima varne povezave z digitalnim besedilom.")
+    if segment.source_page_type != "digital":
+        return _skip(replacement, "non_digital_source", "Segment ni iz digitalne besedilne strani.")
     extracted = page.get_text("text", clip=rect, sort=True)
     if not _text_matches(segment.source_text, extracted):
         return _skip(replacement, "source_text_mismatch", "Besedilo v navedenem območju se ne ujema z izvornim segmentom.")
+    assessment = overlap_analyzer.analyze(page, rect, preserve_list_marker=segment.block_type == "list_item")
+    _apply_overlap_assessment(replacement, assessment)
+    if assessment.kind != "none" and not assessment.safe_for_background_patch:
+        return _skip(replacement, "image_overlap", _overlap_skip_message(assessment))
     style, asset, warnings, line_count = typography.resolve(page, rect, segment)
     replacement.typography = style
     replacement.typography_warnings.extend(warnings)
@@ -159,6 +172,53 @@ def _plan_segment(document: pymupdf.Document, segment: PdfExportSegment, typogra
     replacement.font_family = asset.family
     replacement.proposed_font = asset.family
     return replacement
+
+
+def _apply_overlap_assessment(replacement: PdfReplacement, assessment: ImageOverlapAssessment) -> None:
+    replacement.image_overlap_kind = assessment.kind
+    replacement.overlapping_image_xrefs = assessment.overlapping_image_xrefs
+    replacement.overlap_ratio = assessment.overlap_ratio
+    replacement.background_color = assessment.sampled_background_color
+    replacement.background_metrics = assessment.metrics
+    replacement.overlap_confidence = assessment.confidence
+    replacement.patch_rects = assessment.patch_rects
+    replacement.redaction_rects = assessment.redaction_rects
+    replacement.image_overlap_warnings.extend(assessment.warnings)
+    replacement.background_patch_used = assessment.safe_for_background_patch
+
+
+def _overlap_skip_message(assessment: ImageOverlapAssessment) -> str:
+    reasons = {
+        "complex_background": "Slikovno ozadje je preveč kompleksno za varen lokalni patch.",
+        "image_only_text": "Besedilo obstaja samo v slikovni plasti in zahteva ročni OCR potek.",
+        "uncertain": "Enotnosti slikovnega ozadja ni bilo mogoče dovolj zanesljivo dokazati.",
+    }
+    return reasons.get(assessment.kind, "Slikovnega prekrivanja ni mogoče varno popraviti.")
+
+
+def _validate_expanded_patch_area(
+    page: pymupdf.Page,
+    replacement: PdfReplacement,
+    analyzer: PdfImageOverlapAnalyzer,
+) -> None:
+    original = _rect(replacement.original_bbox)
+    fitted = _rect(replacement.fitted_bbox)
+    if fitted == original:
+        return
+    assessment = analyzer.analyze(
+        page,
+        fitted,
+        preserve_list_marker=replacement.block_type == "list_item",
+        patch_rects=[fitted],
+    )
+    if not assessment.safe_for_background_patch or not _background_colors_close(replacement.background_color, assessment.sampled_background_color):
+        replacement.background_patch_used = False
+        replacement.image_overlap_warnings.append("expanded_background_not_safe")
+        _skip(replacement, "image_overlap", "Razširjeno območje ne ostane na dokazljivo enotnem ozadju.")
+        return
+    replacement.background_metrics = assessment.metrics
+    replacement.overlap_confidence = min(replacement.overlap_confidence, assessment.confidence)
+    replacement.image_overlap_warnings.append("expanded_background_checked")
 
 
 def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> None:
@@ -281,11 +341,18 @@ def _write_diagnostics(document: pymupdf.Document, plan: PdfExportPlan) -> None:
             continue
         page = document[replacement.page_number - 1]
         rect = _rect(replacement.fitted_bbox or replacement.source_bbox)
-        colors = {"exact": (0.12, 0.55, 0.28), "expanded_bbox": (0.08, 0.45, 0.76), "scaled": (0.92, 0.48, 0.08)}
-        color = colors.get(replacement.fit_strategy, (0.78, 0.12, 0.16))
+        fit_colors = {"exact": (0.12, 0.55, 0.28), "expanded_bbox": (0.08, 0.45, 0.76), "scaled": (0.92, 0.48, 0.08)}
+        overlap_colors = {
+            "simple_background": (0.12, 0.55, 0.28),
+            "complex_background": (0.78, 0.12, 0.16),
+            "image_only_text": (0.55, 0.20, 0.70),
+            "uncertain": (0.92, 0.48, 0.08),
+        }
+        color = overlap_colors.get(replacement.image_overlap_kind, fit_colors.get(replacement.fit_strategy, (0.78, 0.12, 0.16)))
         page.draw_rect(rect, color=color, width=0.8, overlay=True)
         label_y = rect.y0 - 2 if rect.y0 >= 8 else rect.y0 + 7
-        page.insert_text((rect.x0, label_y), f"{replacement.segment_id} {replacement.fit_strategy}", fontname="helv", fontsize=5, color=color, overlay=True)
+        label = replacement.image_overlap_kind if replacement.image_overlap_kind != "none" else replacement.fit_strategy
+        page.insert_text((rect.x0, label_y), f"{replacement.segment_id} {label}", fontname="helv", fontsize=5, color=color, overlay=True)
 
 
 def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typography: PdfTypographyResolver) -> None:
@@ -295,9 +362,15 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
         page = document[page_number - 1]
         page_items = [item for item in eligible if item.page_number == page_number]
         for item in page_items:
-            page.add_redact_annot(_rect(item.original_bbox), fill=False, cross_out=False)
+            redactions = item.redaction_rects if item.background_patch_used and item.redaction_rects else [item.original_bbox]
+            for redaction in redactions:
+                page.add_redact_annot(_rect(redaction), fill=False, cross_out=False)
         page.apply_redactions(images=0, graphics=0, text=0)
         for item in page_items:
+            if item.background_patch_used and item.background_color:
+                patch_color = _style_color(item.background_color)
+                for patch in item.patch_rects:
+                    page.draw_rect(_rect(patch), color=None, fill=patch_color, fill_opacity=1, overlay=True)
             asset = _asset_for(item, typography)
             html_text, css = typography.html_and_css(item.translated_text, item.typography, asset)
             spare, scale = page.insert_htmlbox(
@@ -362,8 +435,12 @@ def _inside(rect: pymupdf.Rect, page_rect: pymupdf.Rect) -> bool:
     )
 
 
-def _overlaps_embedded_image(page: pymupdf.Page, rect: pymupdf.Rect) -> bool:
-    return any(not (pymupdf.Rect(image["bbox"]) & rect).is_empty for image in page.get_image_info())
+def _background_colors_close(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    first = _style_color(left)
+    second = _style_color(right)
+    return sum((a - b) ** 2 for a, b in zip(first, second)) ** 0.5 <= 8 / 255
 
 
 def _text_span_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
@@ -423,6 +500,8 @@ def _summarize(replacements: list[PdfReplacement]) -> PdfExportSummary:
         exact=sum(item.fit_strategy == "exact" for item in replacements),
         expanded=sum(item.fit_strategy == "expanded_bbox" for item in replacements),
         scaled=sum(item.fit_strategy == "scaled" for item in replacements),
+        background_patches=sum(item.background_patch_used for item in replacements),
+        image_overlap_skipped=sum(item.skip_reason == "image_overlap" for item in replacements),
     )
 
 

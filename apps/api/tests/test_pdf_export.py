@@ -42,7 +42,7 @@ def test_replacement_preserves_original_file_images_vectors_background_and_unico
         assert pixel[1] > pixel[0] and pixel[1] > pixel[2]
 
 
-def test_segment_overlapping_embedded_image_is_skipped(tmp_path: Path) -> None:
+def test_source_mismatch_precedes_image_overlap_analysis(tmp_path: Path) -> None:
     source = tmp_path / "image-overlap.pdf"
     _make_pdf(source, include_image=True)
     payload = _job_payload(source)
@@ -56,7 +56,7 @@ def test_segment_overlapping_embedded_image_is_skipped(tmp_path: Path) -> None:
     )
 
     assert plan.replacements[0].eligible is False
-    assert plan.replacements[0].skip_reason == "image_overlap"
+    assert plan.replacements[0].skip_reason == "source_text_mismatch"
 
 
 def test_diagnostic_mode_keeps_source_text(tmp_path: Path) -> None:

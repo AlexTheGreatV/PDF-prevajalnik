@@ -3,6 +3,7 @@ import type { BBox } from "./pdf-types";
 import type { TranslationJob } from "./translation-types";
 
 export type PdfExportMode = "diagnostic" | "replacement_preview";
+export type ImageOverlapKind = "none" | "simple_background" | "complex_background" | "image_only_text" | "uncertain";
 
 export type PdfExportReplacement = {
   segment_id: string;
@@ -27,6 +28,23 @@ export type PdfExportReplacement = {
   color: string;
   fit_strategy: "not_checked" | "exact" | "expanded_bbox" | "scaled" | "overflow" | "unsupported_style" | "missing_glyph" | "skipped";
   typography_warnings: string[];
+  image_overlap_kind: ImageOverlapKind;
+  overlapping_image_xrefs: number[];
+  overlap_ratio: number;
+  background_patch_used: boolean;
+  background_color: string | null;
+  patch_rects: BBox[];
+  overlap_confidence: number;
+  background_metrics: {
+    dpi: number;
+    sample_count: number;
+    color_variance: number | null;
+    edge_density: number | null;
+    texture_score: number | null;
+    side_color_delta: number | null;
+    near_threshold: boolean;
+  } | null;
+  image_overlap_warnings: string[];
 };
 
 export type PdfExportPlan = {
@@ -43,6 +61,8 @@ export type PdfExportPlan = {
     exact: number;
     expanded: number;
     scaled: number;
+    background_patches: number;
+    image_overlap_skipped: number;
   };
   replacements: PdfExportReplacement[];
 };
