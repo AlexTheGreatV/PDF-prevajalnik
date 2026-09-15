@@ -32,7 +32,14 @@ class PdfTypographyResolver:
         self.fallback = FontAsset("china-s", "Droid Sans Fallback Regular", fallback_path, False, False)
         self.archive = pymupdf.Archive(str(temp_dir))
 
-    def resolve(self, page: pymupdf.Page, rect: pymupdf.Rect, segment: PdfExportSegment) -> tuple[PdfTextStyle, FontAsset | None, list[str], int]:
+    def resolve(
+        self,
+        page: pymupdf.Page,
+        rect: pymupdf.Rect,
+        segment: PdfExportSegment,
+        *,
+        layout_rect: pymupdf.Rect | None = None,
+    ) -> tuple[PdfTextStyle, FontAsset | None, list[str], int]:
         lines, spans = _spans_in_rect(page, rect)
         warnings: list[str] = []
         if spans:
@@ -69,7 +76,7 @@ class PdfTypographyResolver:
             italic=italic,
             color=_color_hex(color_value),
             line_height=line_height,
-            alignment=_alignment(lines, rect),
+            alignment=_alignment(lines, layout_rect or rect),
             writing_direction=direction,
             rotation=page.rotation,
             dominant_style_confidence=round(confidence, 4),

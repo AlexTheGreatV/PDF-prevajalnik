@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -17,16 +18,23 @@ from app.pdf_export_models import (
     PdfExportSegment,
     PdfExportSummary,
     PdfReplacement,
+    PdfTableCellReplacement,
+    PdfTableExportPlan,
+    PdfTableExportSummary,
     SkipReason,
 )
-from app.services.pdf_typography import FontAsset, PdfTypographyResolver
 from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer
+from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canonical_text, is_technical_value, parse_cell_position
+from app.services.pdf_typography import FontAsset, PdfTypographyResolver
 
 DOCUMENT_MODEL_VERSION = 1
 MIN_FONT_SIZE = 6.0
 GEOMETRY_TOLERANCE = 0.5
 HEADING_MIN_SCALE = 0.85
 BODY_MIN_SCALE = 0.75
+TABLE_MIN_FONT_SIZE = 5.5
+TABLE_BODY_MIN_SCALE = 0.75
+TABLE_TITLE_MIN_SCALE = 0.85
 
 
 class PdfExportValidationError(ValueError):
@@ -47,15 +55,22 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
     overlap_analyzer = PdfImageOverlapAnalyzer()
     with pymupdf.open(path) as document:
         _validate_document_identity(path, document, job)
-        replacements = [_plan_segment(document, segment, typography, overlap_analyzer) for segment in job.segments]
+        regular_segments = [segment for segment in job.segments if segment.block_type not in {"table", "table_cell"}]
+        replacements = [_plan_segment(document, segment, typography, overlap_analyzer) for segment in regular_segments]
+        tables, table_replacements = _plan_tables(document, job, typography, overlap_analyzer)
+        replacements.extend(table_replacements)
         _mark_overlap_conflicts(replacements)
         for replacement in replacements:
             if replacement.skip_reason is not None:
+                continue
+            if isinstance(replacement, PdfTableCellReplacement):
+                _fit_table_cell(document[replacement.page_number - 1], replacement, typography, overlap_analyzer)
                 continue
             page = document[replacement.page_number - 1]
             _fit_replacement(page, replacement, replacements, typography)
             if replacement.eligible and replacement.background_patch_used:
                 _validate_expanded_patch_area(page, replacement, overlap_analyzer)
+        _refresh_table_status(tables)
 
     return PdfExportPlan(
         filename=_output_filename(job.source_filename),
@@ -63,6 +78,8 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
         document_sha256=job.document_identity.sha256,
         summary=_summarize(replacements),
         replacements=replacements,
+        table_summary=_summarize_tables(tables),
+        tables=tables,
     )
 
 
@@ -104,33 +121,11 @@ def _plan_segment(
     typography: PdfTypographyResolver,
     overlap_analyzer: PdfImageOverlapAnalyzer,
 ) -> PdfReplacement:
-    proposed_size = _bounded_font_size(segment.source_style.font_size if segment.source_style else None)
-    source_color = _style_color(segment.source_style.color if segment.source_style else None)
-    replacement = PdfReplacement(
-        segment_id=segment.segment_id,
-        page_number=segment.page_number,
-        source_bbox=segment.source_bbox,
-        source_text=segment.source_text,
-        translated_text=segment.edited_translation,
-        translation_origin=segment.translation_origin,
-        reviewed=segment.status == "reviewed",
-        block_type=segment.block_type,
-        proposed_font="FiraGO",
-        proposed_font_size=proposed_size,
-        requested_font_size=proposed_size,
-        text_color=source_color,
-        color=_color_hex(source_color),
-        font_family="FiraGO",
-        original_bbox=segment.source_bbox,
-        fitted_bbox=segment.source_bbox,
-        fit_status="not_checked",
-    )
+    replacement = _new_replacement(segment)
     if segment.status != "reviewed":
         return _skip(replacement, "not_reviewed", "Izvozi se samo ročno potrjene prevode.")
     if not segment.edited_translation.strip():
         return _skip(replacement, "empty_translation", "Potrjeni segment nima prevoda.")
-    if segment.block_type in {"table", "table_cell"}:
-        return _skip(replacement, "complex_table", "Kompleksne tabele v tem prototipu niso zamenjane.")
     if segment.source_bbox is None:
         return _skip(replacement, "missing_bbox", "Segment nima zanesljivega območja na strani.")
     if not 1 <= segment.page_number <= document.page_count:
@@ -172,6 +167,241 @@ def _plan_segment(
     replacement.font_family = asset.family
     replacement.proposed_font = asset.family
     return replacement
+
+
+def _new_replacement(segment: PdfExportSegment) -> PdfReplacement:
+    proposed_size = _bounded_font_size(segment.source_style.font_size if segment.source_style else None)
+    source_color = _style_color(segment.source_style.color if segment.source_style else None)
+    return PdfReplacement(
+        segment_id=segment.segment_id,
+        page_number=segment.page_number,
+        source_bbox=segment.source_bbox,
+        source_text=segment.source_text,
+        translated_text=segment.edited_translation,
+        translation_origin=segment.translation_origin,
+        reviewed=segment.status == "reviewed",
+        block_type=segment.block_type,
+        proposed_font="FiraGO",
+        proposed_font_size=proposed_size,
+        requested_font_size=proposed_size,
+        text_color=source_color,
+        color=_color_hex(source_color),
+        font_family="FiraGO",
+        original_bbox=segment.source_bbox,
+        fitted_bbox=segment.source_bbox,
+        fit_status="not_checked",
+    )
+
+
+def _plan_tables(
+    document: pymupdf.Document,
+    job: PdfExportJob,
+    typography: PdfTypographyResolver,
+    overlap_analyzer: PdfImageOverlapAnalyzer,
+) -> tuple[list[PdfTableExportPlan], list[PdfReplacement]]:
+    detector = PdfTableAnalyzer()
+    detected = {
+        page_number: detector.detect(document[page_number - 1], page_number)
+        for page_number in sorted({segment.page_number for segment in job.segments if segment.block_type in {"table", "table_cell"}})
+        if 1 <= page_number <= document.page_count
+    }
+    table_plans = {
+        table.table_id: PdfTableExportPlan(
+            table_id=table.table_id,
+            page_number=table.page_number,
+            bbox=table.bbox,
+            row_count=table.row_count,
+            column_count=table.column_count,
+            reliable=table.reliable,
+            warnings=list(table.warnings),
+        )
+        for tables in detected.values()
+        for table in tables
+    }
+    replacements: list[PdfReplacement] = []
+    cell_groups: dict[tuple[int, str], list[PdfExportSegment]] = defaultdict(list)
+    container_blocks = {
+        (segment.page_number, segment.block_id)
+        for segment in job.segments
+        if segment.block_type == "table"
+    }
+    cell_group_keys = {
+        (segment.page_number, segment.block_id)
+        for segment in job.segments
+        if segment.block_type == "table_cell"
+    }
+    for segment in job.segments:
+        if segment.block_type == "table_cell":
+            cell_groups[(segment.page_number, segment.block_id)].append(segment)
+        elif segment.block_type == "table":
+            reason: SkipReason = "duplicate_table_content" if (segment.page_number, segment.block_id) in cell_group_keys else "complex_table"
+            replacements.append(_skip(_new_replacement(segment), reason, "Vsebnik tabele se ne izvozi skupaj s posameznimi celicami."))
+
+    assigned_tables: set[str] = set()
+    for (page_number, block_id), segments in cell_groups.items():
+        positions = [parse_cell_position(segment.segment_id) for segment in segments]
+        duplicate_positions = len([position for position in positions if position is not None]) != len(set(position for position in positions if position is not None))
+        if any(position is None for position in positions):
+            cells = [_unresolved_table_cell(segment, block_id, "ambiguous_cell_membership") for segment in segments]
+            replacements.extend(cells)
+            table_plans[block_id] = PdfTableExportPlan(
+                table_id=block_id, page_number=page_number, reliable=False,
+                warnings=["ambiguous_cell_membership"], cells=cells,
+            )
+            continue
+        if duplicate_positions:
+            cells = [_unresolved_table_cell(segment, block_id, "duplicate_table_content") for segment in segments]
+            replacements.extend(cells)
+            table_plans[block_id] = PdfTableExportPlan(
+                table_id=block_id, page_number=page_number, reliable=False,
+                warnings=["duplicate_table_content"], cells=cells,
+            )
+            continue
+        expected_rows = max(position[0] for position in positions) + 1
+        expected_columns = max(position[1] for position in positions) + 1
+        candidates = [
+            table for table in detected.get(page_number, [])
+            if table.row_count == expected_rows and table.column_count == expected_columns
+        ]
+        ranked = sorted(
+            ((_table_match_score(table, segments), table) for table in candidates),
+            key=lambda item: item[0], reverse=True,
+        )
+        ambiguous = not ranked or ranked[0][0] < 0.5 or (len(ranked) > 1 and ranked[0][0] == ranked[1][0])
+        if ambiguous or ranked[0][1].table_id in assigned_tables:
+            cells = [_unresolved_table_cell(segment, block_id, "ambiguous_cell_membership") for segment in segments]
+            replacements.extend(cells)
+            table_plans[block_id] = PdfTableExportPlan(
+                table_id=block_id, page_number=page_number, row_count=expected_rows,
+                column_count=expected_columns, reliable=False,
+                warnings=["ambiguous_cell_membership"], cells=cells,
+            )
+            continue
+        table = ranked[0][1]
+        assigned_tables.add(table.table_id)
+        cells = [
+            _plan_table_cell(document[page_number - 1], table, segment, typography, overlap_analyzer)
+            for segment in segments
+        ]
+        replacements.extend(cells)
+        plan = table_plans[table.table_id]
+        plan.cells = sorted(cells, key=lambda cell: (cell.row_index, cell.column_index))
+        if (page_number, block_id) in container_blocks:
+            for cell in plan.cells:
+                _skip(cell, "duplicate_table_content", "Vsebina je podvojena s tabelnim vsebnikom.")
+    return list(table_plans.values()), replacements
+
+
+def _table_match_score(table: DetectedTable, segments: list[PdfExportSegment]) -> float:
+    matches = 0
+    checked = 0
+    for segment in segments:
+        position = parse_cell_position(segment.segment_id)
+        if position is None:
+            continue
+        row, column = position
+        checked += 1
+        if row < table.row_count and column < table.column_count:
+            matches += canonical_text(table.cells[row][column].text) == canonical_text(segment.source_text)
+    return matches / max(1, checked)
+
+
+def _unresolved_table_cell(segment: PdfExportSegment, table_id: str, reason: SkipReason) -> PdfTableCellReplacement:
+    row, column = parse_cell_position(segment.segment_id) or (0, 0)
+    cell = PdfTableCellReplacement(
+        **_new_replacement(segment).model_dump(), table_id=table_id,
+        row_index=row, column_index=column, row_span=1, column_span=1,
+    )
+    return _skip(cell, reason, "Celice ni mogoče enolično povezati z zaznano tabelo.")
+
+
+def _plan_table_cell(
+    page: pymupdf.Page,
+    table: DetectedTable,
+    segment: PdfExportSegment,
+    typography: PdfTypographyResolver,
+    overlap_analyzer: PdfImageOverlapAnalyzer,
+) -> PdfTableCellReplacement:
+    row, column = parse_cell_position(segment.segment_id) or (0, 0)
+    geometry = table.cells[row][column]
+    base = _new_replacement(segment).model_dump()
+    base.update(
+        source_bbox=geometry.source_bbox,
+        original_bbox=geometry.source_bbox,
+        fitted_bbox=geometry.content_bbox,
+        warnings=list(geometry.warnings),
+    )
+    cell = PdfTableCellReplacement(
+        **base, table_id=table.table_id, row_index=row, column_index=column,
+        row_span=geometry.row_span, column_span=geometry.column_span,
+        cell_bbox=geometry.cell_bbox, content_bbox=geometry.content_bbox,
+        background_fill=geometry.background_fill, border_clearance=geometry.border_clearance,
+    )
+    if not geometry.text:
+        return _skip(cell, "empty_cell", "Prazna celica ostane nespremenjena.")
+    if is_technical_value(geometry.text):
+        return _skip(cell, "technical_value", "Samostojna tehnična vrednost ostane nespremenjena.")
+    if not table.reliable:
+        return _skip(cell, "unsupported_table_structure", "Struktura tabele ni dovolj zanesljiva za celični izvoz.")
+    if "missing_cell_bbox" in geometry.warnings:
+        return _skip(cell, "missing_cell_bbox", "Celica nima zanesljive geometrije.")
+    if "duplicate_cell_geometry" in geometry.warnings:
+        return _skip(cell, "duplicate_cell_geometry", "Več celic uporablja isto geometrijo.")
+    if geometry.source_bbox is None or geometry.content_bbox is None or geometry.cell_bbox is None:
+        return _skip(cell, "missing_cell_bbox", "Celica nima zanesljivega vsebinskega območja.")
+    if canonical_text(geometry.text) != canonical_text(segment.source_text):
+        cell.source_match_status = "mismatch"
+        return _skip(cell, "source_text_mismatch", "Izvorno besedilo se ne ujema z vsebino celice.")
+    cell.source_match_status = "matched"
+    if segment.status != "reviewed":
+        return _skip(cell, "not_reviewed", "Celica ni ročno potrjena.")
+    if not segment.edited_translation.strip():
+        return _skip(cell, "empty_translation", "Potrjena celica nima prevoda.")
+    if page.rotation != 0 or segment.source_rotation not in {0, None}:
+        return _skip(cell, "rotated_page", "Rotirana tabela ni podprta.")
+    if segment.source_text_origin != "native":
+        assessment = overlap_analyzer.analyze(page, _rect(geometry.source_bbox), native_text=False)
+        _apply_overlap_assessment(cell, assessment)
+        return _skip(cell, "ocr_only_source", "Image-only oziroma OCR celica zahteva ročni potek.")
+    if segment.source_page_type != "digital":
+        return _skip(cell, "non_digital_source", "Celica ni iz digitalne strani.")
+    assessment = overlap_analyzer.analyze(
+        page,
+        _rect(geometry.source_bbox),
+        patch_clip=_rect(geometry.cell_bbox),
+        ignore_enclosing_drawings=True,
+        allow_opaque_vector_cover=True,
+    )
+    _apply_overlap_assessment(cell, assessment)
+    if assessment.kind != "none" and not assessment.safe_for_background_patch:
+        return _skip(cell, "image_overlap", _overlap_skip_message(assessment))
+    source_style_rect = _rect(geometry.source_bbox)
+    source_style_rect = pymupdf.Rect(
+        source_style_rect.x0 - GEOMETRY_TOLERANCE,
+        source_style_rect.y0 - GEOMETRY_TOLERANCE,
+        source_style_rect.x1 + GEOMETRY_TOLERANCE,
+        source_style_rect.y1 + GEOMETRY_TOLERANCE,
+    ) & page.rect
+    style, asset, warnings, line_count = typography.resolve(
+        page, source_style_rect, segment, layout_rect=_rect(geometry.content_bbox)
+    )
+    cell.typography = style
+    cell.typography_warnings.extend(warnings)
+    cell.requested_font_size = style.font_size
+    cell.proposed_font_size = style.font_size
+    cell.text_color = _style_color(style.color)
+    cell.color = style.color
+    cell.alignment = style.alignment
+    cell.line_height = style.line_height
+    cell.original_line_count = line_count
+    cell.font_weight = "bold" if style.bold else "regular"
+    cell.font_style = "italic" if style.italic else "normal"
+    if asset is None:
+        cell.fit_strategy = "missing_glyph"
+        return _skip(cell, "missing_glyph", "Lokalni pisavi nimata vseh znakov prevoda.")
+    cell.font_family = asset.family
+    cell.proposed_font = asset.family
+    return cell
 
 
 def _apply_overlap_assessment(replacement: PdfReplacement, assessment: ImageOverlapAssessment) -> None:
@@ -234,7 +464,8 @@ def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> None:
                 conflicting.update((first.segment_id, second.segment_id))
     for replacement in candidates:
         if replacement.segment_id in conflicting:
-            _skip(replacement, "overlap_conflict", "Območje se prekriva z drugim replacementom.")
+            reason: SkipReason = "overlapping_table_replacement" if isinstance(replacement, PdfTableCellReplacement) else "overlap_conflict"
+            _skip(replacement, reason, "Območje se prekriva z drugim replacementom.")
 
 
 def _fit_replacement(
@@ -263,6 +494,48 @@ def _fit_replacement(
 
     replacement.fit_strategy = "overflow"
     _skip(replacement, "overflow", "Prevod se ne prilega znotraj dovoljene tipografske meje.", "overflow")
+
+
+def _fit_table_cell(
+    page: pymupdf.Page,
+    replacement: PdfTableCellReplacement,
+    typography: PdfTypographyResolver,
+    overlap_analyzer: PdfImageOverlapAnalyzer,
+) -> None:
+    content = _rect(replacement.content_bbox)
+    asset = _asset_for(replacement, typography)
+    exact = _htmlbox_preflight(page.rect, content, replacement, typography, asset, 1.0)
+    if exact[0] >= 0:
+        _accept_fit(replacement, content, exact, "exact")
+    else:
+        minimum_ratio = TABLE_TITLE_MIN_SCALE if replacement.column_span > 1 else TABLE_BODY_MIN_SCALE
+        minimum_scale = max(TABLE_MIN_FONT_SIZE / replacement.requested_font_size, minimum_ratio)
+        scaled = _htmlbox_preflight(page.rect, content, replacement, typography, asset, minimum_scale)
+        if scaled[0] < 0 or scaled[1] + 0.0001 < minimum_scale:
+            replacement.fit_strategy = "overflow"
+            _skip(replacement, "cell_overflow", "Prevod se ne prilega varnemu območju celice.", "overflow")
+            return
+        _accept_fit(replacement, content, scaled, "scaled")
+
+    if replacement.background_patch_used:
+        assessment = overlap_analyzer.analyze(
+            page,
+            content,
+            patch_rects=[content],
+            patch_clip=_rect(replacement.cell_bbox),
+            ignore_enclosing_drawings=True,
+            allow_opaque_vector_cover=True,
+        )
+        if not assessment.safe_for_background_patch or not _background_colors_close(
+            replacement.background_color, assessment.sampled_background_color
+        ):
+            replacement.background_patch_used = False
+            replacement.image_overlap_warnings.append("table_content_background_not_safe")
+            _skip(replacement, "image_overlap", "Celotno območje preloma nima dokazljivo varnega ozadja.")
+            return
+        replacement.background_metrics = assessment.metrics
+        replacement.overlap_confidence = min(replacement.overlap_confidence, assessment.confidence)
+        replacement.image_overlap_warnings.append("table_content_background_checked")
 
 
 def _accept_fit(replacement: PdfReplacement, rect: pymupdf.Rect, result: tuple[float, float, int], strategy: FitStrategy) -> None:
@@ -337,10 +610,11 @@ def _safe_expansion(
 
 def _write_diagnostics(document: pymupdf.Document, plan: PdfExportPlan) -> None:
     for replacement in plan.replacements:
-        if replacement.source_bbox is None:
+        diagnostic_bbox = replacement.cell_bbox if isinstance(replacement, PdfTableCellReplacement) else replacement.fitted_bbox or replacement.source_bbox
+        if diagnostic_bbox is None:
             continue
         page = document[replacement.page_number - 1]
-        rect = _rect(replacement.fitted_bbox or replacement.source_bbox)
+        rect = _rect(diagnostic_bbox)
         fit_colors = {"exact": (0.12, 0.55, 0.28), "expanded_bbox": (0.08, 0.45, 0.76), "scaled": (0.92, 0.48, 0.08)}
         overlap_colors = {
             "simple_background": (0.12, 0.55, 0.28),
@@ -348,11 +622,59 @@ def _write_diagnostics(document: pymupdf.Document, plan: PdfExportPlan) -> None:
             "image_only_text": (0.55, 0.20, 0.70),
             "uncertain": (0.92, 0.48, 0.08),
         }
-        color = overlap_colors.get(replacement.image_overlap_kind, fit_colors.get(replacement.fit_strategy, (0.78, 0.12, 0.16)))
+        if isinstance(replacement, PdfTableCellReplacement):
+            if replacement.skip_reason == "technical_value":
+                color = (0.08, 0.45, 0.76)
+            elif replacement.skip_reason == "cell_overflow":
+                color = (0.92, 0.48, 0.08)
+            elif replacement.skip_reason in {"image_overlap", "ocr_only_source", "unsupported_table_structure"}:
+                color = (0.55, 0.20, 0.70)
+            elif replacement.eligible:
+                color = (0.12, 0.55, 0.28)
+            else:
+                color = (0.78, 0.12, 0.16)
+        else:
+            color = overlap_colors.get(replacement.image_overlap_kind, fit_colors.get(replacement.fit_strategy, (0.78, 0.12, 0.16)))
         page.draw_rect(rect, color=color, width=0.8, overlay=True)
-        label_y = rect.y0 - 2 if rect.y0 >= 8 else rect.y0 + 7
-        label = replacement.image_overlap_kind if replacement.image_overlap_kind != "none" else replacement.fit_strategy
-        page.insert_text((rect.x0, label_y), f"{replacement.segment_id} {label}", fontname="helv", fontsize=5, color=color, overlay=True)
+        if not isinstance(replacement, PdfTableCellReplacement):
+            label_y = rect.y0 - 2 if rect.y0 >= 8 else rect.y0 + 7
+            label = replacement.image_overlap_kind if replacement.image_overlap_kind != "none" else replacement.fit_strategy
+            page.insert_text((rect.x0, label_y), f"{replacement.segment_id} {label}", fontname="helv", fontsize=5, color=color, overlay=True)
+    for table in plan.tables:
+        if table.bbox is None:
+            continue
+        page = document[table.page_number - 1]
+        table_rect = _rect(table.bbox)
+        rows: dict[int, list[PdfTableCellReplacement]] = defaultdict(list)
+        for cell in table.cells:
+            if cell.cell_bbox is not None:
+                rows[cell.row_index].append(cell)
+        for row_index, cells in rows.items():
+            label = f"r{row_index + 1} " + "/".join(
+                _table_diagnostic_code(cell) for cell in sorted(cells, key=lambda item: item.column_index)
+            )
+            font_size = 3.5
+            label_width = pymupdf.get_text_length(label, fontname="helv", fontsize=font_size)
+            if page.rect.x1 - table_rect.x1 >= label_width + 2:
+                label_x = table_rect.x1 + 1
+            elif table_rect.x0 - page.rect.x0 >= label_width + 2:
+                label_x = table_rect.x0 - label_width - 1
+            else:
+                continue
+            row_top = min(_rect(cell.cell_bbox).y0 for cell in cells)
+            page.insert_text((label_x, row_top + 4), label, fontname="helv", fontsize=font_size, color=(0.25, 0.25, 0.25), overlay=True)
+
+
+def _table_diagnostic_code(cell: PdfTableCellReplacement) -> str:
+    if cell.eligible:
+        return "G"
+    if cell.skip_reason == "technical_value":
+        return "B"
+    if cell.skip_reason == "cell_overflow":
+        return "O"
+    if cell.skip_reason in {"image_overlap", "ocr_only_source", "unsupported_table_structure"}:
+        return "V"
+    return "R"
 
 
 def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typography: PdfTypographyResolver) -> None:
@@ -374,7 +696,7 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
             asset = _asset_for(item, typography)
             html_text, css = typography.html_and_css(item.translated_text, item.typography, asset)
             spare, scale = page.insert_htmlbox(
-                _rect(item.fitted_bbox), html_text, css=css, scale_low=item.scale or 1.0, archive=typography.archive, overlay=True
+                _rect(item.fitted_bbox), html_text, css=css, scale_low=max(0.0, (item.scale or 1.0) - 0.000001), archive=typography.archive, overlay=True
             )
             if spare < 0 or scale + 0.0001 < (item.scale or 1.0):
                 raise PdfExportValidationError("insert_failed", f"Prevod segmenta {item.segment_id} se pri končnem zapisu ni prilegal.")
@@ -495,13 +817,39 @@ def _summarize(replacements: list[PdfReplacement]) -> PdfExportSummary:
         reviewed=sum(item.reviewed for item in replacements),
         eligible=sum(item.eligible for item in replacements),
         skipped=sum(not item.eligible for item in replacements),
-        overflow=sum(item.skip_reason == "overflow" for item in replacements),
-        conflicts=sum(item.skip_reason == "overlap_conflict" for item in replacements),
+        overflow=sum(item.skip_reason in {"overflow", "cell_overflow"} for item in replacements),
+        conflicts=sum(item.skip_reason in {"overlap_conflict", "overlapping_table_replacement"} for item in replacements),
         exact=sum(item.fit_strategy == "exact" for item in replacements),
         expanded=sum(item.fit_strategy == "expanded_bbox" for item in replacements),
         scaled=sum(item.fit_strategy == "scaled" for item in replacements),
         background_patches=sum(item.background_patch_used for item in replacements),
         image_overlap_skipped=sum(item.skip_reason == "image_overlap" for item in replacements),
+    )
+
+
+def _refresh_table_status(tables: list[PdfTableExportPlan]) -> None:
+    for table in tables:
+        reviewed = [cell for cell in table.cells if cell.reviewed]
+        table.partial_export = bool(reviewed) and any(cell.eligible for cell in reviewed) and any(not cell.eligible for cell in reviewed)
+
+
+def _summarize_tables(tables: list[PdfTableExportPlan]) -> PdfTableExportSummary:
+    cells = [cell for table in tables for cell in table.cells]
+    ambiguous_reasons = {
+        "ambiguous_cell_membership", "merged_cell_ambiguous", "missing_cell_bbox",
+        "duplicate_cell_geometry", "unsupported_table_structure", "duplicate_table_content",
+    }
+    return PdfTableExportSummary(
+        detected_tables=len([table for table in tables if table.bbox is not None]),
+        reviewed_cells=sum(cell.reviewed for cell in cells),
+        eligible_cells=sum(cell.eligible for cell in cells),
+        exported_cells=sum(cell.eligible for cell in cells),
+        technical_cells=sum(cell.skip_reason == "technical_value" for cell in cells),
+        overflow_cells=sum(cell.skip_reason == "cell_overflow" for cell in cells),
+        ambiguous_cells=sum(cell.skip_reason in ambiguous_reasons for cell in cells),
+        image_only_cells=sum(cell.skip_reason == "ocr_only_source" for cell in cells),
+        conflicting_cells=sum(cell.skip_reason == "overlapping_table_replacement" for cell in cells),
+        partial_tables=sum(table.partial_export for table in tables),
     )
 
 

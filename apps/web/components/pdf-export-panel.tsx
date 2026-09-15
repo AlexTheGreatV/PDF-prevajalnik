@@ -15,6 +15,16 @@ const REASON_LABELS: Record<string, string> = {
   ocr_only_source: "OCR območje",
   image_overlap: "območje se prekriva z vdelano sliko",
   complex_table: "kompleksna tabela",
+  technical_value: "tehnična vrednost ostane nespremenjena",
+  empty_cell: "prazna celica",
+  duplicate_table_content: "podvojena tabelna vsebina",
+  overlapping_table_replacement: "prekrivajoči se tabelni zamenjavi",
+  ambiguous_cell_membership: "dvoumna pripadnost celice",
+  merged_cell_ambiguous: "dvoumna združena celica",
+  missing_cell_bbox: "manjkajoča geometrija celice",
+  duplicate_cell_geometry: "podvojena geometrija celice",
+  unsupported_table_structure: "nezanesljiva struktura tabele",
+  cell_overflow: "prevod se ne prilega celici",
   rotated_page: "rotirana stran",
   source_text_mismatch: "izvorno besedilo se ne ujema",
   overlap_conflict: "prekrivanje območij",
@@ -87,6 +97,27 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
         <ExportMetric label="Lokalni patchi" value={plan.summary.background_patches} />
         <ExportMetric label="Slikovni preskoki" value={plan.summary.image_overlap_skipped} />
       </div>
+      {plan.tables.length > 0 && <section className="export-table-section">
+        <h4>Tabelne celice</h4>
+        <div className="export-summary">
+          <ExportMetric label="Tabele" value={plan.table_summary.detected_tables} />
+          <ExportMetric label="Potrjene celice" value={plan.table_summary.reviewed_cells} />
+          <ExportMetric label="Upravičene" value={plan.table_summary.eligible_cells} />
+          <ExportMetric label="Izvožene" value={plan.table_summary.exported_cells} />
+          <ExportMetric label="Tehnične" value={plan.table_summary.technical_cells} />
+          <ExportMetric label="Overflow" value={plan.table_summary.overflow_cells} />
+          <ExportMetric label="Dvoumne" value={plan.table_summary.ambiguous_cells} />
+          <ExportMetric label="Image-only" value={plan.table_summary.image_only_cells} />
+          <ExportMetric label="Konfliktne" value={plan.table_summary.conflicting_cells} />
+        </div>
+        {plan.table_summary.partial_tables > 0 && <p className="translation-warning">Del tabel bo izvožen samo delno. Preskočene celice ostanejo nespremenjene.</p>}
+        {plan.tables.map((table) => <details key={table.table_id} className="export-table-detail">
+          <summary>Stran {table.page_number} · {table.table_id} · {table.row_count} × {table.column_count}{table.partial_export ? " · delni izvoz" : ""}</summary>
+          {table.cells.filter((cell) => !cell.eligible).map((cell) => <p key={cell.segment_id}>
+            <strong>r{cell.row_index + 1} c{cell.column_index + 1}</strong> · {cell.source_text || "prazna celica"}: {REASON_LABELS[cell.skip_reason ?? ""] ?? cell.skip_reason ?? "ni upravičena"}
+          </p>)}
+        </details>)}
+      </section>}
       <details className="export-typography">
         <summary>Tipografske podrobnosti</summary>
         {plan.replacements.map((item) => <div key={item.segment_id} className="export-typography-row">
@@ -145,6 +176,8 @@ const OVERLAP_WARNING_LABELS: Record<string, string> = {
   background_complexity_exceeds_limit: "ozadje presega dovoljeno kompleksnost",
   background_metrics_near_threshold: "meritve so preblizu varnostnemu pragu",
   image_only_text_requires_manual_ocr_workflow: "potreben je ročni OCR potek",
+  table_content_background_checked: "celotno območje celice je ponovno preverjeno",
+  table_content_background_not_safe: "ozadje celotnega območja celice ni varno",
 };
 
 function formatSize(value: number): string {

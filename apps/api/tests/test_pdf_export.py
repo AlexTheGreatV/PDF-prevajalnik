@@ -130,7 +130,7 @@ def test_bbox_touching_page_edge_remains_valid(tmp_path: Path) -> None:
     [
         ({"source_text_origin": "accepted_ocr"}, "ocr_only_source"),
         ({"source_page_type": "scanned"}, "non_digital_source"),
-        ({"block_type": "table_cell", "source_bbox": None}, "complex_table"),
+        ({"block_type": "table_cell", "source_bbox": None}, "ambiguous_cell_membership"),
     ],
 )
 def test_ambiguous_sources_are_skipped(tmp_path: Path, changes: dict, reason: str) -> None:

@@ -55,10 +55,18 @@ class PdfImageOverlapAnalyzer:
         native_text: bool = True,
         preserve_list_marker: bool = False,
         patch_rects: list[pymupdf.Rect] | None = None,
+        patch_clip: pymupdf.Rect | None = None,
+        ignore_enclosing_drawings: bool = False,
+        allow_opaque_vector_cover: bool = False,
     ) -> ImageOverlapAssessment:
         images = _overlapping_images(page, rect)
         if not images:
             return ImageOverlapAssessment("none", [], 0.0, None, None, 1.0, False, [], [], [], None)
+        if allow_opaque_vector_cover and _opaque_vector_fill_covers_images(page, rect):
+            return ImageOverlapAssessment(
+                "none", [], 0.0, None, None, 1.0, False, [], [],
+                ["overlapping_image_hidden_by_opaque_vector_fill"], None,
+            )
         xrefs = sorted({int(info["xref"]) for info in images if info.get("xref")})
         overlap_ratio = min(1.0, sum((_rect(info["bbox"]) & rect).get_area() for info in images) / max(rect.get_area(), 0.001))
         if not native_text:
@@ -69,12 +77,17 @@ class PdfImageOverlapAnalyzer:
 
         source_patches, glyph_rects = _text_patch_rects(page, rect, preserve_list_marker)
         requested_patches = patch_rects or source_patches
-        clipped_patches = _clip_patches_to_images(requested_patches, images, self.thresholds.patch_padding_pt)
+        clipped_patches = _clip_patches_to_images(
+            requested_patches,
+            images,
+            self.thresholds.patch_padding_pt,
+            patch_clip,
+        )
         if not clipped_patches:
             return self._uncertain(xrefs, overlap_ratio, "no_patchable_text_glyphs")
         if _intersects_other_text(page, rect, requested_patches):
             return self._complex(xrefs, overlap_ratio, "neighboring_text_in_patch_area")
-        if _intersects_drawing(page, clipped_patches):
+        if _intersects_drawing(page, clipped_patches, ignore_enclosing_drawings):
             return self._complex(xrefs, overlap_ratio, "vector_element_in_patch_area")
 
         try:
@@ -193,10 +206,17 @@ def _text_patch_rects(page: pymupdf.Page, rect: pymupdf.Rect, preserve_list_mark
     return lines or [rect], glyphs
 
 
-def _clip_patches_to_images(patches: list[pymupdf.Rect], images: list[dict], padding: float) -> list[pymupdf.Rect]:
+def _clip_patches_to_images(
+    patches: list[pymupdf.Rect],
+    images: list[dict],
+    padding: float,
+    patch_clip: pymupdf.Rect | None = None,
+) -> list[pymupdf.Rect]:
     result: list[pymupdf.Rect] = []
     for patch in patches:
         padded = pymupdf.Rect(patch.x0 - padding, patch.y0 - padding, patch.x1 + padding, patch.y1 + padding)
+        if patch_clip is not None:
+            padded &= patch_clip
         for image in images:
             clipped = padded & _rect(image["bbox"])
             if not clipped.is_empty:
@@ -218,8 +238,77 @@ def _intersects_other_text(page: pymupdf.Page, source_rect: pymupdf.Rect, patche
     return False
 
 
-def _intersects_drawing(page: pymupdf.Page, patches: list[pymupdf.Rect]) -> bool:
-    return any(not (_rect(drawing["rect"]) & patch).is_empty for drawing in page.get_drawings() for patch in patches)
+def _intersects_drawing(page: pymupdf.Page, patches: list[pymupdf.Rect], ignore_enclosing: bool = False) -> bool:
+    for drawing in page.get_drawings():
+        drawing_rect = _rect(drawing["rect"])
+        for patch in patches:
+            if (drawing_rect & patch).is_empty:
+                continue
+            if ignore_enclosing and drawing_rect.contains(patch):
+                continue
+            return True
+    return False
+
+
+def _opaque_vector_fill_covers_images(page: pymupdf.Page, rect: pymupdf.Rect) -> bool:
+    image_sequences = [
+        index
+        for index, (kind, bbox, *_) in enumerate(page.get_bboxlog())
+        if kind == "fill-image" and not (_rect(bbox) & rect).is_empty
+    ]
+    if not image_sequences:
+        return False
+    latest_image = max(image_sequences)
+    drawings = page.get_drawings()
+    for drawing in drawings:
+        items = drawing.get("items") or []
+        if (
+            int(drawing.get("seqno", -1)) > latest_image
+            and drawing.get("fill") is not None
+            and float(drawing.get("fill_opacity", 0.0)) >= 0.999
+            and drawing.get("color") is None
+            and len(items) == 1
+            and items[0][0] == "re"
+            and _rect(items[0][1]).contains(rect)
+            and not any(
+                int(later.get("seqno", -1)) > int(drawing.get("seqno", -1))
+                and _drawing_items_intersect(later, rect)
+                for later in drawings
+            )
+        ):
+            return True
+    return False
+
+
+def _drawing_items_intersect(drawing: dict, rect: pymupdf.Rect) -> bool:
+    width = max(0.1, float(drawing.get("width") or 0.1))
+    for item in drawing.get("items") or []:
+        if item[0] == "re":
+            item_rect = _rect(item[1])
+            if drawing.get("fill") is None and drawing.get("color") is not None:
+                half = width / 2
+                border_bands = (
+                    pymupdf.Rect(item_rect.x0 - half, item_rect.y0 - half, item_rect.x1 + half, item_rect.y0 + half),
+                    pymupdf.Rect(item_rect.x0 - half, item_rect.y1 - half, item_rect.x1 + half, item_rect.y1 + half),
+                    pymupdf.Rect(item_rect.x0 - half, item_rect.y0 + half, item_rect.x0 + half, item_rect.y1 - half),
+                    pymupdf.Rect(item_rect.x1 - half, item_rect.y0 + half, item_rect.x1 + half, item_rect.y1 - half),
+                )
+                if any(not (band & rect).is_empty for band in border_bands):
+                    return True
+                continue
+        elif item[0] == "l":
+            left, right = item[1], item[2]
+            item_rect = pymupdf.Rect(
+                min(left.x, right.x) - width / 2,
+                min(left.y, right.y) - width / 2,
+                max(left.x, right.x) + width / 2,
+                max(left.y, right.y) + width / 2,
+            )
+        else:
+            return not (_rect(drawing["rect"]) & rect).is_empty
+        if not (item_rect & rect).is_empty:
+            return True
+    return False
 
 
 def _sample_points(

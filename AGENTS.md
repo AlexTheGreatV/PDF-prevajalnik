@@ -6,7 +6,7 @@ Build an internal document translation application for JUB/KOOP, starting with a
 
 ## Current Milestone
 
-Allow reviewed native text duplicated in an image layer to be exported only when a local 300-DPI analysis proves a uniform background suitable for a minimal opaque patch.
+Allow reviewed native text in reliably detected structured PDF table cells to be exported without changing table geometry, borders, fills, images, or standalone technical values.
 
 Allowed:
 
@@ -17,6 +17,7 @@ Allowed:
 - Local diagnostic and replacement-preview PDF export into a new temporary file
 - Local FiraGO typography resolution with regular, bold, italic, and bold-italic faces
 - Local background patching over demonstrably uniform image regions without modifying image XObjects
+- Cell-level export for reliable digital tables with source matching, fit preflight, and partial-export diagnostics
 
 Guardrails:
 
@@ -28,7 +29,8 @@ Guardrails:
 - Do not hardcode translations or silently repair damaged placeholders.
 - Never auto-review glossary or model translations; a successful placeholder retry must require manual review.
 - Never overwrite a source PDF. Export only reviewed, identity-matched, geometry-checked digital text blocks after fit preflight.
-- Preserve images and vector graphics, and skip ambiguous, overlapping, OCR-only, rotated, table, or overflowing regions with a structured reason.
+- Preserve images and vector graphics, and skip ambiguous, overlapping, OCR-only, rotated, unsupported-table, or overflowing regions with a structured reason.
+- Never resize table rows or columns, reconstruct ambiguous merged cells, alter borders/fills, or translate standalone technical values automatically.
 - Keep Droid Sans Fallback as a final glyph fallback, never download fonts at runtime, and never reuse an embedded source font without clear embedding rights and complete glyph coverage.
 - Never patch photographs, gradients, textures, icons, lines, image-only OCR text, or uncertain regions. Do not add inpainting or full-page rasterization.
 - Do not add payments, public registration, or remote document uploads.

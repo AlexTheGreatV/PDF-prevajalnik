@@ -28,6 +28,7 @@ No external AI services are called in this milestone. Documents stay local.
 - Use a Slovenian web UI for drag-and-drop PDF analysis and page previews
 - Prepare and review structured translation segments without changing source text
 - Optionally translate English segments to Slovenian with a local OPUS-MT/CTranslate2 model
+- Preview reviewed translations in reliable digital table cells while preserving the table grid and technical values
 
 ## Local Backend Setup
 
@@ -108,7 +109,7 @@ Translated PDF preview endpoints:
 - `POST /api/pdf/export-translated/plan` validates identity, source text, coordinates, conflicts, glyphs, and fit without changing a PDF.
 - `POST /api/pdf/export-translated` returns a new `<original-name>-sl-preview.pdf` in `diagnostic` or `replacement_preview` mode.
 
-Only manually reviewed digital text blocks are eligible. Tables, OCR-only content, rotated pages, boxes that overlap embedded images, overlapping replacements, source mismatches, and overflow are skipped with structured reasons. Replacement preflight completes before text redaction; the source PDF is never modified, temporary files are removed after each request, and images and vector graphics are preserved. Preview fonts are loaded only from pinned local packages, without downloads or system-font lookup.
+Only manually reviewed, identity-matched digital text is eligible. Reliable structured tables are planned cell by cell: source text and geometry must match, content stays inside the original cell, standalone technical values remain unchanged, and one overflowing or ambiguous cell produces an explicit partial export instead of rejecting safe neighboring cells. Graphic tables, image-only cells, rotated pages, overlapping replacements, source mismatches, and overflow are skipped with structured reasons. Replacement preflight completes before text redaction; the source PDF is never modified, temporary files are removed after each request, and images, fills, borders, and other vector graphics are preserved. Preview fonts are loaded only from pinned local packages, without downloads or system-font lookup.
 
 Typography preflight uses the FiraGO OpenType 1.001 family included in the pinned `pymupdf-fonts` 1.0.5 package, with regular, bold, italic, and bold-italic faces; Droid Sans Fallback is retained only for glyph fallback. The resolver recalculates the dominant source span style from the identity-checked PDF, preserves its decimal PyMuPDF RGB color, approximate alignment, and line height, and reports mixed styles. It first tries the original box, then a collision-checked expansion within the same page half, and finally bounded scaling: at most 15% for headings and 25% for body text, never below 6 pt. Embedded source-font subsets are not reused because complete glyph coverage and embedding rights cannot be established reliably.
 

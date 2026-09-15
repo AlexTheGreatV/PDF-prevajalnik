@@ -939,6 +939,10 @@ pre {
 .export-typography-row .translation-warning { grid-column: 1 / -1; margin: 0; }
 .export-overlap-detail { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; }
 .color-swatch { width: 14px; height: 14px; border: 1px solid var(--border); display: inline-block; }
+.export-table-section { border-top: 1px solid var(--border); padding-top: 16px; }
+.export-table-section h4 { margin: 0 0 10px; }
+.export-table-detail { border-top: 1px solid var(--border); padding: 9px 0; }
+.export-table-detail p { margin: 7px 0 0; font-size: 13px; }
 
 @media (max-width: 800px) {
   .export-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -47,6 +47,32 @@ export type PdfExportReplacement = {
   image_overlap_warnings: string[];
 };
 
+export type PdfTableCellReplacement = PdfExportReplacement & {
+  table_id: string;
+  row_index: number;
+  column_index: number;
+  row_span: number;
+  column_span: number;
+  cell_bbox: BBox | null;
+  content_bbox: BBox | null;
+  source_text: string;
+  source_match_status: "matched" | "mismatch" | "not_checked";
+  background_fill: string | null;
+  border_clearance: number;
+};
+
+export type PdfTableExportPlan = {
+  table_id: string;
+  page_number: number;
+  bbox: BBox | null;
+  row_count: number;
+  column_count: number;
+  reliable: boolean;
+  partial_export: boolean;
+  warnings: string[];
+  cells: PdfTableCellReplacement[];
+};
+
 export type PdfExportPlan = {
   filename: string;
   mode: PdfExportMode;
@@ -65,6 +91,19 @@ export type PdfExportPlan = {
     image_overlap_skipped: number;
   };
   replacements: PdfExportReplacement[];
+  table_summary: {
+    detected_tables: number;
+    reviewed_cells: number;
+    eligible_cells: number;
+    exported_cells: number;
+    technical_cells: number;
+    overflow_cells: number;
+    ambiguous_cells: number;
+    image_only_cells: number;
+    conflicting_cells: number;
+    partial_tables: number;
+  };
+  tables: PdfTableExportPlan[];
 };
 
 export async function preparePdfExport(file: File, job: TranslationJob, mode: PdfExportMode): Promise<PdfExportPlan> {

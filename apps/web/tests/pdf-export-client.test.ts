@@ -30,11 +30,21 @@ test("prepares a local multipart PDF export plan", async () => {
     const form = init?.body as FormData;
     assert.equal(form.get("mode"), "diagnostic");
     assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 4);
-    return new Response(JSON.stringify({ filename: "source-sl-preview.pdf", mode: "diagnostic", document_sha256: "a".repeat(64), summary: { total_segments: 0, reviewed: 0, eligible: 0, skipped: 0, overflow: 0, conflicts: 0 }, replacements: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({
+      filename: "source-sl-preview.pdf",
+      mode: "diagnostic",
+      document_sha256: "a".repeat(64),
+      summary: { total_segments: 0, reviewed: 0, eligible: 0, skipped: 0, overflow: 0, conflicts: 0 },
+      table_summary: { detected_tables: 1, reviewed_cells: 2, eligible_cells: 1, exported_cells: 0, technical_cells: 1, overflow_cells: 0, ambiguous_cells: 0, image_only_cells: 0, conflicting_cells: 0, partial_tables: 1 },
+      replacements: [],
+      tables: [{ table_id: "p1-t1", page_number: 1, bbox: { x0: 10, y0: 20, x1: 90, y1: 80 }, row_count: 1, column_count: 2, reliable: true, partial_export: true, warnings: [], cells: [] }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   try {
     const result = await preparePdfExport(new File(["%PDF-"], "source.pdf", { type: "application/pdf" }), job(), "diagnostic");
     assert.equal(result.filename, "source-sl-preview.pdf");
+    assert.equal(result.table_summary.detected_tables, 1);
+    assert.equal(result.tables[0].partial_export, true);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -19,6 +19,16 @@ SkipReason = Literal[
     "ocr_only_source",
     "image_overlap",
     "complex_table",
+    "technical_value",
+    "empty_cell",
+    "duplicate_table_content",
+    "overlapping_table_replacement",
+    "ambiguous_cell_membership",
+    "merged_cell_ambiguous",
+    "missing_cell_bbox",
+    "duplicate_cell_geometry",
+    "unsupported_table_structure",
+    "cell_overflow",
     "rotated_page",
     "source_text_mismatch",
     "overlap_conflict",
@@ -143,6 +153,44 @@ class PdfReplacement(BaseModel):
     skip_reason: SkipReason | None = None
 
 
+class PdfTableCellReplacement(PdfReplacement):
+    table_id: str
+    row_index: int = Field(ge=0)
+    column_index: int = Field(ge=0)
+    row_span: int = Field(ge=1)
+    column_span: int = Field(ge=1)
+    cell_bbox: BBox | None = None
+    content_bbox: BBox | None = None
+    source_match_status: Literal["matched", "mismatch", "not_checked"] = "not_checked"
+    background_fill: str | None = None
+    border_clearance: float = 0.0
+
+
+class PdfTableExportPlan(BaseModel):
+    table_id: str
+    page_number: int
+    bbox: BBox | None = None
+    row_count: int = 0
+    column_count: int = 0
+    reliable: bool = False
+    partial_export: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    cells: list[PdfTableCellReplacement] = Field(default_factory=list)
+
+
+class PdfTableExportSummary(BaseModel):
+    detected_tables: int = 0
+    reviewed_cells: int = 0
+    eligible_cells: int = 0
+    exported_cells: int = 0
+    technical_cells: int = 0
+    overflow_cells: int = 0
+    ambiguous_cells: int = 0
+    image_only_cells: int = 0
+    conflicting_cells: int = 0
+    partial_tables: int = 0
+
+
 class PdfExportSummary(BaseModel):
     total_segments: int
     reviewed: int
@@ -163,3 +211,5 @@ class PdfExportPlan(BaseModel):
     document_sha256: str
     summary: PdfExportSummary
     replacements: list[PdfReplacement]
+    table_summary: PdfTableExportSummary = Field(default_factory=PdfTableExportSummary)
+    tables: list[PdfTableExportPlan] = Field(default_factory=list)
