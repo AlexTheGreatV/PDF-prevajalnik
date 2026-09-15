@@ -15,6 +15,29 @@ from app.services.pdf_renderer import render_pdf_pages
 client = TestClient(app)
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ],
+)
+def test_api_allows_known_local_frontend_origins(origin: str) -> None:
+    response = client.options(
+        "/api/pdf/analyze",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
 def test_analyzes_digital_pdf(tmp_path: Path) -> None:
     pdf_path = tmp_path / "digital.pdf"
     _make_digital_pdf(pdf_path)

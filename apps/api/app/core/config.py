@@ -8,7 +8,12 @@ from pydantic import field_validator
 
 class Settings(BaseSettings):
     app_env: str = "local"
-    cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    cors_origins: list[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ]
     storage_dir: Path = Path("apps/api/storage")
     processing_tmp_dir: Path = Path(tempfile.gettempdir()) / "jub-koop-pdf-pipeline"
     max_upload_bytes: int = 50 * 1024 * 1024
