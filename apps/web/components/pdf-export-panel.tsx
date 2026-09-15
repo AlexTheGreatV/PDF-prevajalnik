@@ -13,6 +13,10 @@ const REASON_LABELS: Record<string, string> = {
   bbox_outside_page: "območje je zunaj strani",
   non_digital_source: "ni digitalno besedilo",
   ocr_only_source: "OCR območje",
+  ocr_not_accepted: "OCR ali njegov prevod ni ročno potrjen",
+  ocr_provenance_mismatch: "OCR vir ali območje se je po potrditvi spremenilo",
+  ocr_region_too_small: "OCR območje je premajhno",
+  ocr_background_unsafe: "ozadje OCR območja ni dokazljivo enotno",
   image_overlap: "območje se prekriva z vdelano sliko",
   complex_table: "kompleksna tabela",
   technical_value: "tehnična vrednost ostane nespremenjena",
@@ -79,7 +83,7 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
     </div>
     <div className="translation-actions">
       <button className="button" disabled={busy !== null || !job.document_identity} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi izvoz PDF"}</button>
-      <button className="button secondary" disabled={!plan || plan.summary.eligible === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : "Prenesi novi PDF"}</button>
+      <button className="button secondary" disabled={!plan || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : "Prenesi novi PDF"}</button>
     </div>
     {!job.document_identity && <p className="translation-warning">Opravilo nima preverjene identitete PDF-ja. Znova ga povežite s trenutno analizo.</p>}
     {error && <p className="translation-error">{error}</p>}
@@ -118,9 +122,23 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
           </p>)}
         </details>)}
       </section>}
+      {plan.ocr_replacements.length > 0 && <section className="export-table-section">
+        <h4>Ročno potrjena OCR območja</h4>
+        <div className="export-summary">
+          <ExportMetric label="Potrjena" value={plan.ocr_summary.reviewed_regions} />
+          <ExportMetric label="Upravičena" value={plan.ocr_summary.eligible_regions} />
+          <ExportMetric label="Varno izvožena" value={plan.ocr_summary.exported_regions} />
+          <ExportMetric label="Nevarna" value={plan.ocr_summary.unsafe_regions} />
+          <ExportMetric label="Zastarela" value={plan.ocr_summary.stale_regions} />
+        </div>
+        {plan.ocr_replacements.map((item) => <p key={item.segment_id}>
+          <strong>Stran {item.page_number} · {item.ocr_review_id ?? item.segment_id}</strong>: {item.eligible ? "varen selektivni izvoz" : REASON_LABELS[item.skip_reason ?? ""] ?? item.skip_reason ?? "ni upravičeno"}
+        </p>)}
+        {plan.ocr_replacements.some((item) => !item.eligible) && <p className="translation-warning">Preskočena OCR območja ostanejo v izvornem PDF-ju nespremenjena.</p>}
+      </section>}
       <details className="export-typography">
         <summary>Tipografske podrobnosti</summary>
-        {plan.replacements.map((item) => <div key={item.segment_id} className="export-typography-row">
+        {[...plan.replacements, ...plan.ocr_replacements].map((item) => <div key={item.segment_id} className="export-typography-row">
           <strong>{item.segment_id}</strong>
           <span>{item.font_family} · {item.font_weight}{item.font_style === "italic" ? " italic" : ""}</span>
           <span>{formatSize(item.requested_font_size)} → {item.fitted_font_size === null ? "—" : formatSize(item.fitted_font_size)}</span>
@@ -133,9 +151,9 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
           {item.image_overlap_warnings.length > 0 && <span className="translation-warning">{item.image_overlap_warnings.map((warning) => OVERLAP_WARNING_LABELS[warning] ?? warning).join(", ")}</span>}
         </div>)}
       </details>
-      {plan.replacements.some((item) => !item.eligible) && <details className="export-skips">
+      {[...plan.replacements, ...plan.ocr_replacements].some((item) => !item.eligible) && <details className="export-skips">
         <summary>Razlogi za preskok</summary>
-        {plan.replacements.filter((item) => !item.eligible).map((item) => <p key={item.segment_id}><strong>{item.segment_id}</strong>: {REASON_LABELS[item.skip_reason ?? ""] ?? item.skip_reason ?? "ni upravičen"}</p>)}
+        {[...plan.replacements, ...plan.ocr_replacements].filter((item) => !item.eligible).map((item) => <p key={item.segment_id}><strong>{item.segment_id}</strong>: {REASON_LABELS[item.skip_reason ?? ""] ?? item.skip_reason ?? "ni upravičen"}</p>)}
       </details>}
     </>}
   </section>;

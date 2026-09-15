@@ -128,7 +128,6 @@ def test_bbox_touching_page_edge_remains_valid(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("changes", "reason"),
     [
-        ({"source_text_origin": "accepted_ocr"}, "ocr_only_source"),
         ({"source_page_type": "scanned"}, "non_digital_source"),
         ({"block_type": "table_cell", "source_bbox": None}, "ambiguous_cell_membership"),
     ],
@@ -140,6 +139,16 @@ def test_ambiguous_sources_are_skipped(tmp_path: Path, changes: dict, reason: st
     payload["segments"][0].update(changes)
     plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, reason))
     assert plan.replacements[0].skip_reason == reason
+
+
+def test_accepted_ocr_without_provenance_is_separately_skipped(tmp_path: Path) -> None:
+    source = tmp_path / "ocr-without-provenance.pdf"
+    _make_pdf(source)
+    payload = _job_payload(source)
+    payload["segments"][0]["source_text_origin"] = "accepted_ocr"
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "ocr-provenance"))
+    assert plan.replacements == []
+    assert plan.ocr_replacements[0].skip_reason == "ocr_provenance_mismatch"
 
 
 def test_overflow_keeps_original_text(tmp_path: Path) -> None:

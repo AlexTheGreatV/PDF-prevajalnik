@@ -130,6 +130,53 @@ class PdfImageOverlapAnalyzer:
             ["image_layer_contains_visible_text"], None,
         )
 
+    def analyze_ocr_region(self, page: pymupdf.Page, rect: pymupdf.Rect) -> ImageOverlapAssessment:
+        """Assess a tight image-only OCR bbox without inferring or rebuilding surrounding graphics."""
+        images = _overlapping_images(page, rect)
+        xrefs = sorted({int(info["xref"]) for info in images if info.get("xref")})
+        scale = self.thresholds.dpi / 72
+        if rect.width * scale * rect.height * scale > 1_000_000:
+            return self._uncertain(xrefs, 0.0, "ocr_region_too_large_for_background_analysis")
+        if not images:
+            return self._uncertain([], 0.0, "ocr_region_has_no_image_layer")
+        overlap_ratio = min(1.0, sum((_rect(info["bbox"]) & rect).get_area() for info in images) / max(rect.get_area(), 0.001))
+        if overlap_ratio < 0.98:
+            return self._uncertain(xrefs, overlap_ratio, "ocr_region_not_fully_image_backed")
+        if _intersects_other_text(page, rect, [rect]):
+            return self._complex(xrefs, overlap_ratio, "neighboring_text_in_patch_area")
+        if _intersects_drawing(page, [rect]):
+            return self._complex(xrefs, overlap_ratio, "vector_element_in_patch_area")
+        try:
+            metric_values, color, has_large_graphic = self._measure_ocr_background(page, rect)
+        except (RuntimeError, ValueError, OSError):
+            return self._uncertain(xrefs, overlap_ratio, "background_render_failed")
+        metrics = PdfBackgroundMetrics(**metric_values)
+        ratios = [
+            metrics.color_variance / self.thresholds.maximum_color_variance,
+            metrics.edge_density / self.thresholds.maximum_edge_density,
+            metrics.texture_score / self.thresholds.maximum_texture_score,
+            metrics.side_color_delta / self.thresholds.maximum_side_color_delta,
+        ]
+        enough = metrics.sample_count >= self.thresholds.minimum_samples
+        near = any(ratio >= 1.0 - self.thresholds.ambiguity_margin for ratio in ratios)
+        metrics.near_threshold = near
+        confidence = max(0.0, min(1.0, 1.0 - max(ratios) * 0.5)) if enough else 0.0
+        if not enough:
+            return ImageOverlapAssessment("uncertain", xrefs, round(overlap_ratio, 4), color, metrics, confidence, False, [_bbox(rect)], [], ["insufficient_background_samples"], "insufficient_samples")
+        if has_large_graphic:
+            return ImageOverlapAssessment(
+                "complex_background", xrefs, round(overlap_ratio, 4), color, metrics, 0.0, False,
+                [_bbox(rect)], [], ["large_graphic_component_in_ocr_region"], "complex_background",
+            )
+        if any(ratio > 1.0 for ratio in ratios):
+            return ImageOverlapAssessment("complex_background", xrefs, round(overlap_ratio, 4), color, metrics, confidence, False, [_bbox(rect)], [], ["background_complexity_exceeds_limit"], "complex_background")
+        if near:
+            return ImageOverlapAssessment("uncertain", xrefs, round(overlap_ratio, 4), color, metrics, confidence, False, [_bbox(rect)], [], ["background_metrics_near_threshold"], "near_threshold")
+        return ImageOverlapAssessment(
+            "simple_background", xrefs, round(overlap_ratio, 4), color, metrics, round(confidence, 4), True,
+            [_bbox(rect)], [], ["accepted_ocr_uniform_background_checked"], None,
+        )
+
     def _measure(
         self,
         page: pymupdf.Page,
@@ -173,6 +220,60 @@ class PdfImageOverlapAnalyzer:
             "side_color_delta": round(side_delta, 4),
             "near_threshold": False,
         }, color
+
+    def _measure_ocr_background(
+        self, page: pymupdf.Page, rect: pymupdf.Rect
+    ) -> tuple[dict[str, float | int | bool], str, bool]:
+        pixmap = page.get_pixmap(clip=rect, dpi=self.thresholds.dpi, alpha=False)
+        if pixmap.width < 3 or pixmap.height < 3 or pixmap.n < 3:
+            raise RuntimeError("invalid OCR background render")
+        image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        pixels = list(image.getdata())
+        buckets: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+        for pixel in pixels:
+            buckets.setdefault(tuple(channel // 16 for channel in pixel), []).append(pixel)
+        dominant = max(buckets.values(), key=len)
+        base = [sum(pixel[index] for pixel in dominant) / len(dominant) for index in range(3)]
+        background_points: list[tuple[int, int]] = []
+        foreground: set[tuple[int, int]] = set()
+        for y in range(image.height):
+            for x in range(image.width):
+                point = (x, y)
+                target = background_points if _distance(image.getpixel(point), base) <= self.thresholds.texture_color_distance else foreground
+                target.add(point) if isinstance(target, set) else target.append(point)
+        if len(background_points) / len(pixels) < 0.55:
+            raise ValueError("no dominant OCR background")
+        samples = [image.getpixel(point) for point in background_points]
+        means = [sum(pixel[index] for pixel in samples) / len(samples) for index in range(3)]
+        variances = [sum((pixel[index] - means[index]) ** 2 for pixel in samples) / len(samples) for index in range(3)]
+        edges = image.convert("L").filter(ImageFilter.FIND_EDGES)
+        background_set = set(background_points)
+        interior_background = [
+            (x, y) for x, y in background_points
+            if 1 < x < image.width - 2 and 1 < y < image.height - 2
+            and all((x + dx, y + dy) in background_set for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+        ]
+        if not interior_background:
+            raise ValueError("no interior OCR background samples")
+        edge_density = sum(edges.getpixel(point) >= 32 for point in interior_background) / len(interior_background)
+        side_width = max(1, round(min(image.width, image.height) * 0.08))
+        sides = [
+            [point for point in background_points if point[1] < side_width],
+            [point for point in background_points if point[1] >= image.height - side_width],
+            [point for point in background_points if point[0] < side_width],
+            [point for point in background_points if point[0] >= image.width - side_width],
+        ]
+        if any(not side for side in sides):
+            raise ValueError("OCR background does not reach every side")
+        side_means = [[sum(image.getpixel(point)[index] for point in side) / len(side) for index in range(3)] for side in sides]
+        side_delta = max(_distance(left, right) for index, left in enumerate(side_means) for right in side_means[index + 1 :])
+        color = "#" + "".join(f"{round(value):02x}" for value in means)
+        return {
+            "dpi": self.thresholds.dpi, "sample_count": len(samples),
+            "color_variance": round(sum(variances) / 3, 4),
+            "edge_density": round(edge_density, 6), "texture_score": 0.0,
+            "side_color_delta": round(side_delta, 4), "near_threshold": False,
+        }, color, _has_large_foreground_component(foreground, image.width, image.height)
 
     def _uncertain(self, xrefs: list[int], overlap_ratio: float, warning: str) -> ImageOverlapAssessment:
         return ImageOverlapAssessment("uncertain", xrefs, round(overlap_ratio, 4), None, None, 0.0, False, [], [], [warning], warning)
@@ -354,6 +455,37 @@ def _pixel_box(rect: pymupdf.Rect, clip: pymupdf.Rect, sx: float, sy: float, wid
 
 def _distance(left, right) -> float:
     return math.sqrt(sum((float(left[index]) - float(right[index])) ** 2 for index in range(3)))
+
+
+def _has_large_foreground_component(points: set[tuple[int, int]], width: int, height: int) -> bool:
+    remaining = set(points)
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        min_x = max_x = start[0]
+        min_y = max_y = start[1]
+        area = 1
+        while stack:
+            x, y = stack.pop()
+            for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if neighbor not in remaining:
+                    continue
+                remaining.remove(neighbor)
+                stack.append(neighbor)
+                area += 1
+                min_x = min(min_x, neighbor[0])
+                max_x = max(max_x, neighbor[0])
+                min_y = min(min_y, neighbor[1])
+                max_y = max(max_y, neighbor[1])
+        component_width = (max_x - min_x + 1) / width
+        component_height = (max_y - min_y + 1) / height
+        if (
+            component_width >= 0.6 and component_height >= 0.45
+            or component_height >= 0.8
+            or area / (width * height) >= 0.15
+        ):
+            return True
+    return False
 
 
 def _rect(value) -> pymupdf.Rect:

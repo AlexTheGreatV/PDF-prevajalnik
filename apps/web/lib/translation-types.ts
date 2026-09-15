@@ -2,6 +2,14 @@ import type { BBox, PdfKind, StructuredBlockKind, StructuredStyle } from "./pdf-
 
 export type TranslationStatus = "pending" | "translating" | "translated" | "reviewed" | "failed" | "skipped";
 export type TranslationSourceOrigin = "native" | "accepted_ocr";
+export type AcceptedOcrSource = {
+  revision_id?: string | null;
+  review_id: string;
+  accepted_text: string;
+  bbox: BBox;
+  source: "block" | "page" | "image" | "manual";
+  reason: string;
+};
 export type TranslationOrigin = "glossary" | "provider" | "manual" | null;
 export type GlossaryMode = "exact_segment" | "do_not_translate" | "preferred" | "locked_inline";
 export type GlossaryOrigin = "built_in" | "user";
@@ -75,6 +83,7 @@ export type TranslationSegment = {
   source_page_type: PdfKind | null;
   source_rotation: number | null;
   source_style: StructuredStyle | null;
+  accepted_ocr_source?: AcceptedOcrSource | null;
   translated_text: string;
   edited_translation: string;
   status: TranslationStatus;

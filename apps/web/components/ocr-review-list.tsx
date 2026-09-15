@@ -108,10 +108,10 @@ export function OcrReviewList({
             </button>
             <button
               className="button secondary"
-              disabled={!item.ocr_text || (item.status !== "suggested" && item.status !== "rejected")}
+              disabled={!item.ocr_text || !["suggested", "rejected", "accepted"].includes(item.status)}
               onClick={() => onAccept(item.id)}
             >
-              Uporabi OCR rezultat
+              {item.status === "accepted" ? "Ponovno registriraj in sprejmi OCR" : "Uporabi OCR rezultat"}
             </button>
           </div>
         </div>

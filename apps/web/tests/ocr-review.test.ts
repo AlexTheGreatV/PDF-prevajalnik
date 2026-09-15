@@ -234,6 +234,16 @@ test("low confidence stays a suggestion until explicitly accepted", () => {
   assert.equal(acceptOcrResult(suggested).native_text, item.native_text);
 });
 
+test("an accepted OCR result can be re-registered after server expiry without changing native text", () => {
+  const item = createOcrReviewItems(analysis())[0];
+  const suggested = applyOcrSuggestion(item, { ...ocrResult("APPLICATIONS", item.pdf_bbox), confidence: 49 });
+  const accepted = acceptOcrResult(suggested, "old-revision");
+  const renewed = acceptOcrResult(accepted, "new-revision");
+  assert.equal(renewed.server_revision_id, "new-revision");
+  assert.equal(renewed.native_text, suggested.native_text);
+  assert.equal(renewed.effective_text, "APPLICATIONS");
+});
+
 test("empty OCR preserves its crop and requires manual review", () => {
   const item = createOcrReviewItems(analysis())[0];
   const result = applyOcrSuggestion(item, ocrResult("", item.pdf_bbox), [], "data:image/png;base64,test");

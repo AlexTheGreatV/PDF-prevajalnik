@@ -12,6 +12,7 @@ import {
   exportTranslationJob,
   getSkipReason,
   importTranslationJob,
+  invalidateStaleOcrApprovals,
   protectForTranslation,
   resetTranslation,
   restoreProtectedTokens,
@@ -56,7 +57,11 @@ function fixture(): PdfAnalysis {
 }
 
 function acceptedOcr(): OcrReviewItem {
-  return { id: "ocr", page_number: 1, reason: "suspicious_glyph", pdf_bbox: { x0: 0, y0: 0, x1: 10, y1: 10 }, pixel_bbox: null, native_text: "qPPLICATIONS", ocr_text: "APPLICATIONS", confidence: 49, status: "accepted", selected_text_source: "ocr", effective_text: "APPLICATIONS", error: null, source: "block", linked_block_reading_order: 1, warnings: [], attempts: [], crop_image_url: null, crop_debug: null };
+  return { id: "ocr", page_number: 1, reason: "suspicious_glyph", pdf_bbox: { x0: 0, y0: 0, x1: 10, y1: 10 }, pixel_bbox: null, native_text: "qPPLICATIONS", ocr_text: "APPLICATIONS", confidence: 49, status: "accepted", selected_text_source: "ocr", effective_text: "APPLICATIONS", error: null, source: "block", linked_block_reading_order: 1, warnings: [], attempts: [], crop_image_url: null, crop_debug: null, server_revision_id: "server-revision" };
+}
+
+function acceptedManualOcr(): OcrReviewItem {
+  return { ...acceptedOcr(), id: "manual-ocr", linked_block_reading_order: undefined, source: "manual", reason: "manual_selection", native_text: "", ocr_text: "Warranty period", effective_text: "Warranty period", pdf_bbox: { x0: 20, y0: 20, x1: 70, y1: 35 } };
 }
 
 class DeterministicProvider implements TranslationProvider {
@@ -93,6 +98,34 @@ test("uses accepted OCR effective text and retains native origin otherwise", () 
   assert.equal(ocr.source_text, "APPLICATIONS");
   assert.equal(ocr.source_text_origin, "accepted_ocr");
   assert.equal(acceptedOcr().native_text, "qPPLICATIONS");
+});
+
+test("adds an accepted manual OCR region as a separate unreviewed translation segment", () => {
+  const job = createTranslationJob(fixture(), [acceptedManualOcr()], { source_language: "en", target_language: "sl" });
+  const segment = job.segments.find((item) => item.segment_id === "ocr-manual-ocr")!;
+  assert.equal(segment.source_text_origin, "accepted_ocr");
+  assert.equal(segment.source_text, "Warranty period");
+  assert.deepEqual(segment.source_bbox, acceptedManualOcr().pdf_bbox);
+  assert.equal(segment.accepted_ocr_source?.review_id, "manual-ocr");
+  assert.notEqual(segment.status, "reviewed");
+});
+
+test("changing or rejecting an OCR source invalidates its old translation approval", () => {
+  const item = acceptedManualOcr();
+  const base = createTranslationJob(fixture(), [item], { source_language: "en", target_language: "sl" });
+  const reviewed = { ...base, segments: base.segments.map((segment) => segment.segment_id === "ocr-manual-ocr" ? reviewTranslation(editTranslation(segment, "Garancijsko obdobje")) : segment) };
+  const changed = { ...item, effective_text: "Changed OCR", ocr_text: "Changed OCR", pdf_bbox: { ...item.pdf_bbox, x1: 75 } };
+  const invalidated = invalidateStaleOcrApprovals(reviewed, [changed]);
+  const segment = invalidated.segments.find((entry) => entry.segment_id === "ocr-manual-ocr")!;
+  assert.equal(segment.status, "translated");
+  assert.equal(segment.needs_review, true);
+  assert.equal(segment.source_text, "Changed OCR");
+  assert.equal(segment.edited_translation, "Garancijsko obdobje");
+  assert.ok(segment.warnings.includes("ocr_source_changed_after_review"));
+
+  const rejected = invalidateStaleOcrApprovals(reviewed, [{ ...item, status: "rejected", selected_text_source: "native" }]);
+  assert.notEqual(rejected.segments.find((entry) => entry.segment_id === "ocr-manual-ocr")?.status, "reviewed");
+  assert.equal(rejected.segments.find((entry) => entry.segment_id === "ocr-manual-ocr")?.accepted_ocr_source, null);
 });
 
 test("skips non-translatable content with reasons", () => {

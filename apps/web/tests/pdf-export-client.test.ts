@@ -36,8 +36,10 @@ test("prepares a local multipart PDF export plan", async () => {
       document_sha256: "a".repeat(64),
       summary: { total_segments: 0, reviewed: 0, eligible: 0, skipped: 0, overflow: 0, conflicts: 0 },
       table_summary: { detected_tables: 1, reviewed_cells: 2, eligible_cells: 1, exported_cells: 0, technical_cells: 1, overflow_cells: 0, ambiguous_cells: 0, image_only_cells: 0, conflicting_cells: 0, partial_tables: 1 },
+      ocr_summary: { reviewed_regions: 1, eligible_regions: 0, exported_regions: 0, unsafe_regions: 1, stale_regions: 0 },
       replacements: [],
       tables: [{ table_id: "p1-t1", page_number: 1, bbox: { x0: 10, y0: 20, x1: 90, y1: 80 }, row_count: 1, column_count: 2, reliable: true, partial_export: true, warnings: [], cells: [] }],
+      ocr_replacements: [{ segment_id: "ocr-1", skip_reason: "ocr_background_unsafe" }],
     }), { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   try {
@@ -45,6 +47,8 @@ test("prepares a local multipart PDF export plan", async () => {
     assert.equal(result.filename, "source-sl-preview.pdf");
     assert.equal(result.table_summary.detected_tables, 1);
     assert.equal(result.tables[0].partial_export, true);
+    assert.equal(result.ocr_summary.unsafe_regions, 1);
+    assert.equal(result.ocr_replacements[0].skip_reason, "ocr_background_unsafe");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -74,5 +78,6 @@ test("shows a structured Slovenian export error", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
 
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });

@@ -115,6 +115,10 @@ Typography preflight uses the FiraGO OpenType 1.001 family included in the pinne
 
 Native text duplicated in an overlapping image layer is eligible only when a 300-DPI local analysis proves a simple background. Central thresholds require at least 128 background samples, mean RGB variance at most 18, edge density at most 0.02, texture score at most 0.04, and side-to-side color distance at most 8; values within 15% of a limit are treated as uncertain and skipped. The exporter keeps the image XObject unchanged, removes only the native text glyphs, paints minimal line-level patches in the measured color, and reruns the background check for an expanded fit box. Photographs, gradients, textures, icons, lines, image-only OCR text, and uncertain regions remain skipped. General inpainting is reserved for a separate future experimental mode that would require manual confirmation.
 
+Accepted OCR export sources are anchored in a process-local API registry before translation review. Registration and acceptance are separate requests, records expire after 30 minutes, and a changed source creates a new revision that makes the previous one stale. This prototype registry is neither persistent nor shared between API workers: restart, expiry, or routing an export to another worker removes the proof of application state and safely blocks OCR export. It records explicit application acceptance only; it does not prove OCR correctness or that a human performed the review.
+
+Run the prototype API with exactly one worker/process. After expiry or restart, use the OCR review button to register and accept the source again, then manually review the retained translation again. Re-registration changes the revision and invalidates the old translation approval without discarding the edited translation.
+
 The prototype supports English to Slovenian only. Documents and translations are not sent to an external translation service, and translated segments always require manual review.
 
 ## Local Frontend Setup

@@ -1,9 +1,12 @@
 import shutil
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Iterator
 from urllib.parse import quote
+
+import pymupdf
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
@@ -11,16 +14,65 @@ from pydantic import ValidationError
 
 from app.core.config import settings
 from app.models import OcrResponse, PdfAnalysis, RenderResult
-from app.pdf_export_models import ExportMode, PdfExportJob, PdfExportPlan
+from app.pdf_export_models import (
+    ExportMode, OcrReviewAcceptance, OcrReviewRegistration,
+    OcrReviewRegistrationResult, PdfExportJob, PdfExportPlan,
+)
 from app.services.ocr import run_selective_ocr
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_renderer import render_pdf_pages_as_data_urls
 from app.services.pdf_exporter import PdfExportValidationError, export_translated_pdf, plan_pdf_export
+from app.services.ocr_review_registry import OCR_REVIEW_TTL_SECONDS, document_sha256, ocr_review_registry
 
 router = APIRouter()
 PDF_MAGIC = b"%PDF-"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 MAX_TRANSLATION_JOB_BYTES = 5 * 1024 * 1024
+
+
+@router.post("/ocr-review/register", response_model=OcrReviewRegistrationResult)
+async def register_ocr_review_source(file: UploadFile = File(...), source: str = Form(...)) -> OcrReviewRegistrationResult:
+    try:
+        candidate = OcrReviewRegistration.model_validate_json(source)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="OCR vir ni veljaven.") from exc
+    with _processing_tempdir() as temp_dir:
+        path = await _save_upload(file, Path(temp_dir))
+        try:
+            with pymupdf.open(path) as document:
+                if candidate.page_number > document.page_count:
+                    raise HTTPException(status_code=400, detail="OCR območje kaže na neobstoječo stran.")
+                page = document[candidate.page_number - 1]
+                rect = pymupdf.Rect(candidate.bbox.x0, candidate.bbox.y0, candidate.bbox.x1, candidate.bbox.y1)
+                if rect.is_empty or rect.is_infinite or not page.rect.contains(rect):
+                    raise HTTPException(status_code=400, detail="OCR območje ni znotraj preverjene strani PDF-ja.")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="PDF-ja za OCR revizijo ni bilo mogoče preveriti.") from exc
+        revision = ocr_review_registry.register(
+            document_sha256=document_sha256(path.read_bytes()),
+            review_id=candidate.review_id,
+            page_number=candidate.page_number,
+            bbox=candidate.bbox,
+            text=candidate.text,
+            source=candidate.source,
+            reason=candidate.reason,
+        )
+    return OcrReviewRegistrationResult(
+        revision_id=revision.revision_id, accepted=False, expires_in_seconds=OCR_REVIEW_TTL_SECONDS
+    )
+
+
+@router.post("/ocr-review/accept", response_model=OcrReviewRegistrationResult)
+def accept_ocr_review_source(request: OcrReviewAcceptance) -> OcrReviewRegistrationResult:
+    revision = ocr_review_registry.accept(request.revision_id)
+    if revision is None:
+        raise HTTPException(status_code=409, detail="OCR revizija ne obstaja več ali ni aktualna.")
+    return OcrReviewRegistrationResult(
+        revision_id=revision.revision_id, accepted=True,
+        expires_in_seconds=max(0, int(revision.expires_at - time.monotonic())),
+    )
 
 
 @router.post("/analyze", response_model=PdfAnalysis)

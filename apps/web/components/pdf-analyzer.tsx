@@ -12,7 +12,7 @@ import { useOcrQueue } from "./use-ocr-queue";
 import { OcrReviewList, reasonLabel } from "./ocr-review-list";
 import { TranslationWorkspace } from "./translation-workspace";
 import { recognizeBestVariant, cropImageToCanvas, ensureImageReady } from "../lib/ocr-canvas";
-import { analyzePdf, renderPdf } from "../lib/pdf-client";
+import { analyzePdf, registerAndAcceptOcrSource, renderPdf } from "../lib/pdf-client";
 import type { PdfAnalysis, RenderResult, StructuredBlock } from "../lib/pdf-types";
 import {
   acceptOcrResult,
@@ -177,6 +177,19 @@ export function PdfAnalyzer() {
   }
 
   function cancelOcrReview() { queue.cancel(); }
+
+  async function acceptOcrReview(id: string) {
+    if (!file) return;
+    const item = ocrItems.find((candidate) => candidate.id === id);
+    if (!item) return;
+    setOcrError(null);
+    try {
+      const revisionId = await registerAndAcceptOcrSource(file, item);
+      updateOcrItem(id, (current) => acceptOcrResult(current, revisionId));
+    } catch (caught) {
+      setOcrError(caught instanceof Error ? caught.message : "Sprejem OCR revizije ni uspel.");
+    }
+  }
 
   async function loadOcrPage(pageNumber: number): Promise<HTMLImageElement> {
     if (!file) throw new Error("Izvorni PDF ni več na voljo.");
@@ -373,7 +386,7 @@ export function PdfAnalyzer() {
       {ocrItems.length > 0 && (
         <OcrReviewList
           items={ocrItems}
-          onAccept={(id) => updateOcrItem(id, acceptOcrResult)}
+          onAccept={(id) => void acceptOcrReview(id)}
           onReject={(id) => updateOcrItem(id, rejectOcrResult)}
         />
       )}

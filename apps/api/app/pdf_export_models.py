@@ -17,6 +17,14 @@ SkipReason = Literal[
     "bbox_outside_page",
     "non_digital_source",
     "ocr_only_source",
+    "ocr_not_accepted",
+    "ocr_provenance_mismatch",
+    "ocr_registry_missing",
+    "ocr_registry_unaccepted",
+    "ocr_registry_stale",
+    "ocr_registry_mismatch",
+    "ocr_region_too_small",
+    "ocr_background_unsafe",
     "image_overlap",
     "complex_table",
     "technical_value",
@@ -51,6 +59,34 @@ class PdfDocumentIdentity(BaseModel):
     pages: list[PdfPageIdentity]
 
 
+class AcceptedOcrSource(BaseModel):
+    revision_id: str | None = Field(default=None, min_length=1, max_length=100)
+    review_id: str = Field(min_length=1, max_length=300)
+    accepted_text: str = Field(min_length=1, max_length=200_000)
+    bbox: BBox
+    source: Literal["block", "page", "image", "manual"]
+    reason: str = Field(min_length=1, max_length=100)
+
+
+class OcrReviewRegistration(BaseModel):
+    review_id: str = Field(min_length=1, max_length=300)
+    page_number: int = Field(ge=1, le=100_000)
+    bbox: BBox
+    text: str = Field(min_length=1, max_length=200_000)
+    source: Literal["block", "page", "image", "manual"]
+    reason: str = Field(min_length=1, max_length=100)
+
+
+class OcrReviewRegistrationResult(BaseModel):
+    revision_id: str
+    accepted: bool
+    expires_in_seconds: int
+
+
+class OcrReviewAcceptance(BaseModel):
+    revision_id: str = Field(min_length=1, max_length=100)
+
+
 class PdfExportSegment(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -64,6 +100,7 @@ class PdfExportSegment(BaseModel):
     source_page_type: PdfKind | None = None
     source_rotation: int | None = None
     source_style: SpanStyle | None = None
+    accepted_ocr_source: AcceptedOcrSource | None = None
     edited_translation: str = Field(max_length=200_000)
     status: Literal["pending", "translating", "translated", "reviewed", "failed", "skipped"]
     translation_origin: Literal["glossary", "provider", "manual"] | None = None
@@ -191,6 +228,20 @@ class PdfTableExportSummary(BaseModel):
     partial_tables: int = 0
 
 
+class PdfOcrExportSummary(BaseModel):
+    reviewed_regions: int = 0
+    eligible_regions: int = 0
+    exported_regions: int = 0
+    unsafe_regions: int = 0
+    stale_regions: int = 0
+
+
+class PdfOcrReplacement(PdfReplacement):
+    ocr_review_id: str | None = None
+    ocr_source: Literal["block", "page", "image", "manual"] | None = None
+    ocr_reason: str | None = None
+
+
 class PdfExportSummary(BaseModel):
     total_segments: int
     reviewed: int
@@ -213,3 +264,5 @@ class PdfExportPlan(BaseModel):
     replacements: list[PdfReplacement]
     table_summary: PdfTableExportSummary = Field(default_factory=PdfTableExportSummary)
     tables: list[PdfTableExportPlan] = Field(default_factory=list)
+    ocr_summary: PdfOcrExportSummary = Field(default_factory=PdfOcrExportSummary)
+    ocr_replacements: list[PdfOcrReplacement] = Field(default_factory=list)

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
@@ -11,6 +11,7 @@ import {
   editTranslation,
   exportTranslationJob,
   importTranslationJob,
+  invalidateStaleOcrApprovals,
   resetTranslation,
   retryFailedTranslation,
   reviewTranslation,
@@ -35,6 +36,12 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
   const local = useLocalTranslation(job, setJob);
+
+  useEffect(() => {
+    // OCR acceptance is external review state; synchronize it before any export can reuse an old approval.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setJob((current) => current ? invalidateStaleOcrApprovals(current, ocrItems) : current);
+  }, [ocrItems]);
 
   const visibleSegments = useMemo(
     () => job?.segments.filter((segment) => filter === "all" || segment.status === filter) ?? [],

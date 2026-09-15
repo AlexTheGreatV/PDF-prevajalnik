@@ -68,6 +68,8 @@ export function createTranslationJob(
           region,
           block,
           source_origin: acceptedOcr ? "accepted_ocr" : "native",
+          accepted_ocr_source: acceptedOcr ? acceptedOcrSource(acceptedOcr) : null,
+          source_bbox: acceptedOcr?.pdf_bbox,
           source_language: options.source_language,
           target_language: options.target_language,
           glossary,
@@ -75,6 +77,37 @@ export function createTranslationJob(
         }));
       }
     }
+  }
+
+  for (const item of ocrItems.filter(isAcceptedStandaloneOcr)) {
+    const page = pages.find((candidate) => candidate.page_number === item.page_number);
+    if (!page) continue;
+    const region: StructuredRegion = {
+      kind: "unknown", bbox: { ...item.pdf_bbox }, reading_order: Number.MAX_SAFE_INTEGER, blocks: [],
+    };
+    const block: StructuredBlock = {
+      kind: "paragraph", bbox: { ...item.pdf_bbox }, reading_order: Number.MAX_SAFE_INTEGER,
+      original_text: item.effective_text, normalized_text: item.effective_text, lines: [],
+      line_boundaries: [], confidence: item.confidence ?? 0,
+      style: { font: null, font_size: null, color: null, flags: 0, bold: false, italic: false },
+      warnings: [], needs_ocr_check: false,
+    };
+    segments.push(createSegment(item.effective_text, {
+      segment_id: `ocr-${item.id}`,
+      block_id: `ocr-${item.id}`,
+      block_type: "paragraph",
+      page_number: page.page_number,
+      page_type: page.page_type,
+      page_rotation: page.rotation,
+      region,
+      block,
+      source_origin: "accepted_ocr",
+      accepted_ocr_source: acceptedOcrSource(item),
+      source_language: options.source_language,
+      target_language: options.target_language,
+      glossary,
+      created_at,
+    }));
   }
 
   return {
@@ -100,6 +133,30 @@ export function createTranslationJob(
   };
 }
 
+export function invalidateStaleOcrApprovals(job: TranslationJob, ocrItems: OcrReviewItem[]): TranslationJob {
+  let changed = false;
+  const items = new Map(ocrItems.map((item) => [item.id, item]));
+  const segments = job.segments.map((segment) => {
+    const provenance = segment.accepted_ocr_source;
+    if (segment.source_text_origin !== "accepted_ocr" || !provenance) return segment;
+    const current = items.get(provenance.review_id);
+    const accepted = current?.status === "accepted" && current.selected_text_source === "ocr" && current.effective_text.trim();
+    const next = accepted ? acceptedOcrSource(current) : null;
+    if (next && JSON.stringify(next) === JSON.stringify(provenance)) return segment;
+    changed = true;
+    return {
+      ...segment,
+      source_text: next?.accepted_text ?? segment.source_text,
+      source_bbox: next?.bbox ?? segment.source_bbox,
+      accepted_ocr_source: next,
+      status: segment.edited_translation.trim() ? "translated" as const : "pending" as const,
+      needs_review: true,
+      warnings: [...new Set([...segment.warnings, "ocr_source_changed_after_review"])],
+    };
+  });
+  return changed ? { ...job, segments } : job;
+}
+
 type SegmentInput = {
   segment_id: string;
   block_id: string;
@@ -110,6 +167,8 @@ type SegmentInput = {
   region: StructuredRegion;
   block: StructuredBlock;
   source_origin: TranslationSegment["source_text_origin"];
+  accepted_ocr_source?: TranslationSegment["accepted_ocr_source"];
+  source_bbox?: TranslationSegment["source_bbox"];
   source_language: string;
   target_language: string;
   glossary: GlossaryEntry[];
@@ -128,10 +187,11 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     target_language: input.target_language,
     source_text,
     source_text_origin: input.source_origin,
-    source_bbox: input.block_type === "table_cell" ? null : { ...input.block.bbox },
+    source_bbox: input.block_type === "table_cell" ? null : { ...(input.source_bbox ?? input.block.bbox) },
     source_page_type: input.page_type,
     source_rotation: input.page_rotation,
     source_style: input.block_type === "table_cell" ? null : { ...input.block.style },
+    accepted_ocr_source: input.accepted_ocr_source ?? null,
     translated_text: "",
     edited_translation: "",
     status: skip_reason ? "skipped" : "pending",
@@ -152,6 +212,22 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     created_at: input.created_at,
   };
   return skip_reason ? segment : applyExactSegmentGlossary(segment, input.glossary);
+}
+
+function isAcceptedStandaloneOcr(item: OcrReviewItem): boolean {
+  return item.status === "accepted" && item.selected_text_source === "ocr" && item.effective_text.trim().length > 0 &&
+    item.linked_block_reading_order === undefined && ["manual", "image", "page"].includes(item.source);
+}
+
+function acceptedOcrSource(item: OcrReviewItem): TranslationSegment["accepted_ocr_source"] {
+  return {
+    revision_id: item.server_revision_id ?? "",
+    review_id: item.id,
+    accepted_text: item.effective_text,
+    bbox: { ...item.pdf_bbox },
+    source: item.source,
+    reason: item.reason,
+  };
 }
 
 export function getSkipReason(
@@ -504,7 +580,8 @@ export function validateTranslationJobCompatibility(imported: TranslationJob, ex
       segment.block_id !== source.block_id ||
       segment.block_type !== source.block_type ||
       segment.source_text !== source.source_text ||
-      segment.source_text_origin !== source.source_text_origin) {
+      segment.source_text_origin !== source.source_text_origin ||
+      JSON.stringify(segment.accepted_ocr_source ?? null) !== JSON.stringify(source.accepted_ocr_source ?? null)) {
       throw new Error("Opravilo vsebuje spremenjene ali nezdružljive izvorne segmente.");
     }
   }
@@ -528,6 +605,7 @@ export function bindTranslationJobToAnalysis(imported: TranslationJob, expected:
         source_page_type: source.source_page_type,
         source_rotation: source.source_rotation,
         source_style: source.source_style,
+        accepted_ocr_source: source.accepted_ocr_source ?? null,
       };
     }),
   };
@@ -620,6 +698,7 @@ function validateJobShape(job: Record<string, unknown>): void {
       ![null, "digital", "scanned", "mixed", "empty"].includes(segment.source_page_type as null | string) ||
       !(segment.source_rotation === null || typeof segment.source_rotation === "number") ||
       !(segment.source_style === null || isRecord(segment.source_style)) ||
+      !isAcceptedOcrSource(segment.accepted_ocr_source, segment.source_text_origin, segment.source_text, segment.source_bbox) ||
       typeof segment.translated_text !== "string" ||
       typeof segment.edited_translation !== "string" ||
       !["pending", "translating", "translated", "reviewed", "failed", "skipped"].includes(String(segment.status)) ||
@@ -636,6 +715,17 @@ function validateJobShape(job: Record<string, unknown>): void {
       !Array.isArray(segment.warnings) ||
       !segment.warnings.every((warning) => typeof warning === "string")) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
   }
+}
+
+function isAcceptedOcrSource(value: unknown, origin: unknown, text: unknown, bbox: unknown): boolean {
+  if (origin !== "accepted_ocr") return value === undefined || value === null;
+  if (value === undefined || value === null) return true;
+  if (!isRecord(value) || !(value.revision_id === null || ["string", "undefined"].includes(typeof value.revision_id)) ||
+    typeof value.review_id !== "string" || !value.review_id ||
+    typeof value.accepted_text !== "string" || value.accepted_text !== text ||
+    !isBBox(value.bbox) || JSON.stringify(value.bbox) !== JSON.stringify(bbox) ||
+    !["block", "page", "image", "manual"].includes(String(value.source)) || typeof value.reason !== "string") return false;
+  return true;
 }
 
 function isDocumentIdentity(value: unknown): boolean {

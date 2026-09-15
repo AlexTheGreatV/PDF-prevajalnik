@@ -1,4 +1,5 @@
 import type { OcrResponse, OcrStatus, PdfAnalysis, RenderResult } from "./pdf-types";
+import type { OcrReviewItem } from "./ocr-review";
 
 export const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -36,6 +37,36 @@ export async function ocrPdf(file: File): Promise<OcrResponse> {
   const response = await fetchApi(`${apiBaseUrl}/api/pdf/ocr`, form);
 
   return parseApiResponse<OcrResponse>(response);
+}
+
+export async function registerAndAcceptOcrSource(file: File, item: OcrReviewItem): Promise<string> {
+  if (!item.ocr_text?.trim()) throw new Error("OCR nima besedila za registracijo.");
+  const form = new FormData();
+  form.append("file", file);
+  form.append("source", JSON.stringify({
+    review_id: item.id,
+    page_number: item.page_number,
+    bbox: item.pdf_bbox,
+    text: item.ocr_text,
+    source: item.source,
+    reason: item.reason,
+  }));
+  const registration = await parseApiResponse<{ revision_id: string }>(
+    await fetchApi(`${apiBaseUrl}/api/pdf/ocr-review/register`, form),
+  );
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl}/api/pdf/ocr-review/accept`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision_id: registration.revision_id }),
+    });
+  } catch (error) {
+    throw new Error("Sprejema OCR revizije na strežniku ni bilo mogoče potrditi.", { cause: error });
+  }
+  const accepted = await parseApiResponse<{ revision_id: string; accepted: boolean }>(response);
+  if (!accepted.accepted) throw new Error("Strežnik OCR revizije ni sprejel.");
+  return accepted.revision_id;
 }
 
 async function fetchApi(url: string, body: FormData): Promise<Response> {

@@ -6,7 +6,7 @@ Build an internal document translation application for JUB/KOOP, starting with a
 
 ## Current Milestone
 
-Allow reviewed native text in reliably detected structured PDF table cells to be exported without changing table geometry, borders, fills, images, or standalone technical values.
+Allow reviewed native text and explicitly accepted, tightly bounded OCR text on demonstrably uniform backgrounds to be exported without changing source images, table geometry, borders, fills, or standalone technical values.
 
 Allowed:
 
@@ -18,6 +18,8 @@ Allowed:
 - Local FiraGO typography resolution with regular, bold, italic, and bold-italic faces
 - Local background patching over demonstrably uniform image regions without modifying image XObjects
 - Cell-level export for reliable digital tables with source matching, fit preflight, and partial-export diagnostics
+- Selective export of explicitly accepted OCR regions after separate translation review, immutable PDF identity checks, and uniform-background preflight
+- OCR review revisions are held for 30 minutes in one API process. They are intentionally lost on restart, are not shared between workers, and a missing record must block export rather than trust client data.
 
 Guardrails:
 
@@ -29,7 +31,8 @@ Guardrails:
 - Do not hardcode translations or silently repair damaged placeholders.
 - Never auto-review glossary or model translations; a successful placeholder retry must require manual review.
 - Never overwrite a source PDF. Export only reviewed, identity-matched, geometry-checked digital text blocks after fit preflight.
-- Preserve images and vector graphics, and skip ambiguous, overlapping, OCR-only, rotated, unsupported-table, or overflowing regions with a structured reason.
+- Preserve images and vector graphics, and skip ambiguous, overlapping, unaccepted or stale OCR, rotated, unsupported-table, or overflowing regions with a structured reason.
+- OCR export must remain inside the accepted bbox, must not cover icons, lines, neighboring text, cells, photographs, gradients, or textures, and must never reconstruct an image or rasterize a page.
 - Never resize table rows or columns, reconstruct ambiguous merged cells, alter borders/fills, or translate standalone technical values automatically.
 - Keep Droid Sans Fallback as a final glyph fallback, never download fonts at runtime, and never reuse an embedded source font without clear embedding rights and complete glyph coverage.
 - Never patch photographs, gradients, textures, icons, lines, image-only OCR text, or uncertain regions. Do not add inpainting or full-page rasterization.

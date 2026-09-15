@@ -17,6 +17,8 @@ from app.pdf_export_models import (
     PdfExportPlan,
     PdfExportSegment,
     PdfExportSummary,
+    PdfOcrExportSummary,
+    PdfOcrReplacement,
     PdfReplacement,
     PdfTableCellReplacement,
     PdfTableExportPlan,
@@ -26,6 +28,7 @@ from app.pdf_export_models import (
 from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer
 from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canonical_text, is_technical_value, parse_cell_position
 from app.services.pdf_typography import FontAsset, PdfTypographyResolver
+from app.services.ocr_review_registry import ocr_review_registry
 
 DOCUMENT_MODEL_VERSION = 1
 MIN_FONT_SIZE = 6.0
@@ -55,11 +58,19 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
     overlap_analyzer = PdfImageOverlapAnalyzer()
     with pymupdf.open(path) as document:
         _validate_document_identity(path, document, job)
-        regular_segments = [segment for segment in job.segments if segment.block_type not in {"table", "table_cell"}]
+        regular_segments = [
+            segment for segment in job.segments
+            if segment.block_type not in {"table", "table_cell"} and segment.source_text_origin == "native"
+        ]
+        ocr_segments = [
+            segment for segment in job.segments
+            if segment.block_type not in {"table", "table_cell"} and segment.source_text_origin == "accepted_ocr"
+        ]
         replacements = [_plan_segment(document, segment, typography, overlap_analyzer) for segment in regular_segments]
+        ocr_replacements = [_plan_ocr_segment(document, segment, typography, overlap_analyzer) for segment in ocr_segments]
         tables, table_replacements = _plan_tables(document, job, typography, overlap_analyzer)
         replacements.extend(table_replacements)
-        _mark_overlap_conflicts(replacements)
+        _mark_overlap_conflicts([*replacements, *ocr_replacements])
         for replacement in replacements:
             if replacement.skip_reason is not None:
                 continue
@@ -70,6 +81,9 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
             _fit_replacement(page, replacement, replacements, typography)
             if replacement.eligible and replacement.background_patch_used:
                 _validate_expanded_patch_area(page, replacement, overlap_analyzer)
+        for replacement in ocr_replacements:
+            if replacement.skip_reason is None:
+                _fit_ocr_replacement(document[replacement.page_number - 1], replacement, typography)
         _refresh_table_status(tables)
 
     return PdfExportPlan(
@@ -80,6 +94,8 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
         replacements=replacements,
         table_summary=_summarize_tables(tables),
         tables=tables,
+        ocr_summary=_summarize_ocr(ocr_replacements),
+        ocr_replacements=ocr_replacements,
     )
 
 
@@ -149,6 +165,80 @@ def _plan_segment(
     _apply_overlap_assessment(replacement, assessment)
     if assessment.kind != "none" and not assessment.safe_for_background_patch:
         return _skip(replacement, "image_overlap", _overlap_skip_message(assessment))
+    style, asset, warnings, line_count = typography.resolve(page, rect, segment)
+    replacement.typography = style
+    replacement.typography_warnings.extend(warnings)
+    replacement.requested_font_size = style.font_size
+    replacement.proposed_font_size = style.font_size
+    replacement.text_color = _style_color(style.color)
+    replacement.color = style.color
+    replacement.alignment = style.alignment
+    replacement.line_height = style.line_height
+    replacement.original_line_count = line_count
+    replacement.font_weight = "bold" if style.bold else "regular"
+    replacement.font_style = "italic" if style.italic else "normal"
+    if asset is None:
+        replacement.fit_strategy = "missing_glyph"
+        return _skip(replacement, "missing_glyph", "Lokalni pisavi nimata vseh znakov prevoda.")
+    replacement.font_family = asset.family
+    replacement.proposed_font = asset.family
+    return replacement
+
+
+def _plan_ocr_segment(
+    document: pymupdf.Document,
+    segment: PdfExportSegment,
+    typography: PdfTypographyResolver,
+    overlap_analyzer: PdfImageOverlapAnalyzer,
+) -> PdfOcrReplacement:
+    replacement = PdfOcrReplacement(**_new_replacement(segment).model_dump())
+    provenance = segment.accepted_ocr_source
+    if segment.status != "reviewed":
+        return _skip(replacement, "ocr_not_accepted", "OCR je sprejet, vendar prevod še ni ročno potrjen.")
+    if not segment.edited_translation.strip():
+        return _skip(replacement, "empty_translation", "Potrjeni OCR segment nima prevoda.")
+    if provenance is None or segment.source_bbox is None:
+        return _skip(replacement, "ocr_provenance_mismatch", "OCR segment nima preverljivega sprejetega vira in območja.")
+    replacement.ocr_review_id = provenance.review_id
+    replacement.ocr_source = provenance.source
+    replacement.ocr_reason = provenance.reason
+    registry_error = "unknown" if not provenance.revision_id else ocr_review_registry.validate(
+        revision_id=provenance.revision_id,
+        document_sha256=_sha256(Path(document.name)),
+        review_id=provenance.review_id,
+        page_number=segment.page_number,
+        bbox=segment.source_bbox,
+        text=segment.source_text,
+    )
+    if registry_error is not None:
+        reason = {
+            "unknown": "ocr_registry_missing",
+            "unaccepted": "ocr_registry_unaccepted",
+            "stale": "ocr_registry_stale",
+        }.get(registry_error, "ocr_registry_mismatch")
+        message = (
+            "Strežniška OCR potrditev ni več veljavna: revizija je potekla ali je bil API ponovno zagnan. "
+            "Ponovno registrirajte in sprejmite OCR, nato ponovno potrdite ohranjeni prevod."
+            if registry_error == "unknown" else
+            "Strežniška OCR revizija ni sprejeta, je zastarela ali se ne ujema. Ponovno registrirajte in sprejmite aktualni vir ter potrdite prevod."
+        )
+        return _skip(replacement, reason, message)
+    if segment.source_text != provenance.accepted_text or not _same_bbox(segment.source_bbox, provenance.bbox):
+        return _skip(replacement, "ocr_provenance_mismatch", "Sprejeto OCR besedilo ali območje se je po potrditvi spremenilo.")
+    if not 1 <= segment.page_number <= document.page_count:
+        return _skip(replacement, "invalid_page", "OCR segment kaže na neobstoječo stran.")
+    page = document[segment.page_number - 1]
+    if page.rotation != 0 or segment.source_rotation not in {0, None}:
+        return _skip(replacement, "rotated_page", "Rotirana stran je varno preskočena.")
+    rect = _rect(segment.source_bbox)
+    if rect.is_empty or rect.is_infinite or not _inside(rect, page.rect):
+        return _skip(replacement, "bbox_outside_page", "OCR območje ni v celoti znotraj strani.")
+    if rect.width < 6 or rect.height < 4 or rect.get_area() < 40:
+        return _skip(replacement, "ocr_region_too_small", "OCR območje je premajhno za varen izvoz.")
+    assessment = overlap_analyzer.analyze_ocr_region(page, rect)
+    _apply_overlap_assessment(replacement, assessment)
+    if not assessment.safe_for_background_patch:
+        return _skip(replacement, "ocr_background_unsafe", _overlap_skip_message(assessment))
     style, asset, warnings, line_count = typography.resolve(page, rect, segment)
     replacement.typography = style
     replacement.typography_warnings.extend(warnings)
@@ -487,13 +577,37 @@ def _fit_replacement(
             return _accept_fit(replacement, expanded, expanded_fit, "expanded_bbox")
 
     fit_rect = expanded if expanded != original else original
-    minimum_scale = max(MIN_FONT_SIZE / replacement.requested_font_size, HEADING_MIN_SCALE if replacement.block_type == "heading" else BODY_MIN_SCALE)
+    minimum_scale = _minimum_text_scale(replacement)
     scaled = _htmlbox_preflight(page.rect, fit_rect, replacement, typography, asset, minimum_scale)
     if scaled[0] >= 0 and scaled[1] + 0.0001 >= minimum_scale:
         return _accept_fit(replacement, fit_rect, scaled, "scaled")
 
     replacement.fit_strategy = "overflow"
     _skip(replacement, "overflow", "Prevod se ne prilega znotraj dovoljene tipografske meje.", "overflow")
+
+
+def _fit_ocr_replacement(
+    page: pymupdf.Page,
+    replacement: PdfOcrReplacement,
+    typography: PdfTypographyResolver,
+) -> None:
+    """Fit OCR translation only inside its accepted bbox; expansion is intentionally forbidden."""
+    rect = _rect(replacement.original_bbox)
+    asset = _asset_for(replacement, typography)
+    exact = _htmlbox_preflight(page.rect, rect, replacement, typography, asset, 1.0)
+    if exact[0] >= 0:
+        return _accept_fit(replacement, rect, exact, "exact")
+    minimum_scale = _minimum_text_scale(replacement)
+    scaled = _htmlbox_preflight(page.rect, rect, replacement, typography, asset, minimum_scale)
+    if scaled[0] >= 0 and scaled[1] + 0.0001 >= minimum_scale:
+        return _accept_fit(replacement, rect, scaled, "scaled")
+    replacement.fit_strategy = "overflow"
+    _skip(replacement, "overflow", "OCR prevod se ne prilega sprejetemu območju; območje se ne razširi.", "overflow")
+
+
+def _minimum_text_scale(replacement: PdfReplacement) -> float:
+    relative_minimum = HEADING_MIN_SCALE if replacement.block_type == "heading" else BODY_MIN_SCALE
+    return max(MIN_FONT_SIZE / replacement.requested_font_size, relative_minimum)
 
 
 def _fit_table_cell(
@@ -609,7 +723,7 @@ def _safe_expansion(
 
 
 def _write_diagnostics(document: pymupdf.Document, plan: PdfExportPlan) -> None:
-    for replacement in plan.replacements:
+    for replacement in [*plan.replacements, *plan.ocr_replacements]:
         diagnostic_bbox = replacement.cell_bbox if isinstance(replacement, PdfTableCellReplacement) else replacement.fitted_bbox or replacement.source_bbox
         if diagnostic_bbox is None:
             continue
@@ -678,7 +792,7 @@ def _table_diagnostic_code(cell: PdfTableCellReplacement) -> str:
 
 
 def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typography: PdfTypographyResolver) -> None:
-    eligible = [item for item in plan.replacements if item.eligible and item.source_bbox is not None]
+    eligible = [item for item in [*plan.replacements, *plan.ocr_replacements] if item.eligible and item.source_bbox is not None]
     pages = sorted({item.page_number for item in eligible})
     for page_number in pages:
         page = document[page_number - 1]
@@ -704,7 +818,7 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
 
 def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
     with pymupdf.open(path) as document:
-        for item in plan.replacements:
+        for item in [*plan.replacements, *plan.ocr_replacements]:
             if not item.eligible or item.source_bbox is None:
                 continue
             extracted = document[item.page_number - 1].get_text("text", clip=_rect(item.fitted_bbox or item.source_bbox), sort=True)
@@ -718,6 +832,10 @@ def _rect(bbox) -> pymupdf.Rect:
 
 def _bbox(rect: pymupdf.Rect) -> BBox:
     return BBox(x0=rect.x0, y0=rect.y0, x1=rect.x1, y1=rect.y1)
+
+
+def _same_bbox(left: BBox, right: BBox) -> bool:
+    return all(_close(getattr(left, key), getattr(right, key)) for key in ("x0", "y0", "x1", "y1"))
 
 
 def _asset_for(replacement: PdfReplacement, typography: PdfTypographyResolver) -> FontAsset:
@@ -824,6 +942,19 @@ def _summarize(replacements: list[PdfReplacement]) -> PdfExportSummary:
         scaled=sum(item.fit_strategy == "scaled" for item in replacements),
         background_patches=sum(item.background_patch_used for item in replacements),
         image_overlap_skipped=sum(item.skip_reason == "image_overlap" for item in replacements),
+    )
+
+
+def _summarize_ocr(replacements: list[PdfOcrReplacement]) -> PdfOcrExportSummary:
+    return PdfOcrExportSummary(
+        reviewed_regions=sum(item.reviewed for item in replacements),
+        eligible_regions=sum(item.eligible for item in replacements),
+        exported_regions=sum(item.eligible for item in replacements),
+        unsafe_regions=sum(item.skip_reason in {"ocr_background_unsafe", "ocr_region_too_small", "overflow", "overlap_conflict"} for item in replacements),
+        stale_regions=sum(item.skip_reason in {
+            "ocr_provenance_mismatch", "ocr_registry_missing", "ocr_registry_unaccepted",
+            "ocr_registry_stale", "ocr_registry_mismatch",
+        } for item in replacements),
     )
 
 

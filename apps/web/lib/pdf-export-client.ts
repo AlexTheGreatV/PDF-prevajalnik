@@ -73,6 +73,12 @@ export type PdfTableExportPlan = {
   cells: PdfTableCellReplacement[];
 };
 
+export type PdfOcrReplacement = PdfExportReplacement & {
+  ocr_review_id: string | null;
+  ocr_source: "block" | "page" | "image" | "manual" | null;
+  ocr_reason: string | null;
+};
+
 export type PdfExportPlan = {
   filename: string;
   mode: PdfExportMode;
@@ -104,6 +110,14 @@ export type PdfExportPlan = {
     partial_tables: number;
   };
   tables: PdfTableExportPlan[];
+  ocr_summary: {
+    reviewed_regions: number;
+    eligible_regions: number;
+    exported_regions: number;
+    unsafe_regions: number;
+    stale_regions: number;
+  };
+  ocr_replacements: PdfOcrReplacement[];
 };
 
 export async function preparePdfExport(file: File, job: TranslationJob, mode: PdfExportMode): Promise<PdfExportPlan> {

@@ -66,6 +66,7 @@ export type OcrReviewItem = {
   attempts: OcrAttempt[];
   crop_image_url: string | null;
   crop_debug: OcrCropDebug | null;
+  server_revision_id: string | null;
 };
 
 export type DisplaySelection = {
@@ -250,18 +251,20 @@ export function applyOcrSuggestion(
     attempts,
     crop_image_url,
     crop_debug,
+    server_revision_id: null,
     selected_text_source: "native",
     effective_text: item.native_text,
   };
 }
 
-export function acceptOcrResult(item: OcrReviewItem): OcrReviewItem {
-  if (!item.ocr_text?.trim() || !["suggested", "rejected"].includes(item.status)) return item;
+export function acceptOcrResult(item: OcrReviewItem, serverRevisionId?: string): OcrReviewItem {
+  if (!item.ocr_text?.trim() || !["suggested", "rejected", "accepted"].includes(item.status)) return item;
   return {
     ...item,
     status: "accepted",
     selected_text_source: "ocr",
     effective_text: item.ocr_text ?? "",
+    server_revision_id: serverRevisionId ?? null,
   };
 }
 
@@ -271,6 +274,7 @@ export function rejectOcrResult(item: OcrReviewItem): OcrReviewItem {
     status: "rejected",
     selected_text_source: "native",
     effective_text: item.native_text,
+    server_revision_id: null,
   };
 }
 
@@ -431,6 +435,7 @@ function createBaseItem(
     | "attempts"
     | "crop_image_url"
     | "crop_debug"
+    | "server_revision_id"
   >,
 ): OcrReviewItem {
   return {
@@ -445,6 +450,7 @@ function createBaseItem(
     attempts: [],
     crop_image_url: null,
     crop_debug: null,
+    server_revision_id: null,
   };
 }
 
