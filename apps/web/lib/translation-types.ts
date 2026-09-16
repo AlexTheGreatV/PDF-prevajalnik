@@ -1,4 +1,5 @@
 import type { BBox, PdfKind, StructuredBlockKind, StructuredStyle } from "./pdf-types";
+import type { TechnicalRange, TechnicalRangeKind } from "./technical-ranges";
 
 export type TranslationStatus = "pending" | "translating" | "translated" | "reviewed" | "failed" | "skipped";
 export type TranslationSourceOrigin = "native" | "accepted_ocr";
@@ -19,7 +20,20 @@ export type ProtectedToken = {
   placeholder: string;
   value: string;
   replacement_value?: string;
-  kind: "url" | "email" | "measurement" | "number" | "product_code" | "technical_term" | "glossary";
+  kind: "url" | "email" | "measurement" | "number" | "product_code" | "technical_term" | "technical_range" | "technical_unit_boundary" | "glossary";
+  technical_range?: TechnicalRange;
+  unit_start_placeholder?: string;
+  unit_end_placeholder?: string;
+  rule_id?: "technical_range" | "technical_unit_spacing";
+  rule_version?: string;
+};
+
+export type TranslationRuleAdjustment = {
+  rule_id: "technical_range" | "technical_unit_spacing";
+  rule_version: string;
+  kind: TechnicalRangeKind | "unit_spacing";
+  source_text: string;
+  replacement_text: string;
 };
 
 export type GlossaryEntry = {
@@ -101,6 +115,8 @@ export type TranslationSegment = {
   warnings: string[];
   chunks: TranslationChunk[];
   forced_chunking: boolean;
+  translation_rules_version?: string | null;
+  translation_rule_adjustments?: TranslationRuleAdjustment[];
   created_at: string;
 };
 

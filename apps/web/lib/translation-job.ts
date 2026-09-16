@@ -2,6 +2,7 @@ import { findExactSegmentGlossaryMatch, findGlossaryMatches, orderedGlossary } f
 import type { OcrReviewItem } from "./ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "./pdf-types";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
+import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
 import type {
   GlossaryEntry,
   PlaceholderAttempt,
@@ -209,6 +210,8 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     warnings: [],
     chunks: [],
     forced_chunking: false,
+    translation_rules_version: null,
+    translation_rule_adjustments: [],
     created_at: input.created_at,
   };
   return skip_reason ? segment : applyExactSegmentGlossary(segment, input.glossary);
@@ -298,6 +301,8 @@ export function editTranslation(segment: TranslationSegment, text: string): Tran
     translation_origin: text.trim() ? "manual" : null,
     glossary_entry_id: null,
     needs_review: false,
+    translation_rules_version: null,
+    translation_rule_adjustments: [],
   };
 }
 
@@ -323,6 +328,8 @@ export function resetTranslation(segment: TranslationSegment): TranslationSegmen
     warnings: [],
     chunks: [],
     forced_chunking: false,
+    translation_rules_version: null,
+    translation_rule_adjustments: [],
   };
 }
 
@@ -468,11 +475,37 @@ function applyChunkResult(prepared: PreparedChunk, result: TranslationProviderRe
 
 function assembleSegment(segment: TranslationSegment, chunks: TranslationChunk[], placeholderRetry = false): TranslationSegment {
   const complete = chunks.length > 0 && chunks.every((chunk) => chunk.status === "translated" && chunk.translated_text.trim());
-  const warnings = [...new Set([...segment.warnings, ...chunks.flatMap((chunk) => chunk.warnings)])];
+  const technical = protectTechnicalTokens(segment.source_text);
+  const adjustments = technical.tokens
+    .filter((token) => token.rule_id && token.rule_version && token.replacement_value !== undefined)
+    .map((token) => ({
+      rule_id: token.rule_id!,
+      rule_version: token.rule_version ?? TECHNICAL_RANGE_RULES_VERSION,
+      kind: token.technical_range?.kind ?? "unit_spacing" as const,
+      source_text: token.value,
+      replacement_text: token.replacement_value ?? token.value,
+    }));
+  const ruleWarnings = complete && adjustments.length > 0 ? ["technical_translation_rule_applied"] : [];
+  const warnings = [...new Set([...segment.warnings, ...technical.warnings, ...ruleWarnings, ...chunks.flatMap((chunk) => chunk.warnings)])];
   if (placeholderRetry && complete) warnings.push("placeholder_retry_succeeded");
   if (placeholderRetry && !complete) warnings.push("placeholder_retry_failed");
   const translated = complete ? chunks.map((chunk) => chunk.translated_text + chunk.separator_after).join("").trimEnd() : "";
-  return { ...segment, chunks, translated_text: translated, edited_translation: translated, status: complete ? "translated" : "failed", error: complete ? null : "Vsaj en modelni del segmenta ni bil uspešno preveden.", translation_origin: complete ? "provider" : segment.translation_origin, placeholder_attempts: chunks.flatMap((chunk) => chunk.placeholder_attempts), needs_review: segment.needs_review || placeholderRetry || segment.forced_chunking, warnings, model_id: segment.model_id, provider_id: segment.provider_id };
+  return {
+    ...segment,
+    chunks,
+    translated_text: translated,
+    edited_translation: translated,
+    status: complete ? "translated" : "failed",
+    error: complete ? null : "Vsaj en modelni del segmenta ni bil uspešno preveden.",
+    translation_origin: complete ? "provider" : segment.translation_origin,
+    placeholder_attempts: chunks.flatMap((chunk) => chunk.placeholder_attempts),
+    needs_review: segment.needs_review || placeholderRetry || segment.forced_chunking || adjustments.length > 0 || technical.warnings.length > 0,
+    warnings,
+    model_id: segment.model_id,
+    provider_id: segment.provider_id,
+    translation_rules_version: complete && adjustments.length > 0 ? TECHNICAL_RANGE_RULES_VERSION : null,
+    translation_rule_adjustments: complete ? adjustments : [],
+  };
 }
 
 function placeholderAttempt(strategy: PlaceholderStrategy, provider_text: string | null, valid: boolean, error: string | null): PlaceholderAttempt {
@@ -712,9 +745,23 @@ function validateJobShape(job: Record<string, unknown>): void {
       !Array.isArray(segment.chunks) ||
       !segment.chunks.every(isTranslationChunk) ||
       typeof segment.forced_chunking !== "boolean" ||
+      !isTranslationRuleMetadata(segment.translation_rules_version, segment.translation_rule_adjustments) ||
       !Array.isArray(segment.warnings) ||
       !segment.warnings.every((warning) => typeof warning === "string")) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
   }
+}
+
+function isTranslationRuleMetadata(version: unknown, adjustments: unknown): boolean {
+  if (version === undefined && adjustments === undefined) return true;
+  if (!(version === null || typeof version === "string") || !Array.isArray(adjustments)) return false;
+  return adjustments.every((item) =>
+    isRecord(item) &&
+    ["technical_range", "technical_unit_spacing"].includes(String(item.rule_id)) &&
+    typeof item.rule_version === "string" &&
+    ["temperature", "measurement", "percentage", "time", "unit_spacing"].includes(String(item.kind)) &&
+    typeof item.source_text === "string" &&
+    typeof item.replacement_text === "string",
+  );
 }
 
 function isAcceptedOcrSource(value: unknown, origin: unknown, text: unknown, bbox: unknown): boolean {

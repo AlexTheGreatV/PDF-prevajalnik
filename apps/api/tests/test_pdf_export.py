@@ -11,9 +11,10 @@ from PIL import Image
 
 from app.core.config import settings
 from app.main import app
-from app.pdf_export_models import PdfExportJob
+from app.pdf_export_models import PdfExportJob, PdfTextStyle
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_exporter import PdfExportValidationError, export_translated_pdf, plan_pdf_export
+from app.services.pdf_typography import PdfTypographyResolver
 
 SOURCE_TEXT = "Digital source text for a safe translated PDF preview."
 TRANSLATED_TEXT = "Varen prevod čšžČŠŽ, CO₂ in +5 °C."
@@ -204,6 +205,36 @@ def test_typography_preserves_color_and_extractable_unicode(tmp_path: Path) -> N
         span = document[0].get_text("dict", clip=pymupdf.Rect(*replacement.fitted_bbox.model_dump().values()))["blocks"][0]["lines"][0]["spans"][0]
         assert span["color"] == 0x124A7A
         assert TRANSLATED_TEXT in document[0].get_text()
+
+
+def test_firago_keeps_numbers_and_units_together_with_nonbreaking_spaces(tmp_path: Path) -> None:
+    typography = PdfTypographyResolver(tmp_path)
+    asset = typography.assets[(False, False)]
+    text = "Temperaturna odpornost −40\u00a0°C do +90\u00a0°C, sušenje 10 do 20\u00a0minut pri 5\u00a0MPa in 290\u00a0ml."
+    style = PdfTextStyle(font_size=10, line_height=1.2)
+    html_text, css = typography.html_and_css(text, style, asset)
+
+    assert "−40\u00a0°C" in html_text
+    assert "+90\u00a0°C" in html_text
+    assert typography.supports(asset, text)
+    with pymupdf.open() as document:
+        page = document.new_page(width=160, height=160)
+        spare, _ = page.insert_htmlbox(
+            pymupdf.Rect(20, 20, 140, 140), html_text, css=css, archive=typography.archive,
+        )
+        assert spare >= 0
+        lines = [
+            "".join(span["text"] for span in line["spans"])
+            for block in page.get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+        ]
+        normalized = [line.replace("\u00a0", " ") for line in lines]
+        assert any("−40 °C" in line for line in normalized)
+        assert any("+90 °C" in line for line in normalized)
+        assert any("5 MPa" in line for line in normalized)
+        assert any("290 ml" in line for line in normalized)
+        assert any("20 minut" in line for line in normalized)
+        assert not any(line.rstrip().endswith(("−40", "+90", "20", "5", "290")) for line in normalized)
 
 
 @pytest.mark.parametrize(("align", "expected"), [(0, "left"), (1, "center"), (2, "right")])

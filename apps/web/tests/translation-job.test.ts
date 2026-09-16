@@ -4,6 +4,7 @@ import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "../lib/pdf-
 import { createDefaultGlossary } from "../lib/default-glossary";
 import { findGlossaryMatches } from "../lib/glossary";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "../lib/technical-tokens";
+import { TECHNICAL_RANGE_RULES_VERSION } from "../lib/technical-ranges";
 import {
   bindTranslationJobToAnalysis,
   createTranslationJob,
@@ -141,12 +142,128 @@ test("skips non-translatable content with reasons", () => {
 test("protects and restores technical values exactly", () => {
   const source = "CO₂, +5 °C to +25 °C, 2.5 MPa, 50 %, RAL 9001, 290 ml, 600 ml, 20 L and 200 L.";
   const protectedValue = protectTechnicalTokens(source);
-  for (const value of ["CO₂", "+5 °C", "+25 °C", "2.5 MPa", "50 %", "RAL 9001", "290 ml", "600 ml", "20 L", "200 L"]) {
+  for (const value of ["CO₂", "+5 °C to +25 °C", "2.5 MPa", "50 %", "RAL 9001", "290 ml", "600 ml", "20 L", "200 L"]) {
     assert.ok(protectedValue.tokens.some((token) => token.value === value), `Missing protected token: ${value}`);
   }
-  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), source);
+  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), "CO₂, +5\u00a0°C do +25\u00a0°C, 2.5\u00a0MPa, 50\u00a0%, RAL 9001, 290\u00a0ml, 600\u00a0ml, 20\u00a0L and 200\u00a0L.");
   assert.throws(() => restoreTechnicalTokens(protectedValue.protected_text.replace("TK000TK", "broken"), protectedValue.tokens), /placeholder/);
   assert.throws(() => restoreTechnicalTokens(`${protectedValue.protected_text} TK000TK`, protectedValue.tokens), /placeholder/);
+});
+
+test("preserves technical symbols and applies nonbreaking unit spacing", () => {
+  const source = "Strength 4 MPa, packs 290 ml and 20 L, CO₂, RAL 9001.";
+  const result = protectTechnicalTokens(source);
+  assert.equal(restoreTechnicalTokens(result.protected_text, result.tokens), "Strength 4\u00a0MPa, packs 290\u00a0ml and 20\u00a0L, CO₂, RAL 9001.");
+  assert.equal(result.tokens.find((token) => token.value === "CO₂")?.replacement_value, "CO₂");
+  assert.equal(result.tokens.find((token) => token.value === "RAL 9001")?.replacement_value, "RAL 9001");
+});
+
+test("parses and localizes only structured technical ranges", () => {
+  const cases = [
+    ["-40 °C to +90 °C", "−40\u00a0°C do +90\u00a0°C", "temperature"],
+    ["from -40 °C to +90 °C", "od −40\u00a0°C do +90\u00a0°C", "temperature"],
+    ["5 mm to 10 mm", "5\u00a0mm do 10\u00a0mm", "measurement"],
+    ["10 % to 20 %", "10\u00a0% do 20\u00a0%", "percentage"],
+    ["between 5 MPa and 10 MPa", "med 5\u00a0MPa in 10\u00a0MPa", "measurement"],
+    ["5.5-10.25 cm", "5.5 do 10.25\u00a0cm", "measurement"],
+  ] as const;
+  for (const [source, expected, kind] of cases) {
+    const result = protectTechnicalTokens(source);
+    const range = result.tokens.find((token) => token.kind === "technical_range");
+    assert.equal(range?.technical_range?.kind, kind);
+    assert.equal(range?.rule_version, TECHNICAL_RANGE_RULES_VERSION);
+    assert.equal(restoreTechnicalTokens(result.protected_text, result.tokens), expected);
+  }
+});
+
+test("leaves word units to the model while protecting range semantics", () => {
+  const cases = [
+    ["10 to 20 minutes", "TK000TK TK001TK minutes TK002TK", "TK000TK TK001TK minut TK002TK", "10 do 20\u00a0minut", "end_only"],
+    ["from 1 to 2 hours", "TK000TK TK001TK hours TK002TK", "TK000TK TK001TK ur TK002TK", "od 1 do 2\u00a0ur", "end_only"],
+    ["between 5 and 10 days", "TK000TK TK001TK days TK002TK", "TK000TK TK001TK dnevi TK002TK", "med 5 in 10\u00a0dnevi", "end_only"],
+    ["1 hour to 2 hours", "TK000TK TK001TK hours TK002TK", "TK000TK TK001TK uri TK002TK", "1 do 2\u00a0uri", "both"],
+    ["1 to 1 day", "TK000TK TK001TK day TK002TK", "TK000TK TK001TK dan TK002TK", "1 do 1\u00a0dan", "end_only"],
+    ["1-2 months", "TK000TK TK001TK months TK002TK", "TK000TK TK001TK meseca TK002TK", "1 do 2\u00a0meseca", "end_only"],
+  ] as const;
+  for (const [source, protectedText, providerText, expected, placement] of cases) {
+    const result = protectTechnicalTokens(source);
+    assert.equal(result.protected_text, protectedText);
+    assert.equal(result.tokens[0].technical_range?.unit_kind, "translatable_word");
+    assert.equal(result.tokens[0].technical_range?.unit_placement, placement);
+    assert.equal(restoreTechnicalTokens(providerText, result.tokens), expected);
+  }
+
+  const sentence = protectTechnicalTokens("Curing takes 1 to 2 months in normal conditions.");
+  assert.equal(sentence.protected_text, "Curing takes TK000TK TK001TK months TK002TK in normal conditions.");
+  assert.equal(
+    restoreTechnicalTokens("Strjevanje v običajnih pogojih traja TK000TK TK001TK meseca TK002TK.", sentence.tokens),
+    "Strjevanje v običajnih pogojih traja 1 do 2\u00a0meseca.",
+  );
+
+  assert.equal(
+    restoreTechnicalTokens("Meseca TK001TK mesecih TK002TK sta pred TK000TK.", sentence.tokens),
+    "Meseca sta pred 1 do 2\u00a0mesecih.",
+  );
+});
+
+test("rejects missing or untranslated word units instead of guessing", () => {
+  const result = protectTechnicalTokens("10 to 20 minutes");
+  assert.throws(() => restoreTechnicalTokens("TK000TK TK001TK TK002TK", result.tokens), /enota/);
+  assert.throws(() => restoreTechnicalTokens("TK000TK TK001TK minutes TK002TK", result.tokens), /izvornem jeziku/);
+  assert.throws(() => restoreTechnicalTokens("TK000TK TK001TK minute TK002TK", result.tokens), /izvornem jeziku/);
+
+  const unknown = protectTechnicalTokens("10 to 20 fortnights");
+  assert.equal(unknown.tokens.some((token) => token.kind === "technical_range"), false);
+  assert.ok(unknown.warnings.includes("technical_range_ambiguous"));
+});
+
+test("does not rewrite ordinary to and flags ambiguous ranges for review", () => {
+  const ordinary = protectTechnicalTokens("Apply the product to the clean surface.");
+  assert.equal(ordinary.tokens.some((token) => token.kind === "technical_range"), false);
+  assert.equal(restoreTechnicalTokens(ordinary.protected_text, ordinary.tokens), "Apply the product to the clean surface.");
+
+  const ambiguous = protectTechnicalTokens("Pressure from 5 MPa to 10 kPa.");
+  assert.equal(ambiguous.tokens.some((token) => token.kind === "technical_range"), false);
+  assert.ok(ambiguous.warnings.includes("technical_range_ambiguous"));
+
+  const unrelatedNumbers = protectTechnicalTokens("Move item 10 to shelf 20.");
+  assert.equal(unrelatedNumbers.tokens.some((token) => token.kind === "technical_range"), false);
+  assert.ok(unrelatedNumbers.warnings.includes("technical_range_ambiguous"));
+});
+
+test("fails a translated segment when a word unit is lost or left in English", async () => {
+  const source = "Drying takes 10 to 20 minutes.";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{ kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1, blocks: [block(1, "paragraph", source)] }];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  const provider = new DeterministicProvider(() => "Sušenje traja TK000TK minutes.");
+  const translated = await translateJobBatch(job, provider);
+  assert.equal(translated.segments[0].status, "failed");
+  assert.equal(translated.segments[0].source_text, source);
+  assert.ok(translated.segments[0].warnings.includes("placeholder_integrity"));
+});
+
+test("records versioned technical range adjustments without automatic review", async () => {
+  const source = "Temperature resistance -40 °C to +90 °C";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{ kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1, blocks: [block(1, "paragraph", source)] }];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  const provider = new DeterministicProvider(() => "Temperaturna odpornost TK000TK");
+  const translated = await translateJobBatch(job, provider);
+  const segment = translated.segments[0];
+  assert.equal(segment.source_text, source);
+  assert.equal(segment.translated_text, "Temperaturna odpornost −40\u00a0°C do +90\u00a0°C");
+  assert.equal(segment.status, "translated");
+  assert.equal(segment.needs_review, true);
+  assert.equal(segment.translation_rules_version, TECHNICAL_RANGE_RULES_VERSION);
+  assert.deepEqual(segment.translation_rule_adjustments, [{
+    rule_id: "technical_range",
+    rule_version: TECHNICAL_RANGE_RULES_VERSION,
+    kind: "temperature",
+    source_text: "-40 °C to +90 °C",
+    replacement_text: "−40\u00a0°C do +90\u00a0°C",
+  }]);
+  assert.ok(segment.warnings.includes("technical_translation_rule_applied"));
 });
 
 test("finds glossary rules and restores target and do-not-translate terms", () => {
