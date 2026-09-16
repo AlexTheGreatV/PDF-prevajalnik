@@ -152,7 +152,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
             <span>{completed} od {actionable} prevodov potrjenih</span>
             <progress value={completed} max={actionable || 1} />
           </div>
-          <PdfExportPanel sourceFile={sourceFile} job={job} />
+          <PdfExportPanel sourceFile={sourceFile} job={job} analysis={analysis} ocrItems={ocrItems} />
           <div className="translation-filters" aria-label="Filtri prevodov">
             {FILTERS.map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{FILTER_LABELS[value]}</button>)}
           </div>

@@ -907,6 +907,26 @@ pre {
   padding: 18px 0;
 }
 
+.document-coverage { margin: 16px 0; border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+.document-coverage h4 { margin: 0 0 4px; }
+.coverage-states { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.coverage-states span { border: 1px solid #c78a42; border-radius: 4px; padding: 5px 7px; color: #75420c; background: #fff8ec; font-size: 12px; font-weight: 700; }
+.coverage-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--border); margin: 12px 0; }
+.coverage-metrics div { min-width: 0; padding: 10px; border-right: 1px solid var(--border); }
+.coverage-metrics div:last-child { border-right: 0; }
+.coverage-metrics span, .coverage-metrics strong { display: block; }
+.coverage-metrics span { color: var(--muted); font-size: 12px; }
+.coverage-metrics strong { margin-top: 3px; font-size: 15px; }
+.coverage-pages { margin-top: 12px; border-top: 1px solid var(--border); }
+.coverage-pages article { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.coverage-pages article.has-warning { border-left: 3px solid #c78a42; padding-left: 10px; }
+.coverage-pages header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.coverage-pages dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px 14px; margin: 8px 0; }
+.coverage-pages dl div { display: flex; justify-content: space-between; gap: 8px; }
+.coverage-pages dt { color: var(--muted); }
+.coverage-pages dd { margin: 0; font-weight: 700; }
+.coverage-pages p { margin: 6px 0 0; font-size: 13px; }
+
 .export-summary {
   display: grid;
   grid-template-columns: repeat(6, minmax(90px, 1fr));
@@ -945,6 +965,8 @@ pre {
 .export-table-detail p { margin: 7px 0 0; font-size: 13px; }
 
 @media (max-width: 800px) {
+  .coverage-metrics, .coverage-pages dl { grid-template-columns: 1fr; }
+  .coverage-metrics div { border-right: 0; border-bottom: 1px solid var(--border); }
   .export-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .export-summary div { border-bottom: 1px solid var(--border); }
   .export-typography-row { grid-template-columns: 1fr; }

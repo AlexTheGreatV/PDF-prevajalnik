@@ -2,8 +2,12 @@
 
 import { useState } from "react";
 
+import { createCoverageRevisionKey } from "../lib/document-coverage";
+import type { OcrReviewItem } from "../lib/ocr-review";
 import { downloadPdfExport, preparePdfExport, type PdfExportMode, type PdfExportPlan } from "../lib/pdf-export-client";
+import type { PdfAnalysis } from "../lib/pdf-types";
 import type { TranslationJob } from "../lib/translation-types";
+import { DocumentCoverageSummary } from "./document-coverage-summary";
 
 const REASON_LABELS: Record<string, string> = {
   not_reviewed: "prevod ni potrjen",
@@ -36,18 +40,27 @@ const REASON_LABELS: Record<string, string> = {
   overflow: "prevod se ne prilega",
 };
 
-export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: TranslationJob }) {
+export function PdfExportPanel({ sourceFile, job, analysis, ocrItems }: {
+  sourceFile: File;
+  job: TranslationJob;
+  analysis: PdfAnalysis;
+  ocrItems: OcrReviewItem[];
+}) {
   const [mode, setMode] = useState<PdfExportMode>("diagnostic");
-  const [planned, setPlanned] = useState<{ job: TranslationJob; mode: PdfExportMode; plan: PdfExportPlan } | null>(null);
+  const [planned, setPlanned] = useState<{ revisionKey: string; plan: PdfExportPlan } | null>(null);
   const [busy, setBusy] = useState<"plan" | "download" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const plan = planned?.job === job && planned.mode === mode ? planned.plan : null;
+  const [downloadedRevisionKey, setDownloadedRevisionKey] = useState<string | null>(null);
+  const revisionKey = createCoverageRevisionKey({ analysis, ocrItems, job, mode });
+  const plan = planned?.revisionKey === revisionKey ? planned.plan : null;
+  const downloadCompleted = downloadedRevisionKey === revisionKey;
 
   async function prepare() {
     setBusy("plan");
     setError(null);
+    setDownloadedRevisionKey(null);
     try {
-      setPlanned({ job, mode, plan: await preparePdfExport(sourceFile, job, mode) });
+      setPlanned({ revisionKey, plan: await preparePdfExport(sourceFile, job, mode) });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Načrta izvoza ni bilo mogoče pripraviti.");
     } finally {
@@ -58,6 +71,7 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
   async function download() {
     setBusy("download");
     setError(null);
+    setDownloadedRevisionKey(null);
     try {
       const result = await downloadPdfExport(sourceFile, job, mode);
       const url = URL.createObjectURL(result.blob);
@@ -66,6 +80,7 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
       anchor.download = result.filename;
       anchor.click();
       URL.revokeObjectURL(url);
+      setDownloadedRevisionKey(revisionKey);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Izvoz PDF ni uspel.");
     } finally {
@@ -85,6 +100,7 @@ export function PdfExportPanel({ sourceFile, job }: { sourceFile: File; job: Tra
       <button className="button" disabled={busy !== null || !job.document_identity} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi izvoz PDF"}</button>
       <button className="button secondary" disabled={!plan || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : "Prenesi novi PDF"}</button>
     </div>
+    <DocumentCoverageSummary analysis={analysis} ocrItems={ocrItems} job={job} plan={plan} downloadCompleted={downloadCompleted} />
     {!job.document_identity && <p className="translation-warning">Opravilo nima preverjene identitete PDF-ja. Znova ga povežite s trenutno analizo.</p>}
     {error && <p className="translation-error">{error}</p>}
     {plan && <>
