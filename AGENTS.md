@@ -19,6 +19,7 @@ Allowed:
 - Local background patching over demonstrably uniform image regions without modifying image XObjects
 - Cell-level export for reliable digital tables with source matching, fit preflight, and partial-export diagnostics
 - Selective export of explicitly accepted OCR regions after separate translation review, immutable PDF identity checks, and uniform-background preflight
+- Versioned provider-independent Slovenian translation rules with explicit automation limits, source hashes, rule provenance, and manual quality checks
 - OCR review revisions are held for 30 minutes in one API process. They are intentionally lost on restart, are not shared between workers, and a missing record must block export rather than trust client data.
 
 Guardrails:
@@ -30,6 +31,8 @@ Guardrails:
 - Preserve `native_text`, OCR results, and the source document model.
 - Do not hardcode translations or silently repair damaged placeholders.
 - Never auto-review glossary or model translations; a successful placeholder retry must require manual review.
+- Never claim that SSKJ, eSSKJ, SIST, IATE, standards, regulations, or another external terminology source was checked unless a source record was explicitly supplied and retained.
+- Keep translation diagnostics in the review UI and JSON metadata; never insert comments, warnings, or diagnostic text into the final translated document.
 - Never overwrite a source PDF. Export only reviewed, identity-matched, geometry-checked digital text blocks after fit preflight.
 - Preserve images and vector graphics, and skip ambiguous, overlapping, unaccepted or stale OCR, rotated, unsupported-table, or overflowing regions with a structured reason.
 - OCR export must remain inside the accepted bbox, must not cover icons, lines, neighboring text, cells, photographs, gradients, or textures, and must never reconstruct an image or rasterize a page.

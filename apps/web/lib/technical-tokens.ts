@@ -1,7 +1,7 @@
 import type { PlaceholderStrategy, ProtectedToken } from "./translation-types";
 import { analyzeTechnicalRanges, TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
 
-const TOKEN_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\bRAL\s+\d{3,5}\b|[+-]?\d+(?:[.,]\d+)?\s*(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%)(?=$|\s|[),.;:])|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|[+-]?\d+(?:[.,]\d+)?/gu;
+const TOKEN_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\{\{[A-Za-z_][\w.-]*\}\}|\$\{[A-Za-z_][\w.-]*\}|\{[A-Za-z_][\w.-]*\}|%(?:s|d)|\[LINK\]|\bRAL\s+\d{3,5}\b|[+-]?\d+(?:[.,]\d+)?\s*(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%)(?=$|\s|[),.;:])|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|(?<!\p{L})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){2,}(?!\p{L})|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|[+-]?\d+(?:[.,]\d+)?/gu;
 export function protectTechnicalTokens(text: string, strategy: PlaceholderStrategy = "primary_tk"): { protected_text: string; tokens: ProtectedToken[]; warnings: string[] } {
   const tokens: ProtectedToken[] = [];
   const analysis = analyzeTechnicalRanges(text);
@@ -28,14 +28,16 @@ export function protectTechnicalTokens(text: string, strategy: PlaceholderStrate
     const unitEndPlaceholder = range.unit_kind === "translatable_word"
       ? placeholderFor(tokens.length + 2, strategy)
       : undefined;
+    const profileReplacement = normalizeDecimalDots(range.target_text);
     tokens.push({
       placeholder,
       value: range.source_text,
-      replacement_value: range.target_text,
+      replacement_value: profileReplacement,
       kind: "technical_range",
       technical_range: technicalRange,
       rule_id: "technical_range",
       rule_version: TECHNICAL_RANGE_RULES_VERSION,
+      profile_rule_ids: profileReplacement !== range.target_text ? ["SL-SSKJ-05-001"] : [],
       unit_start_placeholder: unitStartPlaceholder,
       unit_end_placeholder: unitEndPlaceholder,
     });
@@ -106,35 +108,54 @@ function placeholderFor(index: number, strategy: PlaceholderStrategy): string {
 }
 
 function protectValues(text: string, tokens: ProtectedToken[], strategy: PlaceholderStrategy): string {
-  return text.replace(TOKEN_PATTERN, (value) => {
+  return text.replace(TOKEN_PATTERN, (value, offset: number) => {
     const index = String(tokens.length).padStart(3, "0");
     const placeholder = strategy === "primary_tk" ? `TK${index}TK` : `PHX${index}XHP`;
-    const kind = tokenKind(value);
-    const replacement = kind === "measurement" ? typographicMeasurement(value) : value;
+    const kind = tokenKind(value, offset, text);
+    const decimalNormalization = kind === "number" && /^[+-]?\d+\.\d+$/.test(value);
+    const replacement = kind === "measurement"
+      ? typographicMeasurement(value)
+      : decimalNormalization ? value.replace(".", ",") : value;
     tokens.push({
       placeholder,
       value,
       replacement_value: replacement,
       kind,
-      ...(replacement !== value ? {
-        rule_id: "technical_unit_spacing" as const,
-        rule_version: TECHNICAL_RANGE_RULES_VERSION,
-      } : {}),
+      ...(replacement !== value ? decimalNormalization
+        ? { rule_id: "decimal_separator" as const, rule_version: "sl-general-sskj-v1" }
+        : { rule_id: "technical_unit_spacing" as const, rule_version: TECHNICAL_RANGE_RULES_VERSION }
+      : {}),
+      profile_rule_ids: replacement !== value && /\d\.\d/.test(value) && /\d,\d/.test(replacement)
+        ? ["SL-SSKJ-05-001"]
+        : [],
     });
     return placeholder;
   });
 }
 
 function typographicMeasurement(value: string): string {
-  const normalized = value.startsWith("-") ? `−${value.slice(1)}` : value;
+  const normalized = normalizeDecimalDots(value.startsWith("-") ? `−${value.slice(1)}` : value);
   return normalized.replace(/(?<=\d)\s+(?=(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%))/u, "\u00a0");
 }
 
-function tokenKind(value: string): ProtectedToken["kind"] {
+function normalizeDecimalDots(value: string): string {
+  return value.replace(/(?<=\d)\.(?=\d)/g, ",");
+}
+
+function tokenKind(value: string, offset: number, source: string): ProtectedToken["kind"] {
   if (/^https?:|^www\./i.test(value)) return "url";
   if (value.includes("@")) return "email";
+  if (/^(?:\{\{|\$?\{|%(?:s|d)$|\[LINK\]$)/.test(value)) return "source_placeholder";
   if (/\d\s*(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%)$/u.test(value)) return "measurement";
-  if (/^[+-]?\d+(?:[.,]\d+)?$/.test(value)) return "number";
+  if (/^[+-]?\d+(?:[.,]\d+)?$/.test(value)) {
+    const before = source[offset - 1] ?? "";
+    const after = source[offset + value.length] ?? "";
+    const prefix = source.slice(Math.max(0, offset - 24), offset);
+    const beforeUnsafe = /[\p{L}\p{N}_\/-]/u.test(before) || (before === "." && /\d/.test(source[offset - 2] ?? ""));
+    const afterUnsafe = /[\p{L}\p{N}_\/-]/u.test(after) || (after === "." && /\d/.test(source[offset + value.length + 1] ?? ""));
+    const labeledMachineValue = /\b(?:version|ver|code|id|identifier|serial|s\/n|sn|ISO|EN|DIN)\s*$/i.test(prefix);
+    return beforeUnsafe || afterUnsafe || labeledMachineValue ? "product_code" : "number";
+  }
   if (/\d/.test(value)) return "product_code";
   return "technical_term";
 }

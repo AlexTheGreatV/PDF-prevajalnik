@@ -15,11 +15,14 @@ import {
   resetTranslation,
   retryFailedTranslation,
   reviewTranslation,
+  updateTranslationJobSegment,
   updateJobGlossary,
   validateTranslationJobCompatibility,
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationJob, TranslationSegment, TranslationStatus } from "../lib/translation-types";
 import { useLocalTranslation } from "./use-local-translation";
+import { TranslationProfileSummary } from "./translation-profile-summary";
+import { updateTerminologySources } from "../lib/translation-profile-evaluation";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -56,7 +59,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   }
 
   function updateSegment(segmentId: string, update: (segment: TranslationSegment) => TranslationSegment) {
-    setJob((current) => current ? { ...current, segments: current.segments.map((segment) => segment.segment_id === segmentId ? update(segment) : segment) } : current);
+    setJob((current) => current ? updateTranslationJobSegment(current, segmentId, update) : current);
   }
 
   function changeGlossary(next: GlossaryEntry[]) {
@@ -152,6 +155,10 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
             <span>{completed} od {actionable} prevodov potrjenih</span>
             <progress value={completed} max={actionable || 1} />
           </div>
+          <TranslationProfileSummary
+            job={job}
+            onTerminologySourcesChange={(sources) => setJob((current) => current ? updateTerminologySources(current, sources) : current)}
+          />
           <PdfExportPanel sourceFile={sourceFile} job={job} analysis={analysis} ocrItems={ocrItems} />
           <div className="translation-filters" aria-label="Filtri prevodov">
             {FILTERS.map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{FILTER_LABELS[value]}</button>)}

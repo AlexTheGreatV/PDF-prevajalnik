@@ -97,6 +97,12 @@ Translation jobs include a configurable technical glossary. Built-in entries use
 
 Translation job schema version 4 binds the job to the analyzed source through its SHA-256, page count, page geometry, rotation, and document-model version. Versions 1 through 3 remain importable, but their missing identity and layout fields are populated only after every immutable source segment has been checked against the current analysis.
 
+Translation job schema version 5 adds the versioned Slovenian profile `sl-general-sskj-v1`, its source and canonical SHA-256 values, actually applied automatic rule IDs, manual and unverifiable rule IDs, structured diagnostics, terminology-source records, and the section 16 quality checklist. Older jobs remain importable with no profile attribution. The canonical source is stored as `docs/translation-profiles/sl-general-sskj-v1.md`; the original DOCX is not tracked.
+
+The static rule execution mode is distinct from runtime applicability (`applicable`, `not_applicable`, or `unknown`) and the runtime check result (`passed`, `failed`, `needs_review`, `not_checkable`, or `not_applicable`). Legal, literary, advertising, markup, placeholder, and other domain-specific rules become applicable only when a concrete document or segment trigger is present. Canonical profile hashing normalizes the checked-in text to UTF-8 with LF line endings and no BOM before SHA-256 calculation, making the recorded hash independent of checkout line endings.
+
+The profile does not contact SSKJ, eSSKJ, SIST, IATE, or another external terminology source at runtime. When no user-approved citation is recorded, the UI reports `Terminološki vir ni preverjen`; SSKJ/eSSKJ are never represented as the sole authority for orthographic or professional terminology decisions. Diagnostic warnings remain in the review UI and JSON only, never in the final translated PDF.
+
 Paragraphs and list items are translated sentence by sentence while remaining one reviewable segment. The local runtime counts actual SentencePiece tokens, uses a dynamic decoding limit between 64 and 768 tokens, rejects truncated output, and permits one safe punctuation-based split when a single chunk exceeds a model limit.
 
 Local translation endpoints:

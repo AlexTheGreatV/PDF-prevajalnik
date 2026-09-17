@@ -24,6 +24,7 @@ import {
   validateTranslationJobCompatibility,
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationProvider, TranslationProviderResult, TranslationRequest } from "../lib/translation-types";
+import { updateTerminologySources } from "../lib/translation-profile-evaluation";
 
 const tests: Promise<void>[] = [];
 function test(name: string, run: () => void | Promise<void>) {
@@ -145,7 +146,7 @@ test("protects and restores technical values exactly", () => {
   for (const value of ["CO₂", "+5 °C to +25 °C", "2.5 MPa", "50 %", "RAL 9001", "290 ml", "600 ml", "20 L", "200 L"]) {
     assert.ok(protectedValue.tokens.some((token) => token.value === value), `Missing protected token: ${value}`);
   }
-  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), "CO₂, +5\u00a0°C do +25\u00a0°C, 2.5\u00a0MPa, 50\u00a0%, RAL 9001, 290\u00a0ml, 600\u00a0ml, 20\u00a0L and 200\u00a0L.");
+  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), "CO₂, +5\u00a0°C do +25\u00a0°C, 2,5\u00a0MPa, 50\u00a0%, RAL 9001, 290\u00a0ml, 600\u00a0ml, 20\u00a0L and 200\u00a0L.");
   assert.throws(() => restoreTechnicalTokens(protectedValue.protected_text.replace("TK000TK", "broken"), protectedValue.tokens), /placeholder/);
   assert.throws(() => restoreTechnicalTokens(`${protectedValue.protected_text} TK000TK`, protectedValue.tokens), /placeholder/);
 });
@@ -158,6 +159,38 @@ test("preserves technical symbols and applies nonbreaking unit spacing", () => {
   assert.equal(result.tokens.find((token) => token.value === "RAL 9001")?.replacement_value, "RAL 9001");
 });
 
+test("normalizes only an unambiguous plain decimal and records the profile rule", async () => {
+  const plain = protectTechnicalTokens("Ratio 3.14.");
+  assert.equal(restoreTechnicalTokens(plain.protected_text, plain.tokens), "Ratio 3,14.");
+  assert.equal(plain.tokens.find((token) => token.value === "3.14")?.rule_id, "decimal_separator");
+
+  for (const source of ["version 1.2.3", "code AB-3.14", "identifier v1.2", "IP 192.168.1.59", "ISO 1.59", "DIN 3.14", "serial 1.59"]) {
+    const protectedValue = protectTechnicalTokens(source);
+    assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), source);
+    assert.equal(protectedValue.tokens.some((token) => token.rule_id === "decimal_separator"), false);
+  }
+
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{ kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1, blocks: [block(1, "paragraph", "Ratio 3.14.")] }];
+  const translated = await translateJobBatch(
+    createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" }),
+    new DeterministicProvider(() => "Razmerje TK000TK."),
+  );
+  assert.equal(translated.segments[0].translated_text, "Razmerje 3,14.");
+  assert.ok(translated.translation_profile?.applied_rule_ids.includes("SL-SSKJ-05-001"));
+  assert.notEqual(translated.segments[0].status, "reviewed");
+});
+
+test("protects formulas codes URLs email and source placeholders", () => {
+  const source = "H₂O CO₂ MS65 RAL 9001 https://example.test a@example.test {name} ${value} %s %d {{variable}} [LINK]";
+  const protectedValue = protectTechnicalTokens(source);
+  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), source);
+  for (const expected of ["H₂O", "CO₂", "MS65", "RAL 9001", "https://example.test", "a@example.test", "{name}", "${value}", "%s", "%d", "{{variable}}", "[LINK]"]) {
+    assert.ok(protectedValue.tokens.some((token) => token.value === expected), `Missing protected token: ${expected}`);
+  }
+  assert.equal(protectedValue.tokens.filter((token) => token.kind === "source_placeholder").length, 6);
+});
+
 test("parses and localizes only structured technical ranges", () => {
   const cases = [
     ["-40 °C to +90 °C", "−40\u00a0°C do +90\u00a0°C", "temperature"],
@@ -165,7 +198,7 @@ test("parses and localizes only structured technical ranges", () => {
     ["5 mm to 10 mm", "5\u00a0mm do 10\u00a0mm", "measurement"],
     ["10 % to 20 %", "10\u00a0% do 20\u00a0%", "percentage"],
     ["between 5 MPa and 10 MPa", "med 5\u00a0MPa in 10\u00a0MPa", "measurement"],
-    ["5.5-10.25 cm", "5.5 do 10.25\u00a0cm", "measurement"],
+    ["5.5-10.25 cm", "5,5 do 10,25\u00a0cm", "measurement"],
   ] as const;
   for (const [source, expected, kind] of cases) {
     const result = protectTechnicalTokens(source);
@@ -264,6 +297,11 @@ test("records versioned technical range adjustments without automatic review", a
     replacement_text: "−40\u00a0°C do +90\u00a0°C",
   }]);
   assert.ok(segment.warnings.includes("technical_translation_rule_applied"));
+  assert.equal(segment.status, "translated");
+  assert.notEqual(segment.status, "reviewed");
+  assert.equal(translated.translation_profile?.profile_id, "sl-general-sskj-v1");
+  assert.ok(translated.translation_profile?.applied_rule_ids.includes("SL-SSKJ-05-004"));
+  assert.ok(translated.translation_profile?.applied_rule_ids.includes("SL-SSKJ-05-006"));
 });
 
 test("finds glossary rules and restores target and do-not-translate terms", () => {
@@ -318,7 +356,116 @@ test("JSON roundtrip retains work and rejects unsupported versions", () => {
   const job = { ...base, segments: base.segments.map((segment, index) => index === 0 ? reviewTranslation(editTranslation(segment, "UPORABA")) : segment) };
   assert.deepEqual(importTranslationJob(exportTranslationJob(job)), job);
   assert.throws(() => importTranslationJob("not-json"), /veljaven JSON/);
-  assert.throws(() => importTranslationJob('{"schema_version":5}'), /ni podprta/);
+  assert.throws(() => importTranslationJob('{"schema_version":6}'), /ni podprta/);
+});
+
+test("schema four import stays compatible without claiming the new profile", () => {
+  const current = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const legacy = JSON.parse(exportTranslationJob(current)) as Record<string, unknown>;
+  legacy.schema_version = 4;
+  delete legacy.translation_profile;
+  delete legacy.quality_checklist;
+  const migrated = importTranslationJob(JSON.stringify(legacy));
+  assert.equal(migrated.schema_version, 5);
+  assert.equal(migrated.translation_profile, null);
+  assert.deepEqual(migrated.quality_checklist, []);
+  assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
+});
+
+test("runtime rule applicability is separate from static execution mode", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const evaluations = job.translation_profile!.rule_evaluations;
+  assert.equal(evaluations.length, 121);
+  assert.ok(evaluations.filter((item) => item.rule_id.startsWith("SL-SSKJ-09-")).every((item) => item.applicability === "not_applicable" && item.status === "not_applicable"));
+  assert.ok(evaluations.filter((item) => item.rule_id.startsWith("SL-SSKJ-11-")).every((item) => item.applicability === "not_applicable" && item.status === "not_applicable"));
+  assert.equal(evaluations.find((item) => item.rule_id === "SL-SSKJ-13-004")?.status, "not_applicable");
+  const suspicious = evaluations.find((item) => item.rule_id === "SL-SSKJ-04-001")!;
+  assert.equal(suspicious.applicability, "applicable");
+  assert.equal(suspicious.status, "needs_review");
+  assert.equal(suspicious.segment_ids.length, 1);
+  assert.ok(evaluations.some((item) => item.status === "not_checkable"));
+  assert.ok(evaluations.some((item) => item.status === "not_applicable"));
+  assert.ok(job.translation_profile!.manual_review_rule_ids.length < 121);
+  assert.equal(job.translation_profile!.diagnostics.filter((item) => item.message === "Terminološki vir ni preverjen").length, 1);
+});
+
+test("ambiguous range warning is attached to its concrete segment", async () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{ kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1, blocks: [block(1, "paragraph", "Coverage is 10 to 20 fortnights.")] }];
+  const translated = await translateJobBatch(
+    createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" }),
+    new DeterministicProvider(() => "Pokritost je 10 do 20 štirinajstdnevnih obdobij."),
+  );
+  const warning = translated.translation_profile!.diagnostics.find((item) => item.rule_id === "SL-SSKJ-05-005")!;
+  assert.equal(warning.segment_id, translated.segments[0].segment_id);
+  assert.equal(warning.source_text, "Coverage is 10 to 20 fortnights.");
+});
+
+test("unknown and changed profiles preserve work while invalidating only stale evaluation", () => {
+  const original = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const edited = { ...original, segments: original.segments.map((segment, index) => index === 0 ? editTranslation(segment, "Ročno urejen prevod") : segment) };
+
+  const future = JSON.parse(exportTranslationJob(edited));
+  future.translation_profile.profile_id = "sl-future-v9";
+  future.translation_profile.profile_version = 9;
+  const importedFuture = importTranslationJob(JSON.stringify(future));
+  assert.equal(importedFuture.translation_profile?.evaluation_status, "unknown_profile");
+  assert.equal(importedFuture.segments[0].source_text, edited.segments[0].source_text);
+  assert.equal(importedFuture.segments[0].edited_translation, "Ročno urejen prevod");
+  assert.equal(importedFuture.translation_profile?.profile_id, "sl-future-v9");
+
+  const changed = JSON.parse(exportTranslationJob(edited));
+  changed.translation_profile.canonical_sha256 = "b".repeat(64);
+  const importedChanged = importTranslationJob(JSON.stringify(changed));
+  assert.equal(importedChanged.translation_profile?.evaluation_status, "stale");
+  assert.deepEqual(importedChanged.translation_profile?.rule_evaluations, []);
+  assert.deepEqual(importedChanged.translation_profile?.applied_rule_ids, []);
+  assert.equal(importedChanged.segments[0].source_text, edited.segments[0].source_text);
+  assert.equal(importedChanged.segments[0].edited_translation, "Ročno urejen prevod");
+});
+
+test("user glossary conflict follows section 15 and remains unreviewed", () => {
+  const glossary: GlossaryEntry[] = [
+    ...createDefaultGlossary(),
+    { id: "user-advantages", source_term: "ADVANTAGES", target_term: "KORISTI", case_sensitive: false, mode: "exact_segment", enabled: true, origin: "user" },
+  ];
+  const analysis = fixture();
+  const heading = analysis.document!.pages[0].regions.find((region) => region.kind === "header")!.blocks[0];
+  heading.original_text = "ADVANTAGES";
+  heading.normalized_text = "ADVANTAGES";
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl", glossary });
+  const segment = job.segments[0];
+  assert.equal(segment.edited_translation, "KORISTI");
+  assert.equal(segment.status, "translated");
+  assert.notEqual(segment.status, "reviewed");
+  assert.equal(job.translation_profile?.conflicts[0]?.winner, "user_glossary");
+});
+
+test("inconsistent terminology produces a warning and profile data survives JSON", () => {
+  const glossary: GlossaryEntry[] = [
+    { id: "one", source_term: "coating", target_term: "premaz", case_sensitive: false, mode: "preferred", enabled: true, origin: "user" },
+    { id: "two", source_term: "Coating", target_term: "obloga", case_sensitive: false, mode: "preferred", enabled: true, origin: "user" },
+  ];
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl", glossary });
+  assert.ok(job.translation_profile?.diagnostics.some((diagnostic) => diagnostic.rule_id === "SL-SSKJ-14-001"));
+  const imported = importTranslationJob(exportTranslationJob(job));
+  assert.deepEqual(imported.translation_profile, job.translation_profile);
+  assert.deepEqual(imported.quality_checklist, job.quality_checklist);
+});
+
+test("a user-confirmed terminology citation is retained without an external lookup", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const updated = updateTerminologySources(job, [{
+    selected_term: "premaz",
+    domain: "gradbeništvo",
+    source_or_citation: "Interni potrjeni glosar, izdaja 2026-09",
+    confidence: "high",
+    user_confirmed: true,
+  }]);
+  assert.equal(updated.translation_profile?.terminology_sources[0].selected_term, "premaz");
+  assert.equal(updated.translation_profile?.diagnostics.some((item) => item.message === "Terminološki vir ni preverjen"), false);
+  const imported = importTranslationJob(exportTranslationJob(updated));
+  assert.deepEqual(imported.translation_profile?.terminology_sources, updated.translation_profile?.terminology_sources);
 });
 
 test("import compatibility rejects changes to immutable source text", () => {
@@ -438,7 +585,7 @@ test("schema one import migrates explicitly and retains immutable source identit
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 4);
+  assert.equal(migrated.schema_version, 5);
   assert.equal(migrated.glossary[0].mode, "do_not_translate");
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.glossary_snapshot, migrated.glossary);
@@ -547,7 +694,7 @@ test("schema two job migrates chunk fields without changing source identity", ()
     return legacySegment;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 4);
+  assert.equal(migrated.schema_version, 5);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.segments[0].chunks, []);
 });
@@ -563,7 +710,7 @@ test("schema three job migrates without inventing identity and can be safely reb
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 4);
+  assert.equal(migrated.schema_version, 5);
   assert.equal(migrated.document_identity, null);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   const rebound = bindTranslationJobToAnalysis(migrated, current);

@@ -1,5 +1,9 @@
 import type { BBox, PdfKind, StructuredBlockKind, StructuredStyle } from "./pdf-types";
 import type { TechnicalRange, TechnicalRangeKind } from "./technical-ranges";
+import type {
+  TranslationProfileSnapshot,
+  TranslationQualityCheck,
+} from "./translation-profile";
 
 export type TranslationStatus = "pending" | "translating" | "translated" | "reviewed" | "failed" | "skipped";
 export type TranslationSourceOrigin = "native" | "accepted_ocr";
@@ -20,18 +24,19 @@ export type ProtectedToken = {
   placeholder: string;
   value: string;
   replacement_value?: string;
-  kind: "url" | "email" | "measurement" | "number" | "product_code" | "technical_term" | "technical_range" | "technical_unit_boundary" | "glossary";
+  kind: "url" | "email" | "measurement" | "number" | "product_code" | "technical_term" | "source_placeholder" | "technical_range" | "technical_unit_boundary" | "glossary";
   technical_range?: TechnicalRange;
   unit_start_placeholder?: string;
   unit_end_placeholder?: string;
-  rule_id?: "technical_range" | "technical_unit_spacing";
+  rule_id?: "technical_range" | "technical_unit_spacing" | "decimal_separator";
   rule_version?: string;
+  profile_rule_ids?: string[];
 };
 
 export type TranslationRuleAdjustment = {
-  rule_id: "technical_range" | "technical_unit_spacing";
+  rule_id: "technical_range" | "technical_unit_spacing" | "decimal_separator";
   rule_version: string;
-  kind: TechnicalRangeKind | "unit_spacing";
+  kind: TechnicalRangeKind | "unit_spacing" | "decimal_number";
   source_text: string;
   replacement_text: string;
 };
@@ -121,7 +126,7 @@ export type TranslationSegment = {
 };
 
 export type TranslationJob = {
-  schema_version: 4;
+  schema_version: 5;
   source_filename: string;
   source_language: string;
   target_language: string;
@@ -130,6 +135,8 @@ export type TranslationJob = {
   glossary: GlossaryEntry[];
   glossary_snapshot: GlossaryEntry[];
   segments: TranslationSegment[];
+  translation_profile: TranslationProfileSnapshot | null;
+  quality_checklist: TranslationQualityCheck[];
 };
 
 export type PdfPageIdentity = {

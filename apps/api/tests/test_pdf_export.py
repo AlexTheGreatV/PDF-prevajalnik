@@ -70,6 +70,31 @@ def test_diagnostic_mode_keeps_source_text(tmp_path: Path) -> None:
         assert "segment-1" in text
 
 
+def test_schema_five_profile_diagnostics_are_not_written_to_final_pdf(tmp_path: Path) -> None:
+    source = tmp_path / "profile-metadata.pdf"
+    _make_pdf(source)
+    payload = _job_payload(source)
+    payload["schema_version"] = 5
+    payload["translation_profile"] = {
+        "profile_id": "sl-general-sskj-v1",
+        "diagnostics": [{"kind": "external_source_unchecked", "message": "Terminološki vir ni preverjen"}],
+    }
+    payload["quality_checklist"] = [{"status": "needs_review", "message": "Potreben je ročni pregled."}]
+
+    artifact = export_translated_pdf(
+        source,
+        PdfExportJob.model_validate(payload),
+        "replacement_preview",
+        tmp_path / "work-profile",
+    )
+
+    with pymupdf.open(artifact.path) as output:
+        text = output[0].get_text()
+        assert TRANSLATED_TEXT in text
+        assert "Terminološki vir ni preverjen" not in text
+        assert "Potreben je ročni pregled" not in text
+
+
 def test_identity_rejects_hash_page_count_and_geometry_mismatch(tmp_path: Path) -> None:
     source = tmp_path / "identity.pdf"
     _make_pdf(source)

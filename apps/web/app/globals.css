@@ -879,6 +879,178 @@ pre {
   font-size: 13px;
 }
 
+.translation-profile-summary {
+  border-block: 1px solid #d7ddd9;
+  padding-block: 18px;
+}
+
+.translation-profile-summary.legacy {
+  border-left: 3px solid #a66200;
+  padding-left: 12px;
+}
+
+.profile-rule-count {
+  color: #355149;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.profile-diagnostics {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.profile-status-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.rule-status {
+  border: 1px solid #cbd5d1;
+  padding: 5px 8px;
+  background: #f7f9f8;
+  font-size: 0.78rem;
+}
+
+.rule-status.passed { border-color: #21835f; }
+.rule-status.failed { border-color: #d92d20; }
+.rule-status.needs_review { border-color: #a66200; }
+.rule-status.not_applicable { color: #66736e; }
+
+.profile-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.profile-filters label,
+.translation-rule-results > label {
+  display: grid;
+  gap: 4px;
+  color: #40564f;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.profile-filters select,
+.translation-rule-results select {
+  min-width: 180px;
+}
+
+.profile-diagnostic {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 9px 11px;
+  border-left: 3px solid #68756f;
+  background: #f5f7f6;
+  font-size: 0.88rem;
+}
+
+.profile-diagnostic.blocking_error { border-left-color: #b42318; background: #fff2f0; }
+.profile-diagnostic.warning { border-left-color: #a66200; background: #fff8e8; }
+.profile-diagnostic.external_source_unchecked { border-left-color: #236c8c; background: #edf8fc; }
+.profile-diagnostic.informational { border-left-color: #577069; }
+.profile-diagnostic small { color: #5c6a65; overflow-wrap: anywhere; }
+.profile-empty { margin: 0; color: #5c6a65; font-size: 0.86rem; }
+
+.translation-quality-checklist,
+.translation-profile-details,
+.translation-rule-results,
+.terminology-sources {
+  margin-top: 12px;
+}
+
+.translation-quality-checklist > summary,
+.translation-rule-results > summary,
+.translation-profile-details > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.translation-rule-results > label { margin-top: 10px; max-width: 260px; }
+.rule-result-list { display: grid; gap: 6px; max-height: 360px; margin-top: 10px; overflow: auto; }
+.rule-result { display: grid; gap: 2px; margin: 0; padding: 8px 10px; border-left: 3px solid #97a59f; background: #f7f9f8; font-size: 0.8rem; }
+.rule-result.passed { border-left-color: #21835f; }
+.rule-result.failed { border-left-color: #d92d20; }
+.rule-result.needs_review { border-left-color: #a66200; }
+.rule-result.not_applicable { opacity: 0.78; }
+.rule-result small { color: #5c6a65; }
+
+.translation-quality-checklist > div {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.quality-check {
+  border: 1px solid #d7ddd9;
+  padding: 10px;
+}
+
+.quality-check > span {
+  display: block;
+  color: #496159;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.quality-check > strong { display: block; margin-top: 4px; font-size: 0.88rem; }
+.quality-check > p { margin: 5px 0 0; color: #50615b; font-size: 0.82rem; }
+.quality-check.failed { border-color: #d92d20; }
+.quality-check.passed { border-color: #21835f; }
+
+.translation-profile-details dl {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0 0;
+  font-size: 0.82rem;
+}
+
+.translation-profile-details dl > div { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px; }
+.translation-profile-details dd { margin: 0; overflow-wrap: anywhere; }
+
+.terminology-sources > p {
+  color: #50615b;
+  font-size: 0.84rem;
+}
+
+.terminology-source-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(170px, 1.4fr) 120px auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.terminology-source-row input,
+.terminology-source-row select {
+  min-width: 0;
+}
+
+@media (max-width: 980px) {
+  .terminology-source-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .profile-filters {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .profile-filters select,
+  .translation-rule-results select {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
 .translation-reviewed {
   border-color: #79b89d;
   background: #f3fbf7;
