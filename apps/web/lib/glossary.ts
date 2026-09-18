@@ -1,7 +1,10 @@
 import type { GlossaryEntry, GlossaryMatch } from "./translation-types";
 
 export function orderedGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
-  return [...entries].sort((a, b) => Number(b.origin === "user") - Number(a.origin === "user"));
+  const priority = (entry: GlossaryEntry) => entry.scope === "document" ? 3 : entry.scope === "persistent_user" ? 2 : entry.origin === "user" ? 2 : 1;
+  return [...entries]
+    .filter((entry) => entry.status === undefined || entry.status === "approved")
+    .sort((a, b) => priority(b) - priority(a));
 }
 
 export function findExactSegmentGlossaryMatch(text: string, glossary: GlossaryEntry[]): GlossaryEntry | null {
@@ -38,6 +41,8 @@ function toMatch(entry: GlossaryEntry, matched_text: string): GlossaryMatch {
     matched_text,
     mode: entry.mode,
     origin: entry.origin,
+    revision: entry.revision,
+    scope: entry.scope,
   };
 }
 

@@ -23,6 +23,8 @@ import type { GlossaryEntry, TranslationJob, TranslationSegment, TranslationStat
 import { useLocalTranslation } from "./use-local-translation";
 import { TranslationProfileSummary } from "./translation-profile-summary";
 import { updateTerminologySources } from "../lib/translation-profile-evaluation";
+import { GlossaryManager, type GlossaryProposal } from "./glossary-manager";
+import { createReviewedCorrectionDraft, isGlossarySnapshotStale, recordGlossaryUsage } from "../lib/persistent-glossary";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -32,9 +34,12 @@ const FILTER_LABELS: Record<(typeof FILTERS)[number], string> = {
 
 export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analysis: PdfAnalysis; ocrItems: OcrReviewItem[]; sourceFile: File }) {
   const importRef = useRef<HTMLInputElement | null>(null);
+  const recordedGlossaryUsage = useRef(new Map<string, Set<string>>());
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("sl");
   const [glossary, setGlossary] = useState<GlossaryEntry[]>(createDefaultGlossary);
+  const [persistentGlossaryHash, setPersistentGlossaryHash] = useState("");
+  const [glossaryProposal, setGlossaryProposal] = useState<GlossaryProposal | null>(null);
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
@@ -46,6 +51,23 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
     setJob((current) => current ? invalidateStaleOcrApprovals(current, ocrItems) : current);
   }, [ocrItems]);
 
+  useEffect(() => {
+    if (!job) return;
+    const persistentEntryIds = new Set(job.glossary.filter((entry) => entry.scope === "persistent_user").map((entry) => entry.id));
+    const used = job.glossary_usage
+      .filter((item) => persistentEntryIds.has(item.glossary_id) && item.outcome === "applied")
+      .map((item) => item.glossary_id);
+    const jobKey = `${job.created_at}:${job.document_identity?.sha256 ?? job.source_filename}`;
+    const recorded = recordedGlossaryUsage.current.get(jobKey) ?? new Set<string>();
+    const pending = used.filter((entryId) => !recorded.has(entryId));
+    if (pending.length === 0) return;
+    pending.forEach((entryId) => recorded.add(entryId));
+    recordedGlossaryUsage.current.set(jobKey, recorded);
+    void recordGlossaryUsage(pending).catch(() => {
+      pending.forEach((entryId) => recorded.delete(entryId));
+    });
+  }, [job]);
+
   const visibleSegments = useMemo(
     () => job?.segments.filter((segment) => filter === "all" || segment.status === filter) ?? [],
     [job, filter],
@@ -54,7 +76,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   const actionable = job?.segments.filter((segment) => segment.status !== "skipped").length ?? 0;
 
   function prepare() {
-    setJob(createTranslationJob(analysis, ocrItems, { source_language: sourceLanguage, target_language: targetLanguage, glossary }));
+    setJob(createTranslationJob(analysis, ocrItems, { source_language: sourceLanguage, target_language: targetLanguage, glossary, glossary_set_hash: persistentGlossaryHash || null }));
     setMessage("Segmenti so pripravljeni. Prevod lahko vnesete ročno.");
   }
 
@@ -62,13 +84,18 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
     setJob((current) => current ? updateTranslationJobSegment(current, segmentId, update) : current);
   }
 
-  function changeGlossary(next: GlossaryEntry[]) {
-    setGlossary(next);
-    setJob((current) => current ? updateJobGlossary(current, next) : current);
+  function changeDocumentGlossary(next: GlossaryEntry[]) {
+    const merged = [
+      ...next.map((entry) => ({ ...entry, scope: "document" as const })),
+      ...glossary.filter((entry) => entry.scope === "persistent_user"),
+      ...createDefaultGlossary(),
+    ];
+    setGlossary(merged);
+    setJob((current) => current ? updateJobGlossary(current, merged) : current);
   }
 
   function addGlossaryEntry() {
-    changeGlossary([...glossary, {
+    changeDocumentGlossary([...glossary.filter((entry) => entry.scope === "document"), {
       id: `glossary-${Date.now()}`,
       source_term: "",
       target_term: "",
@@ -76,7 +103,19 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       mode: "exact_segment",
       enabled: true,
       origin: "user",
+      scope: "document",
+      status: "approved",
+      source: "manual",
     }]);
+  }
+
+  function updatePersistentGlossary(entries: GlossaryEntry[], activeHash: string) {
+    setPersistentGlossaryHash(activeHash);
+    setGlossary((current) => [
+      ...current.filter((entry) => entry.scope === "document"),
+      ...entries,
+      ...createDefaultGlossary(),
+    ]);
   }
 
   function exportJob() {
@@ -130,7 +169,9 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
         </div>
       </div>
 
-      <GlossaryEditor entries={glossary} onChange={changeGlossary} onAdd={addGlossaryEntry} />
+      <GlossaryManager proposal={glossaryProposal} onProposalConsumed={() => setGlossaryProposal(null)} onApprovedEntriesChange={updatePersistentGlossary} />
+
+      <GlossaryEditor entries={glossary.filter((entry) => entry.scope === "document")} onChange={changeDocumentGlossary} onAdd={addGlossaryEntry} />
 
       <div className={`translation-provider-status ${local.status?.available ? "available" : "unavailable"}`}>
         <strong>{local.status?.available ? "Lokalni prevajalnik je pripravljen" : "Lokalni prevajalnik ni nameščen"}</strong>
@@ -159,6 +200,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
             job={job}
             onTerminologySourcesChange={(sources) => setJob((current) => current ? updateTerminologySources(current, sources) : current)}
           />
+          {isGlossarySnapshotStale(job, persistentGlossaryHash) && <p className="translation-warning">Glosar je bil po prevodu spremenjen. Obstoječi prevodi ostajajo nespremenjeni; za uporabo novega nabora izrecno znova pripravite prevod.</p>}
           <PdfExportPanel sourceFile={sourceFile} job={job} analysis={analysis} ocrItems={ocrItems} />
           <div className="translation-filters" aria-label="Filtri prevodov">
             {FILTERS.map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{FILTER_LABELS[value]}</button>)}
@@ -169,7 +211,8 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
                 onEdit={(text) => updateSegment(segment.segment_id, (current) => editTranslation(current, text))}
                 onReview={() => updateSegment(segment.segment_id, reviewTranslation)}
                 onReset={() => updateSegment(segment.segment_id, resetTranslation)}
-                onRetry={() => updateSegment(segment.segment_id, retryFailedTranslation)} />
+                onRetry={() => updateSegment(segment.segment_id, retryFailedTranslation)}
+                onPropose={() => setGlossaryProposal({ key: `${segment.segment_id}-${Date.now()}`, ...createReviewedCorrectionDraft(segment) })} />
             ))}
             {visibleSegments.length === 0 && <p>V tem filtru ni segmentov.</p>}
           </div>
@@ -179,8 +222,8 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   );
 }
 
-function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry }: {
-  segment: TranslationSegment; onEdit: (text: string) => void; onReview: () => void; onReset: () => void; onRetry: () => void;
+function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, onPropose }: {
+  segment: TranslationSegment; onEdit: (text: string) => void; onReview: () => void; onReset: () => void; onRetry: () => void; onPropose: () => void;
 }) {
   return (
     <article className={`translation-segment translation-${segment.status}`}>
@@ -213,6 +256,7 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry }: 
       {!segment.skip_reason && <div className="translation-row-actions">
         <button className="button secondary" disabled={!segment.edited_translation.trim()} onClick={onReview}>Potrdi prevod</button>
         <button className="button secondary" onClick={onReset}>Ponastavi</button>
+        {segment.status === "reviewed" && segment.translation_origin === "manual" && <button className="button secondary" onClick={onPropose}>Predlagaj za glosar</button>}
         {segment.status === "failed" && <button className="button secondary" onClick={onRetry}>Poskusi znova</button>}
       </div>}
     </article>
@@ -221,15 +265,13 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry }: 
 
 function GlossaryEditor({ entries, onChange, onAdd }: { entries: GlossaryEntry[]; onChange: (entries: GlossaryEntry[]) => void; onAdd: () => void }) {
   function update(id: string, value: Partial<GlossaryEntry>) { onChange(entries.map((entry) => entry.id === id ? { ...entry, ...value } : entry)); }
-  function restore(entry: GlossaryEntry) {
-    if (entry.origin === "built_in" && entry.default_target_term) update(entry.id, { target_term: entry.default_target_term, enabled: true });
-  }
   return <div className="glossary-editor">
-    <div className="translation-subhead"><div><h3>Slovar izrazov</h3><p>Privzeti in uporabniški vnosi se shranijo v izvoženo opravilo.</p></div><button className="button secondary" onClick={onAdd}>Dodaj izraz</button></div>
+    <div className="translation-subhead"><div><h3>Navodila trenutnega dokumenta</h3><p>Ti vnosi imajo najvišjo prednost in se shranijo samo v izvoženo opravilo.</p></div><button className="button secondary" onClick={onAdd}>Dodaj navodilo</button></div>
+    {entries.length === 0 && <p>Dokument nima posebnih terminoloških navodil.</p>}
     {entries.map((entry) => <div className="glossary-row" key={entry.id}>
-      <span className={`glossary-origin ${entry.origin}`}>{entry.origin === "built_in" ? "Privzeto" : "Uporabniško"}</span>
+      <span className="glossary-origin user">Dokument</span>
       <label><input type="checkbox" checked={entry.enabled} onChange={(event) => update(entry.id, { enabled: event.target.checked })} /> Vključeno</label>
-      <input aria-label="Izvorni izraz" placeholder="Izvorni izraz" value={entry.source_term} disabled={entry.origin === "built_in"} onChange={(event) => update(entry.id, { source_term: event.target.value })} />
+      <input aria-label="Izvorni izraz" placeholder="Izvorni izraz" value={entry.source_term} onChange={(event) => update(entry.id, { source_term: event.target.value })} />
       <input aria-label="Ciljni izraz" placeholder="Ciljni izraz" value={entry.target_term} disabled={entry.mode === "do_not_translate"} onChange={(event) => update(entry.id, { target_term: event.target.value })} />
       <select aria-label="Način slovarja" value={entry.mode} onChange={(event) => update(entry.id, { mode: event.target.value as GlossaryEntry["mode"] })}>
         <option value="exact_segment">Celoten segment</option>
@@ -238,9 +280,7 @@ function GlossaryEditor({ entries, onChange, onAdd }: { entries: GlossaryEntry[]
         <option value="locked_inline">Zaklenjeno v povedi</option>
       </select>
       <label><input type="checkbox" checked={entry.case_sensitive} onChange={(event) => update(entry.id, { case_sensitive: event.target.checked })} /> Razlikuj črke</label>
-      {entry.origin === "built_in"
-        ? <button className="button secondary" onClick={() => restore(entry)}>Obnovi</button>
-        : <button className="button secondary" onClick={() => onChange(entries.filter((item) => item.id !== entry.id))}>Odstrani</button>}
+      <button className="button secondary" onClick={() => onChange(entries.filter((item) => item.id !== entry.id))}>Odstrani</button>
     </div>)}
   </div>;
 }

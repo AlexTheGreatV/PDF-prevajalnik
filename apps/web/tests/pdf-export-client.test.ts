@@ -13,7 +13,7 @@ function test(name: string, run: () => void | Promise<void>) {
 
 function job(): TranslationJob {
   return {
-    schema_version: 5,
+    schema_version: 6,
     source_filename: "source.pdf",
     source_language: "en",
     target_language: "sl",
@@ -21,6 +21,8 @@ function job(): TranslationJob {
     document_identity: { sha256: "a".repeat(64), page_count: 1, document_model_version: 1, pages: [{ page_number: 1, width: 100, height: 100, rotation: 0 }] },
     glossary: [],
     glossary_snapshot: [],
+    glossary_set_hash: null,
+    glossary_usage: [],
     segments: [],
     translation_profile: null,
     quality_checklist: [],
@@ -34,7 +36,7 @@ test("prepares a local multipart PDF export plan", async () => {
     assert.equal(init?.method, "POST");
     const form = init?.body as FormData;
     assert.equal(form.get("mode"), "diagnostic");
-    assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 5);
+    assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 6);
     return new Response(JSON.stringify({
       filename: "source-sl-preview.pdf",
       mode: "diagnostic",

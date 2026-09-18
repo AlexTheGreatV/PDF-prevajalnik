@@ -24,5 +24,9 @@ export function createDefaultGlossary(): GlossaryEntry[] {
     mode: "exact_segment",
     enabled: true,
     origin: "built_in",
+    scope: "built_in",
+    revision: 1,
+    status: "approved",
+    source: "built_in",
   }));
 }

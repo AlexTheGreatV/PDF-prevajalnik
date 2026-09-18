@@ -6,6 +6,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 
 
+API_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = API_ROOT.parents[1] if API_ROOT.name == "api" and API_ROOT.parent.name == "apps" else API_ROOT
+
+
 class Settings(BaseSettings):
     app_env: str = "local"
     cors_origins: list[str] = [
@@ -22,6 +26,12 @@ class Settings(BaseSettings):
     local_translation_model_path: Path = Path("local-models/hplt-en-sl-v2-ct2-int8")
     local_translation_device: str = "cpu"
     local_translation_compute_type: str = "int8"
+    glossary_database_path: Path = Path("local-data/glossary.sqlite3")
+
+    @field_validator("glossary_database_path", mode="after")
+    @classmethod
+    def resolve_glossary_database_path(cls, value: Path) -> Path:
+        return value if value.is_absolute() else (PROJECT_ROOT / value).resolve()
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -31,7 +41,7 @@ class Settings(BaseSettings):
         return value
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )

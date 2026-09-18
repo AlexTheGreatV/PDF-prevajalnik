@@ -19,6 +19,7 @@ apps/api/storage/
 tmp/
 local-fixtures/
 local-models/
+local-data/
 apps/api/tmp/
 apps/api/.coverage
 *.pyc

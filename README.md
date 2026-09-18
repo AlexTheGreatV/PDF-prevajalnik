@@ -93,7 +93,13 @@ LOCAL_TRANSLATION_COMPUTE_TYPE=int8
 
 To use the OPUS-MT alternative, set `LOCAL_TRANSLATION_PROFILE=opus-en-sla` together with `LOCAL_TRANSLATION_MODEL_PATH=local-models/opus-mt-en-sla-ct2-int8`. The application never downloads either model during startup, tests, or builds.
 
-Translation jobs include a configurable technical glossary. Built-in entries use whole-segment matching and produce unreviewed translation candidates that still require manual confirmation; inline locking is opt-in and always marks the result for review. Schema version 3 introduced the glossary snapshot and model-inference chunks.
+Translation jobs include a configurable technical glossary. Built-in entries use whole-segment matching; document-specific instructions have the highest priority, followed by approved persistent user entries and built-in terms. User glossary results remain translation candidates and are never marked as reviewed automatically. Inline locking is document-specific, opt-in, and always marks the result for review.
+
+The persistent glossary uses Python's built-in SQLite driver and defaults to `local-data/glossary.sqlite3` (`GLOSSARY_DATABASE_PATH`). The database is created lazily, uses WAL mode, revision history, optimistic concurrency, and logical archive/restore operations. Only `approved` entries affect newly prepared translation jobs. Each job stores the approved-set hash and entry revisions it used, so a later glossary edit is shown as stale without changing old source text or translations.
+
+`local-data/` is ignored by Git. Back up the SQLite database only while the API is stopped, or use SQLite's own backup mechanism so the main database and WAL state remain consistent. This milestone is a single-machine local prototype: concurrent requests are serialized through SQLite transactions, but there are no user accounts, permissions, cross-device synchronization, or PostgreSQL migration yet. CSV import requires a preview and explicit confirmation; its reversible field metadata keeps spreadsheet-formula escaping separate from actual glossary values. JSON is export-only in this milestone. Neither CSV nor JSON transfer recreates the immutable revision history, so moving data between computers transfers glossary entries rather than the complete audit trail.
+
+Translation job schema version 6 carries glossary snapshots, the active-set hash, per-entry revision/provenance, and usage/conflict diagnostics. Older supported jobs migrate without falsely claiming a persistent glossary snapshot.
 
 Translation job schema version 4 binds the job to the analyzed source through its SHA-256, page count, page geometry, rotation, and document-model version. Versions 1 through 3 remain importable, but their missing identity and layout fields are populated only after every immutable source segment has been checked against the current analysis.
 

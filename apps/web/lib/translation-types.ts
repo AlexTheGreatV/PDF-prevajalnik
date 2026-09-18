@@ -18,6 +18,7 @@ export type AcceptedOcrSource = {
 export type TranslationOrigin = "glossary" | "provider" | "manual" | null;
 export type GlossaryMode = "exact_segment" | "do_not_translate" | "preferred" | "locked_inline";
 export type GlossaryOrigin = "built_in" | "user";
+export type GlossaryScope = "document" | "persistent_user" | "built_in";
 export type PlaceholderStrategy = "primary_tk" | "retry_phx";
 
 export type ProtectedToken = {
@@ -50,6 +51,10 @@ export type GlossaryEntry = {
   enabled: boolean;
   origin: GlossaryOrigin;
   default_target_term?: string;
+  scope?: GlossaryScope;
+  revision?: number;
+  status?: "proposed" | "approved" | "rejected" | "archived";
+  source?: "manual" | "reviewed_correction" | "import" | "built_in";
 };
 
 export type GlossaryMatch = {
@@ -59,6 +64,18 @@ export type GlossaryMatch = {
   matched_text: string;
   mode: GlossaryMode;
   origin: GlossaryOrigin;
+  revision?: number;
+  scope?: GlossaryScope;
+};
+
+export type GlossaryUsageRecord = {
+  segment_id: string;
+  glossary_id: string;
+  revision: number | null;
+  mode: GlossaryMode;
+  outcome: "applied" | "warned";
+  conflict: boolean;
+  precedence: "document" | "approved_user" | "built_in";
 };
 
 export type PlaceholderAttempt = {
@@ -126,7 +143,7 @@ export type TranslationSegment = {
 };
 
 export type TranslationJob = {
-  schema_version: 5;
+  schema_version: 6;
   source_filename: string;
   source_language: string;
   target_language: string;
@@ -134,6 +151,8 @@ export type TranslationJob = {
   document_identity: PdfDocumentIdentity | null;
   glossary: GlossaryEntry[];
   glossary_snapshot: GlossaryEntry[];
+  glossary_set_hash: string | null;
+  glossary_usage: GlossaryUsageRecord[];
   segments: TranslationSegment[];
   translation_profile: TranslationProfileSnapshot | null;
   quality_checklist: TranslationQualityCheck[];

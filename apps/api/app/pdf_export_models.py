@@ -109,7 +109,7 @@ class PdfExportSegment(BaseModel):
 class PdfExportJob(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    schema_version: Literal[4, 5]
+    schema_version: Literal[4, 5, 6]
     source_filename: str
     document_identity: PdfDocumentIdentity
     segments: list[PdfExportSegment] = Field(max_length=10_000)

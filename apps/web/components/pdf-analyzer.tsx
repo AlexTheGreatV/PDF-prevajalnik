@@ -391,7 +391,31 @@ export function PdfAnalyzer() {
         />
       )}
 
-      {analysis?.document && file && <TranslationWorkspace analysis={analysis} ocrItems={ocrItems} sourceFile={file} />}
+      {analysis?.document && file && (
+        <div className="analysis-workbench">
+          <div className="analysis-workbench-main">
+            <TranslationWorkspace analysis={analysis} ocrItems={ocrItems} sourceFile={file} />
+          </div>
+          <aside className="document-side-preview" aria-label="Predogled PDF dokumenta">
+            <h2>Predogled PDF</h2>
+            {analysis.pages.map((page) => {
+              const preview = renderPagesByNumber.get(page.page_number);
+              return preview ? (
+                <figure key={page.page_number}>
+                  <figcaption>Stran {page.page_number}</figcaption>
+                  <Image
+                    src={preview.path}
+                    alt={`Predogled strani ${page.page_number}`}
+                    width={preview.width_px ?? 850}
+                    height={preview.height_px ?? 1100}
+                    unoptimized
+                  />
+                </figure>
+              ) : null;
+            })}
+          </aside>
+        </div>
+      )}
 
       {analysis && (
         <>

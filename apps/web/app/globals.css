@@ -35,8 +35,51 @@ input {
 }
 
 .workspace {
-  max-width: 1120px;
+  max-width: 1720px;
   margin: 0 auto;
+}
+
+.analysis-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
+  gap: 20px;
+  align-items: start;
+}
+
+.analysis-workbench-main {
+  min-width: 0;
+}
+
+.document-side-preview {
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  padding-left: 16px;
+}
+
+.document-side-preview h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+}
+
+.document-side-preview figure {
+  margin: 0 0 16px;
+}
+
+.document-side-preview figcaption {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.document-side-preview img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
 }
 
 .heading {
@@ -884,6 +927,66 @@ pre {
   padding-block: 18px;
 }
 
+.persistent-glossary {
+  margin-block: 18px;
+  padding-block: 18px;
+  border-block: 1px solid #d7ddd9;
+}
+
+.glossary-tabs { margin-block: 12px; }
+
+.glossary-toolbar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+
+.glossary-toolbar input,
+.glossary-toolbar select,
+.glossary-form input,
+.glossary-form select,
+.glossary-form textarea { min-width: 0; width: 100%; }
+
+.glossary-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid #cbd5d1;
+  background: #f7f9f8;
+}
+
+.glossary-form label { display: grid; gap: 4px; font-size: 0.82rem; font-weight: 700; }
+.glossary-form .translation-warning,
+.glossary-form .compact-actions { grid-column: 1 / -1; }
+
+.glossary-table-wrap { max-width: 100%; overflow-x: auto; }
+.glossary-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.glossary-table th,
+.glossary-table td { padding: 8px; border-bottom: 1px solid #d7ddd9; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.glossary-table th { color: #40564f; }
+.glossary-table small { display: block; margin-top: 4px; color: #5c6a65; }
+
+.glossary-badge { display: inline-block; padding: 3px 5px; border: 1px solid #9cada6; font-size: 0.68rem; font-weight: 800; }
+.glossary-badge.reviewed_correction { border-color: #a66200; }
+.glossary-badge.import { border-color: #236c8c; }
+.glossary-badge.built_in { color: #52635d; }
+.glossary-badge.conflict { margin-left: 4px; border-color: #c2413b; color: #9f2d28; background: #fff4f3; }
+
+.compact-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.compact-actions button { padding: 6px 8px; border: 1px solid #aebbb6; background: #fff; cursor: pointer; }
+.glossary-history { margin-top: 12px; }
+.glossary-history p { margin: 6px 0; font-size: 0.82rem; }
+.glossary-import-export { display: grid; gap: 14px; }
+.import-preview { padding: 12px; border: 1px solid #cbd5d1; }
+.import-preview dl { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+.import-preview dl div { padding: 8px; background: #f7f9f8; }
+.import-preview dt { color: #5c6a65; font-size: 0.75rem; }
+.import-preview dd { margin: 3px 0 0; font-weight: 800; }
+
 .translation-profile-summary.legacy {
   border-left: 3px solid #a66200;
   padding-left: 12px;
@@ -1048,6 +1151,26 @@ pre {
   .translation-rule-results select {
     width: 100%;
     min-width: 0;
+  }
+
+  .glossary-toolbar,
+  .glossary-form { grid-template-columns: 1fr; }
+  .glossary-form .translation-warning,
+  .glossary-form .compact-actions { grid-column: auto; }
+  .import-preview dl { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 1100px) {
+  .analysis-workbench {
+    grid-template-columns: 1fr;
+  }
+
+  .document-side-preview {
+    position: static;
+    max-height: none;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+    padding: 16px 0 0;
   }
 }
 

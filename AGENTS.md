@@ -14,6 +14,7 @@ Allowed:
 - Local OPUS-MT and HPLT/CTranslate2 inference and diagnostics
 - Local FastAPI translation endpoints
 - User-controlled exact, preferred, do-not-translate, and explicitly locked glossary entries
+- A provider-independent persistent local glossary backed by SQLite, with explicit approval, revision history, and import preview
 - Local diagnostic and replacement-preview PDF export into a new temporary file
 - Local FiraGO typography resolution with regular, bold, italic, and bold-italic faces
 - Local background patching over demonstrably uniform image regions without modifying image XObjects
@@ -31,6 +32,8 @@ Guardrails:
 - Preserve `native_text`, OCR results, and the source document model.
 - Do not hardcode translations or silently repair damaged placeholders.
 - Never auto-review glossary or model translations; a successful placeholder retry must require manual review.
+- Only approved persistent glossary entries may affect newly prepared translations. Preserve the glossary revision and active-set hash used by each translation job; later edits must not silently rewrite existing work.
+- Keep the local glossary database, its WAL/SHM files, imports, exports, and backups out of Git. Do not store document paragraphs in glossary records.
 - Never claim that SSKJ, eSSKJ, SIST, IATE, standards, regulations, or another external terminology source was checked unless a source record was explicitly supplied and retained.
 - Keep translation diagnostics in the review UI and JSON metadata; never insert comments, warnings, or diagnostic text into the final translated document.
 - Never overwrite a source PDF. Export only reviewed, identity-matched, geometry-checked digital text blocks after fit preflight.

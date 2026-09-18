@@ -356,7 +356,7 @@ test("JSON roundtrip retains work and rejects unsupported versions", () => {
   const job = { ...base, segments: base.segments.map((segment, index) => index === 0 ? reviewTranslation(editTranslation(segment, "UPORABA")) : segment) };
   assert.deepEqual(importTranslationJob(exportTranslationJob(job)), job);
   assert.throws(() => importTranslationJob("not-json"), /veljaven JSON/);
-  assert.throws(() => importTranslationJob('{"schema_version":6}'), /ni podprta/);
+  assert.throws(() => importTranslationJob('{"schema_version":7}'), /ni podprta/);
 });
 
 test("schema four import stays compatible without claiming the new profile", () => {
@@ -366,7 +366,7 @@ test("schema four import stays compatible without claiming the new profile", () 
   delete legacy.translation_profile;
   delete legacy.quality_checklist;
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 5);
+  assert.equal(migrated.schema_version, 6);
   assert.equal(migrated.translation_profile, null);
   assert.deepEqual(migrated.quality_checklist, []);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
@@ -516,6 +516,40 @@ test("user exact segment override has priority over the built-in entry", () => {
   assert.equal(applications.glossary_entry_id, "user-applications");
 });
 
+test("document glossary outranks approved persistent and built-in entries with auditable usage", () => {
+  const glossary: GlossaryEntry[] = [
+    ...createDefaultGlossary(),
+    { id: "persistent-applications", source_term: "APPLICATIONS", target_term: "TRAJNA UPORABA", case_sensitive: true, mode: "exact_segment", enabled: true, origin: "user", scope: "persistent_user", status: "approved", revision: 4 },
+    { id: "document-applications", source_term: "APPLICATIONS", target_term: "DOKUMENTNA UPORABA", case_sensitive: true, mode: "exact_segment", enabled: true, origin: "user", scope: "document", status: "approved", revision: 2 },
+  ];
+  const job = createTranslationJob(fixture(), [acceptedOcr()], {
+    source_language: "en", target_language: "sl", glossary, glossary_set_hash: "a".repeat(64),
+  });
+  const applications = job.segments.find((segment) => segment.source_text === "APPLICATIONS")!;
+  assert.equal(applications.edited_translation, "DOKUMENTNA UPORABA");
+  assert.equal(applications.glossary_entry_id, "document-applications");
+  assert.equal(applications.status, "translated");
+  assert.equal(applications.needs_review, true);
+  assert.equal(job.glossary_set_hash, "a".repeat(64));
+  assert.equal(job.glossary_usage.find((usage) => usage.glossary_id === "document-applications")?.outcome, "applied");
+  assert.equal(job.glossary_usage.find((usage) => usage.glossary_id === "persistent-applications")?.outcome, "warned");
+  assert.equal(job.glossary_usage.find((usage) => usage.glossary_id === "persistent-applications")?.conflict, true);
+});
+
+test("only approved persistent entries affect a newly prepared job", () => {
+  const statuses = ["proposed", "rejected", "archived"] as const;
+  for (const status of statuses) {
+    const glossary: GlossaryEntry[] = [
+      ...createDefaultGlossary(),
+      { id: `inactive-${status}`, source_term: "APPLICATIONS", target_term: "NE SME VELJATI", case_sensitive: true, mode: "exact_segment", enabled: true, origin: "user", scope: "persistent_user", status, revision: 1 },
+    ];
+    const job = createTranslationJob(fixture(), [acceptedOcr()], { source_language: "en", target_language: "sl", glossary });
+    const applications = job.segments.find((segment) => segment.source_text === "APPLICATIONS")!;
+    assert.equal(applications.edited_translation, "PODROČJA UPORABE");
+    assert.equal(applications.glossary_entry_id, "builtin-applications");
+  }
+});
+
 test("preferred glossary is advisory while do-not-translate and locked-inline are explicit", async () => {
   const glossary: GlossaryEntry[] = [
     { id: "preferred", source_term: "Panel", target_term: "plošča", case_sensitive: true, mode: "preferred", enabled: true, origin: "user" },
@@ -585,7 +619,7 @@ test("schema one import migrates explicitly and retains immutable source identit
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 5);
+  assert.equal(migrated.schema_version, 6);
   assert.equal(migrated.glossary[0].mode, "do_not_translate");
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.glossary_snapshot, migrated.glossary);
@@ -694,7 +728,7 @@ test("schema two job migrates chunk fields without changing source identity", ()
     return legacySegment;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 5);
+  assert.equal(migrated.schema_version, 6);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.segments[0].chunks, []);
 });
@@ -710,7 +744,7 @@ test("schema three job migrates without inventing identity and can be safely reb
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 5);
+  assert.equal(migrated.schema_version, 6);
   assert.equal(migrated.document_identity, null);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   const rebound = bindTranslationJobToAnalysis(migrated, current);

@@ -20,12 +20,12 @@ import type {
   TranslationSegment,
 } from "./translation-types";
 
-export const TRANSLATION_JOB_SCHEMA_VERSION = 5 as const;
+export const TRANSLATION_JOB_SCHEMA_VERSION = 6 as const;
 
 export function createTranslationJob(
   analysis: PdfAnalysis,
   ocrItems: OcrReviewItem[],
-  options: { source_language: string; target_language: string; glossary?: GlossaryEntry[]; created_at?: string },
+  options: { source_language: string; target_language: string; glossary?: GlossaryEntry[]; glossary_set_hash?: string | null; created_at?: string },
 ): TranslationJob {
   const created_at = options.created_at ?? new Date().toISOString();
   const glossary = cloneGlossary(options.glossary ?? []);
@@ -134,12 +134,14 @@ export function createTranslationJob(
     },
     glossary,
     glossary_snapshot: cloneGlossary(glossary),
+    glossary_set_hash: options.glossary_set_hash ?? null,
+    glossary_usage: [],
     segments,
     ...(options.target_language === "sl"
       ? createActiveTranslationProfileMetadata()
       : { translation_profile: null, quality_checklist: [] }),
   };
-  return refreshTranslationProfileMetadata(job);
+  return finalizeTranslationJob(job);
 }
 
 export function invalidateStaleOcrApprovals(job: TranslationJob, ocrItems: OcrReviewItem[]): TranslationJob {
@@ -163,7 +165,7 @@ export function invalidateStaleOcrApprovals(job: TranslationJob, ocrItems: OcrRe
       warnings: [...new Set([...segment.warnings, "ocr_source_changed_after_review"])],
     };
   });
-  return changed ? refreshTranslationProfileMetadata({ ...job, segments }) : job;
+  return changed ? finalizeTranslationJob({ ...job, segments }) : job;
 }
 
 type SegmentInput = {
@@ -347,7 +349,7 @@ export function retryFailedTranslation(segment: TranslationSegment): Translation
 
 export function updateJobGlossary(job: TranslationJob, glossary: GlossaryEntry[]): TranslationJob {
   const snapshot = cloneGlossary(glossary);
-  return refreshTranslationProfileMetadata({
+  return finalizeTranslationJob({
     ...job,
     glossary: snapshot,
     glossary_snapshot: cloneGlossary(snapshot),
@@ -368,7 +370,7 @@ export function updateTranslationJobSegment(
   segmentId: string,
   update: (segment: TranslationSegment) => TranslationSegment,
 ): TranslationJob {
-  return refreshTranslationProfileMetadata({
+  return finalizeTranslationJob({
     ...job,
     segments: job.segments.map((segment) => segment.segment_id === segmentId ? update(segment) : segment),
   });
@@ -430,7 +432,7 @@ export async function translateJobBatch(
     });
   }
   const translatedById = new Map(translated.map((segment) => [segment.segment_id, segment]));
-  return refreshTranslationProfileMetadata({
+  return finalizeTranslationJob({
     ...withGlossary,
     segments: withGlossary.segments.map((segment) => translatedById.get(segment.segment_id) ?? segment),
   });
@@ -516,11 +518,15 @@ function assembleSegment(segment: TranslationSegment, chunks: TranslationChunk[]
     });
     return values;
   });
+  const translated = complete ? chunks.map((chunk) => chunk.translated_text + chunk.separator_after).join("").trimEnd() : "";
+  const missingPreferred = complete ? segment.glossary_matches.filter((match) =>
+    match.mode === "preferred" && match.target_term.trim() && !containsTerm(translated, match.target_term),
+  ) : [];
   const ruleWarnings = complete && adjustments.length > 0 ? ["technical_translation_rule_applied"] : [];
-  const warnings = [...new Set([...segment.warnings, ...technical.warnings, ...ruleWarnings, ...chunks.flatMap((chunk) => chunk.warnings)])];
+  const glossaryWarnings = missingPreferred.map((match) => `preferred_glossary_term_missing:${match.glossary_id}`);
+  const warnings = [...new Set([...segment.warnings, ...technical.warnings, ...ruleWarnings, ...glossaryWarnings, ...chunks.flatMap((chunk) => chunk.warnings)])];
   if (placeholderRetry && complete) warnings.push("placeholder_retry_succeeded");
   if (placeholderRetry && !complete) warnings.push("placeholder_retry_failed");
-  const translated = complete ? chunks.map((chunk) => chunk.translated_text + chunk.separator_after).join("").trimEnd() : "";
   return {
     ...segment,
     chunks,
@@ -530,7 +536,7 @@ function assembleSegment(segment: TranslationSegment, chunks: TranslationChunk[]
     error: complete ? null : "Vsaj en modelni del segmenta ni bil uspešno preveden.",
     translation_origin: complete ? "provider" : segment.translation_origin,
     placeholder_attempts: chunks.flatMap((chunk) => chunk.placeholder_attempts),
-    needs_review: segment.needs_review || placeholderRetry || segment.forced_chunking || adjustments.length > 0 || technical.warnings.length > 0,
+    needs_review: segment.needs_review || placeholderRetry || segment.forced_chunking || adjustments.length > 0 || technical.warnings.length > 0 || segment.glossary_matches.length > 0,
     warnings,
     model_id: segment.model_id,
     provider_id: segment.provider_id,
@@ -596,6 +602,7 @@ export function splitOversizedChunk(chunk: TranslationChunk): TranslationChunk[]
 function applyExactSegmentGlossary(segment: TranslationSegment, glossary: GlossaryEntry[]): TranslationSegment {
   const entry = findExactSegmentGlossaryMatch(segment.source_text, glossary);
   if (!entry?.target_term.trim()) return segment;
+  const needsReview = entry.scope === "document" || entry.scope === "persistent_user" || entry.origin === "user";
   return {
     ...segment,
     translated_text: entry.target_term,
@@ -609,13 +616,13 @@ function applyExactSegmentGlossary(segment: TranslationSegment, glossary: Glossa
     model_id: null,
     provider_id: null,
     placeholder_attempts: [],
-    needs_review: false,
-    warnings: [],
+    needs_review: needsReview,
+    warnings: needsReview ? ["glossary_applied"] : [],
   };
 }
 
 export function exportTranslationJob(job: TranslationJob): string {
-  const refreshed = refreshTranslationProfileMetadata(job);
+  const refreshed = finalizeTranslationJob(job);
   return JSON.stringify({ ...refreshed, glossary_snapshot: cloneGlossary(refreshed.glossary) }, null, 2);
 }
 
@@ -625,15 +632,19 @@ export function importTranslationJob(value: string): TranslationJob {
   catch { throw new Error("Datoteka ni veljaven JSON."); }
   if (!isRecord(parsed)) throw new Error("JSON nima veljavne strukture prevajalskega opravila.");
   const migrated = parsed.schema_version === 1
-    ? migrateSchemaFour(migrateSchemaThree(migrateSchemaTwo(migrateSchemaOne(parsed))))
+    ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(migrateSchemaFour(migrateSchemaThree(migrateSchemaTwo(migrateSchemaOne(parsed))))))
     : parsed.schema_version === 2
-      ? migrateSchemaFour(migrateSchemaThree(migrateSchemaTwo(parsed)))
+      ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(migrateSchemaFour(migrateSchemaThree(migrateSchemaTwo(parsed)))))
       : parsed.schema_version === 3
-        ? migrateSchemaFour(migrateSchemaThree(parsed))
-        : parsed.schema_version === 4 ? migrateSchemaFour(parsed) : migrateSchemaFiveProfileMetadata(parsed);
+        ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(migrateSchemaFour(migrateSchemaThree(parsed))))
+        : parsed.schema_version === 4
+          ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(migrateSchemaFour(parsed)))
+          : parsed.schema_version === 5
+            ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(parsed))
+            : migrateSchemaSixMetadata(parsed);
   if (!isRecord(migrated) || migrated.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
   validateJobShape(migrated);
-  return refreshTranslationProfileMetadata(migrated as TranslationJob);
+  return finalizeTranslationJob(migrated as TranslationJob);
 }
 
 export function validateTranslationJobCompatibility(imported: TranslationJob, expected: TranslationJob): void {
@@ -743,6 +754,25 @@ function migrateSchemaFour(job: Record<string, unknown>): Record<string, unknown
   };
 }
 
+function migrateSchemaSix(job: Record<string, unknown>): Record<string, unknown> {
+  if (job.schema_version !== 5) return job;
+  return {
+    ...job,
+    schema_version: 6,
+    glossary_set_hash: null,
+    glossary_usage: [],
+  };
+}
+
+function migrateSchemaSixMetadata(job: Record<string, unknown>): Record<string, unknown> {
+  if (job.schema_version !== 6) return job;
+  return {
+    ...job,
+    glossary_set_hash: typeof job.glossary_set_hash === "string" ? job.glossary_set_hash : null,
+    glossary_usage: Array.isArray(job.glossary_usage) ? job.glossary_usage : [],
+  };
+}
+
 function migrateSchemaFiveProfileMetadata(job: Record<string, unknown>): Record<string, unknown> {
   if (job.schema_version !== 5 || !isRecord(job.translation_profile)) return job;
   const profile = job.translation_profile;
@@ -782,6 +812,10 @@ function validateJobShape(job: Record<string, unknown>): void {
   if (!Array.isArray(job.quality_checklist) || !job.quality_checklist.every(isQualityCheck)) throw new Error("JSON vsebuje neveljaven kontrolni seznam prevoda.");
   if (job.document_identity !== null && !isDocumentIdentity(job.document_identity)) throw new Error("JSON vsebuje neveljavno identiteto PDF-ja.");
   if (!Array.isArray(job.glossary_snapshot)) throw new Error("JSON nima posnetka uporabljenega slovarja.");
+  if (!(job.glossary_set_hash === null || typeof job.glossary_set_hash === "string") ||
+    !Array.isArray(job.glossary_usage) || !job.glossary_usage.every(isGlossaryUsage)) {
+    throw new Error("JSON vsebuje neveljavno sledljivost glosarja.");
+  }
   for (const entry of [...job.glossary as unknown[], ...job.glossary_snapshot]) validateGlossaryEntry(entry);
   for (const segment of job.segments as unknown[]) {
     if (!isRecord(segment) ||
@@ -917,9 +951,21 @@ function validateGlossaryEntry(value: unknown): void {
     !["exact_segment", "do_not_translate", "preferred", "locked_inline"].includes(String(value.mode)) ||
     typeof value.enabled !== "boolean" ||
     !["built_in", "user"].includes(String(value.origin)) ||
-    (value.default_target_term !== undefined && typeof value.default_target_term !== "string")) {
+    (value.default_target_term !== undefined && typeof value.default_target_term !== "string") ||
+    (value.scope !== undefined && !["document", "persistent_user", "built_in"].includes(String(value.scope))) ||
+    (value.revision !== undefined && (!Number.isInteger(value.revision) || Number(value.revision) < 1)) ||
+    (value.status !== undefined && !["proposed", "approved", "rejected", "archived"].includes(String(value.status))) ||
+    (value.source !== undefined && !["manual", "reviewed_correction", "import", "built_in"].includes(String(value.source)))) {
     throw new Error("JSON vsebuje neveljaven slovarski vnos.");
   }
+}
+
+function isGlossaryUsage(value: unknown): boolean {
+  return isRecord(value) && typeof value.segment_id === "string" && typeof value.glossary_id === "string" &&
+    (value.revision === null || (Number.isInteger(value.revision) && Number(value.revision) >= 1)) &&
+    ["exact_segment", "do_not_translate", "preferred", "locked_inline"].includes(String(value.mode)) &&
+    ["applied", "warned"].includes(String(value.outcome)) && typeof value.conflict === "boolean" &&
+    ["document", "approved_user", "built_in"].includes(String(value.precedence));
 }
 
 function isPlaceholderAttempt(value: unknown): boolean {
@@ -957,6 +1003,31 @@ function validateBaseJob(job: Record<string, unknown>): void {
 
 function cloneGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
   return entries.map((entry) => ({ ...entry }));
+}
+
+function finalizeTranslationJob(job: TranslationJob): TranslationJob {
+  return refreshTranslationProfileMetadata({ ...job, glossary_usage: collectGlossaryUsage(job) });
+}
+
+function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usage"] {
+  return job.segments.flatMap((segment) => segment.glossary_matches.map((match) => {
+    const sameSource = job.glossary.filter((candidate) => candidate.enabled && candidate.source_term.toLocaleLowerCase() === match.source_term.toLocaleLowerCase());
+    const warned = segment.warnings.includes(`preferred_glossary_term_missing:${match.glossary_id}`) ||
+      (match.mode === "exact_segment" && segment.glossary_entry_id !== match.glossary_id);
+    return {
+      segment_id: segment.segment_id,
+      glossary_id: match.glossary_id,
+      revision: match.revision ?? null,
+      mode: match.mode,
+      outcome: warned ? "warned" as const : "applied" as const,
+      conflict: new Set(sameSource.map((candidate) => candidate.target_term)).size > 1,
+      precedence: match.scope === "document" ? "document" as const : match.scope === "persistent_user" || match.origin === "user" ? "approved_user" as const : "built_in" as const,
+    };
+  }));
+}
+
+function containsTerm(text: string, term: string): boolean {
+  return text.toLocaleLowerCase("sl").includes(term.toLocaleLowerCase("sl"));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
