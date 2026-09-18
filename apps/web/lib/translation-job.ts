@@ -265,9 +265,8 @@ export function protectForTranslation(
   glossary: GlossaryEntry[],
   strategy: PlaceholderStrategy = "primary_tk",
 ) {
-  const technical = protectTechnicalTokens(text, strategy);
-  const tokens = [...technical.tokens];
-  let protected_text = technical.protected_text;
+  const glossaryTokens: ProtectedToken[] = [];
+  let protected_text = text;
   for (const entry of orderedGlossary(glossary).filter((item) =>
     item.enabled &&
     item.source_term.trim() &&
@@ -277,9 +276,8 @@ export function protectForTranslation(
     const escaped = entry.source_term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, flags);
     protected_text = protected_text.replace(pattern, (value) => {
-      const index = String(tokens.length).padStart(3, "0");
-      const placeholder = strategy === "primary_tk" ? `GLS${index}GLS` : `PHX${index}XHP`;
-      tokens.push({
+      const placeholder = nextGlossaryPlaceholder(protected_text, glossaryTokens, strategy);
+      glossaryTokens.push({
         placeholder,
         value,
         replacement_value: entry.mode === "do_not_translate" ? value : entry.target_term,
@@ -288,7 +286,14 @@ export function protectForTranslation(
       return placeholder;
     });
   }
-  return { protected_text, tokens };
+  const sentinels = glossaryTokens.map((token, index) => ({ token, value: `\uE000${alphabeticIndex(index)}\uE001` }));
+  const technicalInput = sentinels.reduce((value, item) => value.replaceAll(item.token.placeholder, item.value), protected_text);
+  const technical = protectTechnicalTokens(technicalInput, strategy);
+  const restoredGlossaryPlaceholders = sentinels.reduce(
+    (value, item) => value.replaceAll(item.value, item.token.placeholder),
+    technical.protected_text,
+  );
+  return { protected_text: restoredGlossaryPlaceholders, tokens: [...glossaryTokens, ...technical.tokens] };
 }
 
 export function restoreProtectedTokens(text: string, tokens: ProtectedToken[]): string {
@@ -296,10 +301,31 @@ export function restoreProtectedTokens(text: string, tokens: ProtectedToken[]): 
   let restored = restoreTechnicalTokens(text, technical);
   for (const token of tokens.filter((item) => item.kind === "glossary")) {
     if (restored.split(token.placeholder).length !== 2) throw new Error("Prevod vsebuje manjkajoč ali poškodovan slovarski placeholder.");
-    restored = restored.replace(token.placeholder, token.replacement_value ?? token.value);
+    const integrity = validateGlossaryTechnicalIntegrity(token.value, token.replacement_value ?? token.value);
+    if (!integrity.valid) throw new Error("Glosarski prevod ne ohrani tehničnih vrednosti iz izvornega izraza.");
+    restored = restored.replace(token.placeholder, integrity.normalizedTarget);
   }
-  if (/(?:TK\d{3}TK|GLS\d{3}GLS|PHX\d{3}XHP)/.test(restored)) throw new Error("Prevod vsebuje neobnovljen placeholder.");
   return restored;
+}
+
+function nextGlossaryPlaceholder(source: string, tokens: ProtectedToken[], strategy: PlaceholderStrategy): string {
+  let index = tokens.length;
+  while (true) {
+    const code = String(index).padStart(3, "0");
+    const candidate = strategy === "primary_tk" ? `GLS${code}GLS` : `GPH${code}HPG`;
+    if (!source.includes(candidate) && !tokens.some((token) => token.placeholder === candidate)) return candidate;
+    index += 1;
+  }
+}
+
+function alphabeticIndex(index: number): string {
+  let value = index;
+  let result = "";
+  do {
+    result = String.fromCharCode(65 + (value % 26)) + result;
+    value = Math.floor(value / 26) - 1;
+  } while (value >= 0);
+  return result.padStart(3, "A");
 }
 
 export function editTranslation(segment: TranslationSegment, text: string): TranslationSegment {
@@ -603,10 +629,29 @@ function applyExactSegmentGlossary(segment: TranslationSegment, glossary: Glossa
   const entry = findExactSegmentGlossaryMatch(segment.source_text, glossary);
   if (!entry?.target_term.trim()) return segment;
   const needsReview = entry.scope === "document" || entry.scope === "persistent_user" || entry.origin === "user";
+  const integrity = validateGlossaryTechnicalIntegrity(segment.source_text, entry.target_term);
+  if (!integrity.valid) {
+    return {
+      ...segment,
+      translated_text: "",
+      edited_translation: "",
+      status: "failed",
+      quality: null,
+      error: "Glosarski prevod ne ohrani tehničnih vrednosti iz izvornega segmenta.",
+      glossary_matches: findGlossaryMatches(segment.source_text, glossary),
+      translation_origin: "glossary",
+      glossary_entry_id: entry.id,
+      model_id: null,
+      provider_id: null,
+      placeholder_attempts: [],
+      needs_review: true,
+      warnings: ["glossary_technical_integrity"],
+    };
+  }
   return {
     ...segment,
-    translated_text: entry.target_term,
-    edited_translation: entry.target_term,
+    translated_text: integrity.normalizedTarget,
+    edited_translation: integrity.normalizedTarget,
     status: "translated",
     quality: null,
     error: null,
@@ -619,6 +664,39 @@ function applyExactSegmentGlossary(segment: TranslationSegment, glossary: Glossa
     needs_review: needsReview,
     warnings: needsReview ? ["glossary_applied"] : [],
   };
+}
+
+function validateGlossaryTechnicalIntegrity(source: string, target: string): { valid: boolean; normalizedTarget: string } {
+  const normalizedSource = source.replace(/−/g, "-");
+  const normalizedInput = target.replace(/−/g, "-");
+  const sourceProtection = protectTechnicalTokens(normalizedSource);
+  const targetProtection = protectTechnicalTokens(normalizedInput);
+  const sourceValues = technicalSignatures(sourceProtection.tokens);
+  const targetValues = technicalSignatures(targetProtection.tokens);
+  const valid = sourceValues.length === targetValues.length && sourceValues.every((value, index) => value === targetValues[index]);
+  return {
+    valid,
+    normalizedTarget: valid ? restoreTechnicalTokens(targetProtection.protected_text, targetProtection.tokens) : "",
+  };
+}
+
+function technicalSignatures(tokens: ProtectedToken[]): string[] {
+  return tokens.flatMap((token) => {
+    if (token.kind === "technical_unit_boundary") return [];
+    if (token.kind !== "technical_range" || !token.technical_range) {
+      return [normalizeTechnicalSignature(token.replacement_value ?? token.value)];
+    }
+    const range = token.technical_range;
+    if (range.unit_kind === "translatable_word") {
+      return [range.start_value, range.end_value].map(normalizeTechnicalSignature);
+    }
+    const start = range.unit_placement === "both" ? `${range.start_value} ${range.unit}` : range.start_value;
+    return [start, `${range.end_value} ${range.unit}`].map(normalizeTechnicalSignature);
+  }).sort();
+}
+
+function normalizeTechnicalSignature(value: string): string {
+  return value.replace(/−/g, "-").replace(/\u00a0/g, " ").replace(/(?<=\d)\.(?=\d)/g, ",").replace(/\s+/g, " ").trim();
 }
 
 export function exportTranslationJob(job: TranslationJob): string {
@@ -1013,6 +1091,7 @@ function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usa
   return job.segments.flatMap((segment) => segment.glossary_matches.map((match) => {
     const sameSource = job.glossary.filter((candidate) => candidate.enabled && candidate.source_term.toLocaleLowerCase() === match.source_term.toLocaleLowerCase());
     const warned = segment.warnings.includes(`preferred_glossary_term_missing:${match.glossary_id}`) ||
+      segment.warnings.includes("glossary_technical_integrity") ||
       (match.mode === "exact_segment" && segment.glossary_entry_id !== match.glossary_id);
     return {
       segment_id: segment.segment_id,

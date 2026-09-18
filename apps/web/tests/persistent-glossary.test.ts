@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import {
+  createLatestGlossaryRequestCoordinator,
   createReviewedCorrectionDraft,
   isGlossarySnapshotStale,
   persistentToRuntimeEntry,
   previewGlossaryCsv,
   recordGlossaryUsage,
+  resolveGlossarySnapshot,
   type PersistentGlossaryEntry,
 } from "../lib/persistent-glossary";
 import type { TranslationJob, TranslationSegment } from "../lib/translation-types";
@@ -12,6 +14,16 @@ import type { TranslationJob, TranslationSegment } from "../lib/translation-type
 const tests: Promise<void>[] = [];
 function test(name: string, run: () => void | Promise<void>) {
   tests.push(Promise.resolve().then(run).then(() => console.log(`ok - ${name}`)));
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 const entry: PersistentGlossaryEntry = {
@@ -105,6 +117,99 @@ test("shows a clear local glossary error returned by the API", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("publishes a delayed glossary snapshot exactly once after it becomes ready", async () => {
+  const delayed = deferred<{ entries: PersistentGlossaryEntry[]; hash: string }>();
+  const coordinator = createLatestGlossaryRequestCoordinator();
+  let loading = 0;
+  let prepared = 0;
+  let snapshotMode = "";
+  const running = coordinator.run(() => delayed.promise, {
+    onLoading: () => { loading += 1; },
+    onReady: (value) => { snapshotMode = value.entries[0].match_mode; prepared += 1; },
+    onError: () => assert.fail("load should succeed"),
+  });
+  assert.equal(loading, 1);
+  assert.equal(prepared, 0);
+  delayed.resolve({ entries: [{ ...entry, match_mode: "do_not_translate" }], hash: "snapshot-1" });
+  assert.equal(await running, "applied");
+  assert.equal(prepared, 1);
+  assert.equal(snapshotMode, "do_not_translate");
+});
+
+test("only resolves a deterministic translation snapshot after loading or explicit skip", () => {
+  const documentEntry = persistentToRuntimeEntry({ ...entry, id: "document-entry" });
+  documentEntry.scope = "document";
+  const persistentEntry = persistentToRuntimeEntry({ ...entry, id: "persistent-entry", match_mode: "do_not_translate" });
+  const builtInEntry = { ...documentEntry, id: "built-in", scope: "built_in" as const, origin: "built_in" as const };
+  assert.equal(resolveGlossarySnapshot([documentEntry], { status: "loading" }, [builtInEntry]), null);
+  assert.equal(resolveGlossarySnapshot([documentEntry], { status: "error", message: "offline" }, [builtInEntry]), null);
+  assert.deepEqual(
+    resolveGlossarySnapshot([documentEntry], { status: "ready", entries: [persistentEntry], active_set_hash: "hash" }, [builtInEntry])?.map((item) => item.id),
+    ["document-entry", "persistent-entry", "built-in"],
+  );
+  assert.deepEqual(
+    resolveGlossarySnapshot([documentEntry], { status: "explicitly_skipped" }, [builtInEntry])?.map((item) => item.id),
+    ["document-entry", "built-in"],
+  );
+});
+
+test("has the same ready snapshot when the glossary resolves before document preparation", async () => {
+  const coordinator = createLatestGlossaryRequestCoordinator();
+  let snapshotHash = "";
+  await coordinator.run(async () => ({ hash: "snapshot-1" }), {
+    onLoading: () => undefined,
+    onReady: (value) => { snapshotHash = value.hash; },
+    onError: () => assert.fail("load should succeed"),
+  });
+  assert.equal(snapshotHash, "snapshot-1");
+});
+
+test("keeps a failed glossary load explicit and allows a successful retry", async () => {
+  const coordinator = createLatestGlossaryRequestCoordinator();
+  const states: string[] = [];
+  await coordinator.run(async () => { throw new Error("API ni dosegljiv"); }, {
+    onLoading: () => states.push("loading"),
+    onReady: () => states.push("ready"),
+    onError: () => states.push("error"),
+  });
+  await coordinator.run(async () => ({ hash: "retry-hash" }), {
+    onLoading: () => states.push("loading"),
+    onReady: () => states.push("ready"),
+    onError: () => states.push("error"),
+  });
+  assert.deepEqual(states, ["loading", "error", "loading", "ready"]);
+});
+
+test("ignores a late glossary response after the document request is invalidated", async () => {
+  const delayed = deferred<{ hash: string }>();
+  const coordinator = createLatestGlossaryRequestCoordinator();
+  let ready = 0;
+  const running = coordinator.run(() => delayed.promise, {
+    onLoading: () => undefined,
+    onReady: () => { ready += 1; },
+    onError: () => assert.fail("stale load should be ignored"),
+  });
+  coordinator.invalidate();
+  delayed.resolve({ hash: "old-document" });
+  assert.equal(await running, "stale");
+  assert.equal(ready, 0);
+});
+
+test("does not reset edited work when an old glossary request finishes late", async () => {
+  const delayed = deferred<{ hash: string }>();
+  const coordinator = createLatestGlossaryRequestCoordinator();
+  const edited = { status: "reviewed", text: "Ročno potrjeno" };
+  const running = coordinator.run(() => delayed.promise, {
+    onLoading: () => undefined,
+    onReady: () => assert.fail("late response must not update existing work"),
+    onError: () => assert.fail("late response must not update existing work"),
+  });
+  coordinator.invalidate();
+  delayed.resolve({ hash: "late" });
+  await running;
+  assert.deepEqual(edited, { status: "reviewed", text: "Ročno potrjeno" });
 });
 
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });

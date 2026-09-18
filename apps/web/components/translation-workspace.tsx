@@ -16,7 +16,6 @@ import {
   retryFailedTranslation,
   reviewTranslation,
   updateTranslationJobSegment,
-  updateJobGlossary,
   validateTranslationJobCompatibility,
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationJob, TranslationSegment, TranslationStatus } from "../lib/translation-types";
@@ -24,7 +23,13 @@ import { useLocalTranslation } from "./use-local-translation";
 import { TranslationProfileSummary } from "./translation-profile-summary";
 import { updateTerminologySources } from "../lib/translation-profile-evaluation";
 import { GlossaryManager, type GlossaryProposal } from "./glossary-manager";
-import { createReviewedCorrectionDraft, isGlossarySnapshotStale, recordGlossaryUsage } from "../lib/persistent-glossary";
+import {
+  createReviewedCorrectionDraft,
+  isGlossarySnapshotStale,
+  recordGlossaryUsage,
+  resolveGlossarySnapshot,
+  type PersistentGlossaryLoadState,
+} from "../lib/persistent-glossary";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -37,13 +42,19 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   const recordedGlossaryUsage = useRef(new Map<string, Set<string>>());
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("sl");
-  const [glossary, setGlossary] = useState<GlossaryEntry[]>(createDefaultGlossary);
-  const [persistentGlossaryHash, setPersistentGlossaryHash] = useState("");
+  const [documentGlossary, setDocumentGlossary] = useState<GlossaryEntry[]>([]);
+  const [persistentGlossary, setPersistentGlossary] = useState<PersistentGlossaryLoadState>({ status: "loading" });
   const [glossaryProposal, setGlossaryProposal] = useState<GlossaryProposal | null>(null);
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
   const local = useLocalTranslation(job, setJob);
+  const glossary = useMemo(
+    () => resolveGlossarySnapshot(documentGlossary, persistentGlossary, createDefaultGlossary()),
+    [documentGlossary, persistentGlossary],
+  );
+  const persistentGlossaryHash = persistentGlossary.status === "ready" ? persistentGlossary.active_set_hash : "";
+  const glossaryReady = glossary !== null;
 
   useEffect(() => {
     // OCR acceptance is external review state; synchronize it before any export can reuse an old approval.
@@ -76,8 +87,11 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   const actionable = job?.segments.filter((segment) => segment.status !== "skipped").length ?? 0;
 
   function prepare() {
-    setJob(createTranslationJob(analysis, ocrItems, { source_language: sourceLanguage, target_language: targetLanguage, glossary, glossary_set_hash: persistentGlossaryHash || null }));
-    setMessage("Segmenti so pripravljeni. Prevod lahko vnesete ročno.");
+    if (!glossaryReady) return;
+    setJob(createTranslationJob(analysis, ocrItems, { source_language: sourceLanguage, target_language: targetLanguage, glossary: glossary!, glossary_set_hash: persistentGlossaryHash || null }));
+    setMessage(persistentGlossary.status === "explicitly_skipped"
+      ? "Segmenti so pripravljeni brez trajnega glosarja. Prevod zahteva posebej pozoren pregled."
+      : "Segmenti so pripravljeni. Prevod lahko vnesete ročno.");
   }
 
   function updateSegment(segmentId: string, update: (segment: TranslationSegment) => TranslationSegment) {
@@ -85,17 +99,12 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   }
 
   function changeDocumentGlossary(next: GlossaryEntry[]) {
-    const merged = [
-      ...next.map((entry) => ({ ...entry, scope: "document" as const })),
-      ...glossary.filter((entry) => entry.scope === "persistent_user"),
-      ...createDefaultGlossary(),
-    ];
-    setGlossary(merged);
-    setJob((current) => current ? updateJobGlossary(current, merged) : current);
+    setDocumentGlossary(next.map((entry) => ({ ...entry, scope: "document" as const })));
+    if (job) setMessage("Navodila dokumenta so spremenjena. Obstoječi prevodi ostajajo nespremenjeni; za nov posnetek izrecno znova pripravite prevod.");
   }
 
   function addGlossaryEntry() {
-    changeDocumentGlossary([...glossary.filter((entry) => entry.scope === "document"), {
+    changeDocumentGlossary([...documentGlossary, {
       id: `glossary-${Date.now()}`,
       source_term: "",
       target_term: "",
@@ -109,13 +118,8 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
     }]);
   }
 
-  function updatePersistentGlossary(entries: GlossaryEntry[], activeHash: string) {
-    setPersistentGlossaryHash(activeHash);
-    setGlossary((current) => [
-      ...current.filter((entry) => entry.scope === "document"),
-      ...entries,
-      ...createDefaultGlossary(),
-    ]);
+  function updatePersistentGlossary(state: PersistentGlossaryLoadState) {
+    setPersistentGlossary(state);
   }
 
   function exportJob() {
@@ -136,7 +140,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       validateTranslationJobCompatibility(imported, expected);
       const compatible = bindTranslationJobToAnalysis(imported, expected);
       setJob(compatible);
-      setGlossary(compatible.glossary);
+      setDocumentGlossary(compatible.glossary.filter((entry) => entry.scope === "document"));
       setSourceLanguage(imported.source_language);
       setTargetLanguage(imported.target_language);
       setMessage("Prevajalsko opravilo je bilo uspešno uvoženo.");
@@ -171,7 +175,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
 
       <GlossaryManager proposal={glossaryProposal} onProposalConsumed={() => setGlossaryProposal(null)} onApprovedEntriesChange={updatePersistentGlossary} />
 
-      <GlossaryEditor entries={glossary.filter((entry) => entry.scope === "document")} onChange={changeDocumentGlossary} onAdd={addGlossaryEntry} />
+      <GlossaryEditor entries={documentGlossary} onChange={changeDocumentGlossary} onAdd={addGlossaryEntry} />
 
       <div className={`translation-provider-status ${local.status?.available ? "available" : "unavailable"}`}>
         <strong>{local.status?.available ? "Lokalni prevajalnik je pripravljen" : "Lokalni prevajalnik ni nameščen"}</strong>
@@ -180,13 +184,19 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       </div>
 
       <div className="translation-actions">
-        <button className="button" onClick={prepare}>{job ? "Znova pripravi prevod" : "Pripravi prevod"}</button>
+        <button className="button" disabled={!glossaryReady} onClick={prepare}>{job ? "Znova pripravi prevod" : "Pripravi prevod"}</button>
         <button className="button secondary" disabled={!job || !local.status?.available || local.running} onClick={() => void local.translate()}>Prevedi čakajoče</button>
         <button className="button secondary" disabled={!local.running} onClick={local.cancel}>Prekliči</button>
         <button className="button secondary" disabled={!job} onClick={exportJob}>Izvozi JSON</button>
         <button className="button secondary" onClick={() => importRef.current?.click()}>Uvozi JSON</button>
         <input ref={importRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => void importJob(event.target.files?.[0] ?? null)} />
       </div>
+      {persistentGlossary.status === "loading" && <p className="translation-provider-message">Nalaganje trajnega glosarja …</p>}
+      {persistentGlossary.status === "error" && <div className="translation-error">
+        <p>{persistentGlossary.message} Prevajalsko opravilo ni bilo pripravljeno brez trajnega glosarja.</p>
+        <button className="button secondary" onClick={() => setPersistentGlossary({ status: "explicitly_skipped" })}>Nadaljuj brez trajnega glosarja</button>
+      </div>}
+      {persistentGlossary.status === "explicitly_skipped" && <p className="translation-warning">Nadaljujete brez trajnega glosarja. Uporabljena bodo samo dokumentna navodila in vgrajeni izrazi.</p>}
 
       {job && (
         <>

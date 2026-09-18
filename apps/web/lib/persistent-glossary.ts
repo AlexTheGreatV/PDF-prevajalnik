@@ -67,6 +67,59 @@ export type GlossaryFilters = {
   match_mode?: PersistentGlossaryMode | "";
 };
 
+export type PersistentGlossaryLoadState =
+  | { status: "loading" }
+  | { status: "ready"; entries: GlossaryEntry[]; active_set_hash: string }
+  | { status: "error"; message: string }
+  | { status: "explicitly_skipped" };
+
+export type LatestGlossaryRequestCoordinator = {
+  run<T>(
+    loader: () => Promise<T>,
+    handlers: {
+      onLoading: () => void;
+      onReady: (value: T) => void;
+      onError: (error: unknown) => void;
+    },
+  ): Promise<"applied" | "stale">;
+  invalidate(): void;
+};
+
+export function createLatestGlossaryRequestCoordinator(): LatestGlossaryRequestCoordinator {
+  let generation = 0;
+  return {
+    async run<T>(loader: () => Promise<T>, handlers: {
+      onLoading: () => void;
+      onReady: (value: T) => void;
+      onError: (error: unknown) => void;
+    }): Promise<"applied" | "stale"> {
+      const requestGeneration = ++generation;
+      handlers.onLoading();
+      try {
+        const value = await loader();
+        if (requestGeneration !== generation) return "stale";
+        handlers.onReady(value);
+        return "applied";
+      } catch (error) {
+        if (requestGeneration !== generation) return "stale";
+        handlers.onError(error);
+        return "applied";
+      }
+    },
+    invalidate() { generation += 1; },
+  };
+}
+
+export function resolveGlossarySnapshot(
+  documentEntries: GlossaryEntry[],
+  state: PersistentGlossaryLoadState,
+  builtInEntries: GlossaryEntry[],
+): GlossaryEntry[] | null {
+  if (state.status === "loading" || state.status === "error") return null;
+  const persistentEntries = state.status === "ready" ? state.entries : [];
+  return [...documentEntries, ...persistentEntries, ...builtInEntries].map((entry) => ({ ...entry }));
+}
+
 export const EMPTY_GLOSSARY_DRAFT: GlossaryEntryDraft = {
   source_term: "", target_term: "", source_language: "en", target_language: "sl", domain: "",
   match_mode: "preferred_term", case_sensitive: false, status: "proposed", origin: "manual",

@@ -394,7 +394,7 @@ export function PdfAnalyzer() {
       {analysis?.document && file && (
         <div className="analysis-workbench">
           <div className="analysis-workbench-main">
-            <TranslationWorkspace analysis={analysis} ocrItems={ocrItems} sourceFile={file} />
+            <TranslationWorkspace key={analysis.sha256} analysis={analysis} ocrItems={ocrItems} sourceFile={file} />
           </div>
           <aside className="document-side-preview" aria-label="Predogled PDF dokumenta">
             <h2>Predogled PDF</h2>

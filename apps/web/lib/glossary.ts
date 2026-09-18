@@ -4,7 +4,11 @@ export function orderedGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
   const priority = (entry: GlossaryEntry) => entry.scope === "document" ? 3 : entry.scope === "persistent_user" ? 2 : entry.origin === "user" ? 2 : 1;
   return [...entries]
     .filter((entry) => entry.status === undefined || entry.status === "approved")
-    .sort((a, b) => priority(b) - priority(a));
+    .sort((a, b) =>
+      priority(b) - priority(a) ||
+      b.source_term.trim().length - a.source_term.trim().length ||
+      a.id.localeCompare(b.id),
+    );
 }
 
 export function findExactSegmentGlossaryMatch(text: string, glossary: GlossaryEntry[]): GlossaryEntry | null {

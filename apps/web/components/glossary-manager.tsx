@@ -6,6 +6,7 @@ import { createDefaultGlossary } from "../lib/default-glossary";
 import {
   EMPTY_GLOSSARY_DRAFT,
   confirmGlossaryCsv,
+  createLatestGlossaryRequestCoordinator,
   createGlossaryEntry,
   getGlossaryHistory,
   getGlossaryStatus,
@@ -20,9 +21,8 @@ import {
   type GlossaryHistoryRecord,
   type GlossaryImportPreview,
   type PersistentGlossaryEntry,
+  type PersistentGlossaryLoadState,
 } from "../lib/persistent-glossary";
-import type { GlossaryEntry } from "../lib/translation-types";
-
 export type GlossaryProposal = {
   key: string;
   source_term: string;
@@ -35,9 +35,10 @@ export type GlossaryProposal = {
 export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntriesChange }: {
   proposal: GlossaryProposal | null;
   onProposalConsumed: () => void;
-  onApprovedEntriesChange: (entries: GlossaryEntry[], activeHash: string) => void;
+  onApprovedEntriesChange: (state: PersistentGlossaryLoadState) => void;
 }) {
   const importRef = useRef<HTMLInputElement | null>(null);
+  const loadCoordinator = useRef(createLatestGlossaryRequestCoordinator());
   const [tab, setTab] = useState<"overview" | "import">("overview");
   const [entries, setEntries] = useState<PersistentGlossaryEntry[]>([]);
   const [total, setTotal] = useState(0);
@@ -72,7 +73,11 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
     )).map((entry) => entry.id));
   }, [builtIns, entries]);
 
-  useEffect(() => { void refresh(); }, [filters]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const coordinator = loadCoordinator.current;
+    void refresh();
+    return () => coordinator.invalidate();
+  }, [filters]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!proposal) return;
     let active = true;
@@ -86,23 +91,38 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
   }, [proposal]);
 
   async function refresh() {
-    try {
+    await loadCoordinator.current.run(async () => {
       const status = await getGlossaryStatus();
       if (!status.available) throw new Error(status.message ?? "Trajni lokalni glosar ni na voljo.");
       const [visible, approved] = await Promise.all([
         listGlossaryEntries(filters),
         listGlossaryEntries({ source_language: "en", target_language: "sl", status: "approved" }),
       ]);
-      setAvailable(true);
-      setEntries(visible.entries);
-      setTotal(visible.total);
-      onApprovedEntriesChange(approved.entries.map(persistentToRuntimeEntry), approved.active_set_hash);
-      setMessage(visible.total ? "" : "Ni lokalnih vnosov za izbrane filtre.");
-    } catch (error) {
-      setAvailable(false);
-      setMessage(error instanceof Error ? error.message : "Trajni lokalni glosar ni na voljo.");
-      onApprovedEntriesChange([], "");
-    }
+      return { visible, approved };
+    }, {
+      onLoading: () => {
+        setAvailable(null);
+        setMessage("Nalaganje trajnega glosarja …");
+        onApprovedEntriesChange({ status: "loading" });
+      },
+      onReady: ({ visible, approved }) => {
+        setAvailable(true);
+        setEntries(visible.entries);
+        setTotal(visible.total);
+        onApprovedEntriesChange({
+          status: "ready",
+          entries: approved.entries.map(persistentToRuntimeEntry),
+          active_set_hash: approved.active_set_hash,
+        });
+        setMessage(visible.total ? "" : "Ni lokalnih vnosov za izbrane filtre.");
+      },
+      onError: (error) => {
+        const errorMessage = error instanceof Error ? error.message : "Trajni lokalni glosar ni na voljo.";
+        setAvailable(false);
+        setMessage(errorMessage);
+        onApprovedEntriesChange({ status: "error", message: errorMessage });
+      },
+    });
   }
 
   function newEntry() {
@@ -175,6 +195,7 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
       <button className={tab === "import" ? "active" : ""} onClick={() => setTab("import")}>Uvoz in izvoz</button>
     </div>
     {message && <p className={available === false ? "translation-error" : "translation-provider-message"}>{message}</p>}
+    {available === false && <button className="button secondary" onClick={() => void refresh()}>Poskusi znova</button>}
 
     {tab === "overview" && <>
       <div className="glossary-toolbar">

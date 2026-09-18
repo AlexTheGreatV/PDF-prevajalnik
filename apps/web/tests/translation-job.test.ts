@@ -316,6 +316,124 @@ test("finds glossary rules and restores target and do-not-translate terms", () =
   assert.equal(protectedValue.tokens.find((token) => token.value === "Panel Bond")?.value, "Panel Bond");
 });
 
+test("protects complete do-not-translate names before technical values", async () => {
+  const glossary: GlossaryEntry[] = [{
+    id: "product-name",
+    source_term: "ACME MS 65 Panel Bond",
+    target_term: "ACME MS 65 Panel Bond",
+    case_sensitive: false,
+    mode: "do_not_translate",
+    enabled: true,
+    origin: "user",
+    scope: "persistent_user",
+    revision: 2,
+  }];
+  const source = "Acme MS 65 Panel Bond";
+  for (const value of ["ACME MS 65 Panel Bond", source]) {
+    for (const strategy of ["primary_tk", "retry_phx"] as const) {
+      const protectedValue = protectForTranslation(value, glossary, strategy);
+      assert.equal(protectedValue.tokens.filter((token) => token.kind === "glossary").length, 1);
+      assert.equal(protectedValue.tokens.filter((token) => token.kind !== "glossary").length, 0);
+      assert.equal(restoreProtectedTokens(protectedValue.protected_text, protectedValue.tokens), value);
+    }
+  }
+
+  const sentence = protectForTranslation(`${source} at 2.5 MPa.`, glossary);
+  assert.equal(sentence.tokens.filter((token) => token.kind === "glossary").length, 1);
+  assert.equal(sentence.tokens.filter((token) => token.kind === "measurement").length, 1);
+  assert.equal(restoreProtectedTokens(sentence.protected_text, sentence.tokens), `${source} at 2,5\u00a0MPa.`);
+
+  const analysis = fixture();
+  analysis.document!.pages[0].regions[1].blocks = [
+    block(1, "heading", source),
+    block(2, "paragraph", "Panel adhesive"),
+  ];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl", glossary });
+  const provider = new DeterministicProvider((text) => text.includes("Panel adhesive") ? "Panelno lepilo" : text);
+  const translated = await translateJobBatch(job, provider);
+  const product = translated.segments.find((segment) => segment.source_text === source)!;
+  const description = translated.segments.find((segment) => segment.source_text === "Panel adhesive")!;
+  assert.equal(product.translated_text, source);
+  assert.equal(product.status, "translated");
+  assert.equal(product.needs_review, true);
+  assert.equal(product.source_text, source);
+  assert.equal(product.source_text_origin, "native");
+  assert.equal(product.accepted_ocr_source, null);
+  assert.equal(product.glossary_matches[0].glossary_id, "product-name");
+  assert.equal(product.glossary_matches[0].revision, 2);
+  assert.equal(translated.glossary_usage.find((usage) => usage.glossary_id === "product-name")?.revision, 2);
+  assert.equal(description.translated_text, "Panelno lepilo");
+  assert.equal(description.glossary_matches.length, 0);
+});
+
+test("uses longest glossary match within precedence and keeps placeholder namespaces isolated", () => {
+  const glossary: GlossaryEntry[] = [
+    { id: "short", source_term: "ACME", target_term: "", case_sensitive: false, mode: "do_not_translate", enabled: true, origin: "user", scope: "persistent_user" },
+    { id: "long", source_term: "ACME MS 65 Panel Bond", target_term: "", case_sensitive: false, mode: "do_not_translate", enabled: true, origin: "user", scope: "persistent_user" },
+  ];
+  const source = "ACME MS 65 Panel Bond at 2.5 MPa";
+  const protectedValue = protectForTranslation(source, glossary);
+  const glossaryTokens = protectedValue.tokens.filter((token) => token.kind === "glossary");
+  const technicalTokens = protectedValue.tokens.filter((token) => token.kind !== "glossary");
+  assert.deepEqual(glossaryTokens.map((token) => token.value), ["ACME MS 65 Panel Bond"]);
+  assert.match(glossaryTokens[0].placeholder, /^GLS\d+GLS$/);
+  assert.ok(technicalTokens.every((token) => /^TK\d+TK$/.test(token.placeholder)));
+  assert.ok(!technicalTokens.some((token) => token.placeholder === glossaryTokens[0].placeholder));
+  assert.equal(restoreProtectedTokens(protectedValue.protected_text, protectedValue.tokens), "ACME MS 65 Panel Bond at 2,5\u00a0MPa");
+});
+
+test("preserves literal placeholder-like text and rejects damaged generated placeholders", () => {
+  const glossary: GlossaryEntry[] = [{
+    id: "keep", source_term: "ACME MS 65 Panel Bond", target_term: "", case_sensitive: true,
+    mode: "do_not_translate", enabled: true, origin: "user", scope: "persistent_user",
+  }];
+  const literal = "TK000TK GLS000GLS GPH000HPG PHX000XHP";
+  const literalProtected = protectForTranslation(literal, []);
+  assert.equal(restoreProtectedTokens(literalProtected.protected_text, literalProtected.tokens), literal);
+
+  const protectedValue = protectForTranslation(`GLS000GLS ACME MS 65 Panel Bond at 2.5 MPa`, glossary);
+  const glossaryToken = protectedValue.tokens.find((token) => token.kind === "glossary")!;
+  const technicalToken = protectedValue.tokens.find((token) => token.kind !== "glossary")!;
+  assert.notEqual(glossaryToken.placeholder, "GLS000GLS");
+  assert.throws(() => restoreProtectedTokens(protectedValue.protected_text.replace(glossaryToken.placeholder, ""), protectedValue.tokens), /slovarski placeholder/);
+  assert.throws(() => restoreProtectedTokens(`${protectedValue.protected_text} ${glossaryToken.placeholder}`, protectedValue.tokens), /slovarski placeholder/);
+  assert.throws(() => restoreProtectedTokens(protectedValue.protected_text.replace(technicalToken.placeholder, ""), protectedValue.tokens), /tehnični placeholder/);
+  assert.throws(() => restoreProtectedTokens(`${protectedValue.protected_text} ${technicalToken.placeholder}`, protectedValue.tokens), /tehnični placeholder/);
+});
+
+test("exact glossary results cannot remove or change technical values", () => {
+  const source = "Specification 65, 2.5 MPa, 20 L, RAL 9001";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions[1].blocks = [block(1, "paragraph", source)];
+  const entry = (target_term: string): GlossaryEntry => ({
+    id: "technical-exact", source_term: source, target_term, case_sensitive: true,
+    mode: "exact_segment", enabled: true, origin: "user", scope: "persistent_user", revision: 3,
+  });
+
+  const valid = createTranslationJob(analysis, [], {
+    source_language: "en", target_language: "sl", glossary: [entry("Specifikacija 65, 2.5 MPa, 20 L, RAL 9001")],
+  }).segments.find((segment) => segment.source_text === source)!;
+  assert.equal(valid.status, "translated");
+  assert.equal(valid.translated_text, "Specifikacija 65, 2,5\u00a0MPa, 20\u00a0L, RAL 9001");
+  assert.equal(valid.needs_review, true);
+
+  const invalid = createTranslationJob(analysis, [], {
+    source_language: "en", target_language: "sl", glossary: [entry("Specifikacija 2.5 MPa, 10 L, RAL 9001")],
+  }).segments.find((segment) => segment.source_text === source)!;
+  assert.equal(invalid.status, "failed");
+  assert.equal(invalid.translated_text, "");
+  assert.equal(invalid.edited_translation, "");
+  assert.equal(invalid.needs_review, true);
+  assert.ok(invalid.warnings.includes("glossary_technical_integrity"));
+  assert.match(invalid.error ?? "", /tehničnih vrednosti/);
+
+  const locked = protectForTranslation("Use strength 2.5 MPa.", [{
+    id: "invalid-inline", source_term: "strength 2.5 MPa", target_term: "trdnost 1 MPa",
+    case_sensitive: true, mode: "locked_inline", enabled: true, origin: "user", scope: "document",
+  }]);
+  assert.throws(() => restoreProtectedTokens(locked.protected_text, locked.tokens), /tehničnih vrednosti/);
+});
+
 test("manual edit, review and reset never change source text", () => {
   const segment = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" }).segments[0];
   const edited = editTranslation(segment, "UPORABA");
@@ -553,15 +671,16 @@ test("only approved persistent entries affect a newly prepared job", () => {
 test("preferred glossary is advisory while do-not-translate and locked-inline are explicit", async () => {
   const glossary: GlossaryEntry[] = [
     { id: "preferred", source_term: "Panel", target_term: "plošča", case_sensitive: true, mode: "preferred", enabled: true, origin: "user" },
-    { id: "keep", source_term: "Zettex", target_term: "", case_sensitive: true, mode: "do_not_translate", enabled: true, origin: "user" },
+    { id: "keep", source_term: "ACME", target_term: "", case_sensitive: true, mode: "do_not_translate", enabled: true, origin: "user" },
     { id: "locked", source_term: "Fast curing", target_term: "hitro utrjevanje", case_sensitive: true, mode: "locked_inline", enabled: true, origin: "user" },
   ];
   const advisory = protectForTranslation("Panel", glossary);
   assert.equal(advisory.protected_text, "Panel");
   assert.equal(advisory.tokens.length, 0);
-  const protectedValue = protectForTranslation("Zettex Fast curing", glossary);
-  assert.match(protectedValue.protected_text, /GLS\d{3}GLS/);
-  assert.equal(restoreProtectedTokens(protectedValue.protected_text, protectedValue.tokens), "Zettex hitro utrjevanje");
+  const protectedValue = protectForTranslation("ACME Fast curing", glossary);
+  assert.doesNotMatch(protectedValue.protected_text, /ACME|Fast curing/);
+  assert.equal(protectedValue.tokens.filter((token) => token.kind === "glossary").length, 2);
+  assert.equal(restoreProtectedTokens(protectedValue.protected_text, protectedValue.tokens), "ACME hitro utrjevanje");
 
   const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl", glossary });
   const translated = await translateJobBatch(job, new DeterministicProvider());
