@@ -25,6 +25,7 @@ import {
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationProvider, TranslationProviderResult, TranslationRequest } from "../lib/translation-types";
 import { updateTerminologySources } from "../lib/translation-profile-evaluation";
+import type { TranslationMemoryEntry } from "../lib/translation-memory";
 
 const tests: Promise<void>[] = [];
 function test(name: string, run: () => void | Promise<void>) {
@@ -66,6 +67,17 @@ function acceptedManualOcr(): OcrReviewItem {
   return { ...acceptedOcr(), id: "manual-ocr", linked_block_reading_order: undefined, source: "manual", reason: "manual_selection", native_text: "", ocr_text: "Warranty period", effective_text: "Warranty period", pdf_bbox: { x0: 20, y0: 20, x1: 70, y1: 35 } };
 }
 
+function tmEntry(source_text: string, target_text: string, changes: Partial<TranslationMemoryEntry> = {}): TranslationMemoryEntry {
+  return {
+    id: "tm-1", source_text, target_text, normalized_source: source_text.normalize("NFC").trim(),
+    normalized_source_sha256: "b".repeat(64), source_language: "en", target_language: "sl",
+    domain: "", status: "approved", origin: "manual_review", source_document_sha256: null,
+    source_segment_id: null, source_kind: "native", note: "", revision: 2,
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    approved_at: "2026-01-01T00:00:00Z", usage_count: 0, last_used_at: null, ...changes,
+  };
+}
+
 class DeterministicProvider implements TranslationProvider {
   readonly id = "test-only";
   calls = 0;
@@ -100,6 +112,99 @@ test("uses accepted OCR effective text and retains native origin otherwise", () 
   assert.equal(ocr.source_text, "APPLICATIONS");
   assert.equal(ocr.source_text_origin, "accepted_ocr");
   assert.equal(acceptedOcr().native_text, "qPPLICATIONS");
+});
+
+test("uses normalized native text for translation without changing the document original", () => {
+  const analysis = fixture();
+  const sourceBlock = analysis.document!.pages[0].regions[1].blocks[0];
+  sourceBlock.original_text = "moisture-\ncuring polymer";
+  sourceBlock.normalized_text = "moisture-curing polymer";
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  assert.equal(job.segments.find((segment) => segment.block_id === "p1-r2-b2")?.source_text, "moisture-curing polymer");
+  assert.equal(sourceBlock.original_text, "moisture-\ncuring polymer");
+});
+
+test("uses an approved exact translation memory snapshot without auto review", () => {
+  const source = "Fast curing";
+  const entry = tmEntry(source, "Hitro strjevanje");
+  const job = createTranslationJob(fixture(), [], {
+    source_language: "en", target_language: "sl", translation_memory: [entry], translation_memory_set_hash: "tm-hash",
+  });
+  const segment = job.segments.find((item) => item.source_text === source)!;
+  assert.equal(segment.edited_translation, "Hitro strjevanje");
+  assert.equal(segment.translation_origin, "translation_memory");
+  assert.equal(segment.translation_memory_entry_id, entry.id);
+  assert.equal(segment.translation_memory_revision, 2);
+  assert.equal(segment.status, "translated");
+  assert.equal(segment.needs_review, true);
+  assert.notEqual(segment.status, "reviewed");
+  assert.equal(job.translation_memory_usage[0].entry_id, entry.id);
+});
+
+test("document exact glossary has priority over translation memory", () => {
+  const source = "Fast curing";
+  const glossary: GlossaryEntry[] = [{
+    id: "document", source_term: source, target_term: "Dokumentni prevod", case_sensitive: true,
+    mode: "exact_segment", enabled: true, origin: "user", scope: "document", status: "approved",
+  }];
+  const job = createTranslationJob(fixture(), [], {
+    source_language: "en", target_language: "sl", glossary,
+    translation_memory: [tmEntry(source, "Prevod spomina")],
+  });
+  const segment = job.segments.find((item) => item.source_text === source)!;
+  assert.equal(segment.translation_origin, "glossary");
+  assert.equal(segment.edited_translation, "Dokumentni prevod");
+  assert.equal(segment.translation_memory_entry_id, null);
+});
+
+test("rejects a technically invalid memory result and falls back to the provider with provenance", async () => {
+  const source = "Use CO₂ at +25 °C and 2.5 MPa with 50 % coverage.";
+  const entry = tmEntry(source, "Uporabite pri +20 °C in 3 MPa.");
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl", translation_memory: [entry] });
+  const prepared = job.segments.find((item) => item.source_text === source)!;
+  assert.equal(prepared.status, "pending");
+  assert.equal(prepared.translation_origin, null);
+  assert.match(prepared.warnings.join("\n"), new RegExp(`translation_memory_rejected:${entry.id}:rev:${entry.revision}:technical_integrity`));
+  assert.equal(job.translation_memory_usage.length, 0);
+  const translated = await translateJobBatch(job, new DeterministicProvider((text) => text));
+  const segment = translated.segments.find((item) => item.source_text === source)!;
+  assert.equal(segment.status, "translated");
+  assert.equal(segment.translation_origin, "provider");
+  assert.equal(segment.translation_memory_entry_id, null);
+  assert.match(segment.warnings.join("\n"), new RegExp(`translation_memory_rejected:${entry.id}:rev:${entry.revision}:technical_integrity`));
+  assert.equal(translated.translation_memory_usage.length, 0);
+});
+
+test("preserves mixed TM plus provider provenance for three deterministic sentence chunks", async () => {
+  const analysis = fixture();
+  const source = "Apply the product. Keep the surface clean. Allow it to dry.";
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", source)],
+  }];
+  const provider = new DeterministicProvider((_text, index) => index === 0 ? "Površina naj ostane čista." : "Pustite, da se posuši.");
+  const job = createTranslationJob(analysis, [], {
+    source_language: "en", target_language: "sl",
+    translation_memory: [tmEntry("Apply the product.", "Nanesite izdelek.")],
+  });
+  const translated = await translateJobBatch(job, provider);
+  assert.equal(provider.requests.flat().length, 2);
+  const segment = translated.segments[0];
+  assert.equal(segment.edited_translation, "Nanesite izdelek. Površina naj ostane čista. Pustite, da se posuši.");
+  assert.equal(segment.status, "translated");
+  assert.equal(segment.translation_origin, "mixed");
+  assert.equal(segment.needs_review, true);
+  assert.deepEqual(segment.chunks.map((chunk) => chunk.translation_origin), ["translation_memory", "provider", "provider"]);
+  assert.equal(segment.chunks[0].translation_memory_entry_id, "tm-1");
+  assert.equal(segment.chunks[0].translation_memory_revision, 2);
+  assert.equal(segment.chunks[0].translation_memory_match, "exact");
+  assert.equal(segment.chunks[0].translation_memory_domain, "");
+  assert.ok(segment.chunks.slice(1).every((chunk) => !chunk.translation_memory_entry_id));
+  assert.equal(translated.translation_memory_usage[0].entry_id, "tm-1");
+  assert.equal(translated.translation_memory_usage.length, 1);
+  const roundTrip = importTranslationJob(exportTranslationJob(translated));
+  assert.equal(roundTrip.segments[0].translation_origin, "mixed");
+  assert.deepEqual(roundTrip.segments[0].chunks.map((chunk) => chunk.translation_origin), ["translation_memory", "provider", "provider"]);
 });
 
 test("adds an accepted manual OCR region as a separate unreviewed translation segment", () => {
@@ -474,7 +579,7 @@ test("JSON roundtrip retains work and rejects unsupported versions", () => {
   const job = { ...base, segments: base.segments.map((segment, index) => index === 0 ? reviewTranslation(editTranslation(segment, "UPORABA")) : segment) };
   assert.deepEqual(importTranslationJob(exportTranslationJob(job)), job);
   assert.throws(() => importTranslationJob("not-json"), /veljaven JSON/);
-  assert.throws(() => importTranslationJob('{"schema_version":7}'), /ni podprta/);
+  assert.throws(() => importTranslationJob('{"schema_version":9}'), /ni podprta/);
 });
 
 test("schema four import stays compatible without claiming the new profile", () => {
@@ -484,7 +589,7 @@ test("schema four import stays compatible without claiming the new profile", () 
   delete legacy.translation_profile;
   delete legacy.quality_checklist;
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 6);
+  assert.equal(migrated.schema_version, 8);
   assert.equal(migrated.translation_profile, null);
   assert.deepEqual(migrated.quality_checklist, []);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
@@ -738,7 +843,7 @@ test("schema one import migrates explicitly and retains immutable source identit
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 6);
+  assert.equal(migrated.schema_version, 8);
   assert.equal(migrated.glossary[0].mode, "do_not_translate");
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.glossary_snapshot, migrated.glossary);
@@ -847,9 +952,46 @@ test("schema two job migrates chunk fields without changing source identity", ()
     return legacySegment;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 6);
+  assert.equal(migrated.schema_version, 8);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.segments[0].chunks, []);
+});
+
+test("schema seven mixed chunks migrate without inventing TM provenance", async () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", "Apply the product. Keep the surface clean.")],
+  }];
+  const translated = await translateJobBatch(createTranslationJob(analysis, [], {
+    source_language: "en", target_language: "sl",
+    translation_memory: [tmEntry("Apply the product.", "Nanesite izdelek.")],
+  }), new DeterministicProvider(() => "Površina naj ostane čista."));
+  const legacy = JSON.parse(exportTranslationJob(translated)) as Record<string, unknown>;
+  legacy.schema_version = 7;
+  legacy.segments = (legacy.segments as Array<Record<string, unknown>>).map((segment) => ({
+    ...segment,
+    translation_origin: segment.translation_origin === "mixed" ? "provider" : segment.translation_origin,
+    chunks: (segment.chunks as Array<Record<string, unknown>>).map((chunk) => {
+      const copy = { ...chunk };
+      delete copy.translation_origin;
+      delete copy.translation_memory_match;
+      return copy;
+    }),
+  }));
+  const migrated = importTranslationJob(JSON.stringify(legacy));
+  assert.equal(migrated.schema_version, 8);
+  assert.equal(migrated.segments[0].translation_origin, "mixed");
+  assert.deepEqual(migrated.segments[0].chunks.map((chunk) => chunk.translation_origin), ["translation_memory", "provider"]);
+});
+
+test("unknown future schema and provenance are rejected rather than silently discarded", () => {
+  const current = JSON.parse(exportTranslationJob(createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" }))) as Record<string, unknown>;
+  current.schema_version = 99;
+  assert.throws(() => importTranslationJob(JSON.stringify(current)), /Različica/);
+  const malformed = JSON.parse(exportTranslationJob(createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" }))) as Record<string, unknown>;
+  (malformed.segments as Array<Record<string, unknown>>)[0].translation_origin = "future_origin";
+  assert.throws(() => importTranslationJob(JSON.stringify(malformed)), /neveljaven prevajalski segment/);
 });
 
 test("schema three job migrates without inventing identity and can be safely rebound", () => {
@@ -863,7 +1005,7 @@ test("schema three job migrates without inventing identity and can be safely reb
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 6);
+  assert.equal(migrated.schema_version, 8);
   assert.equal(migrated.document_identity, null);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   const rebound = bindTranslationJobToAnalysis(migrated, current);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
@@ -30,6 +30,14 @@ import {
   resolveGlossarySnapshot,
   type PersistentGlossaryLoadState,
 } from "../lib/persistent-glossary";
+import {
+  canInitializeTranslationJob,
+  createTranslationMemoryDraft,
+  isTranslationMemorySnapshotStale,
+  recordTranslationMemoryUsage,
+  type TranslationMemoryLoadState,
+} from "../lib/translation-memory";
+import { TranslationMemoryManager, type TranslationMemoryProposal } from "./translation-memory-manager";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -40,11 +48,16 @@ const FILTER_LABELS: Record<(typeof FILTERS)[number], string> = {
 export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analysis: PdfAnalysis; ocrItems: OcrReviewItem[]; sourceFile: File }) {
   const importRef = useRef<HTMLInputElement | null>(null);
   const recordedGlossaryUsage = useRef(new Map<string, Set<string>>());
+  const recordedTranslationMemoryUsage = useRef(new Map<string, Set<string>>());
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("sl");
+  const [translationDomain, setTranslationDomain] = useState("");
   const [documentGlossary, setDocumentGlossary] = useState<GlossaryEntry[]>([]);
   const [persistentGlossary, setPersistentGlossary] = useState<PersistentGlossaryLoadState>({ status: "loading" });
   const [glossaryProposal, setGlossaryProposal] = useState<GlossaryProposal | null>(null);
+  const [translationMemory, setTranslationMemory] = useState<TranslationMemoryLoadState>({ status: "loading" });
+  const [translationMemoryReloadRequest, setTranslationMemoryReloadRequest] = useState(0);
+  const [translationMemoryProposal, setTranslationMemoryProposal] = useState<TranslationMemoryProposal | null>(null);
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
@@ -55,6 +68,8 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   );
   const persistentGlossaryHash = persistentGlossary.status === "ready" ? persistentGlossary.active_set_hash : "";
   const glossaryReady = glossary !== null;
+  const translationMemoryReady = canInitializeTranslationJob(true, persistentGlossary.status, translationMemory.status);
+  const translationMemoryHash = translationMemory.status === "ready" ? translationMemory.active_set_hash : "";
 
   useEffect(() => {
     // OCR acceptance is external review state; synchronize it before any export can reuse an old approval.
@@ -79,6 +94,17 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
     });
   }, [job]);
 
+  useEffect(() => {
+    if (!job) return;
+    const jobKey = `${job.created_at}:${job.document_identity?.sha256 ?? job.source_filename}`;
+    const recorded = recordedTranslationMemoryUsage.current.get(jobKey) ?? new Set<string>();
+    const pending = job.translation_memory_usage.map((usage) => usage.entry_id).filter((entryId) => !recorded.has(entryId));
+    if (!pending.length) return;
+    pending.forEach((entryId) => recorded.add(entryId));
+    recordedTranslationMemoryUsage.current.set(jobKey, recorded);
+    void recordTranslationMemoryUsage(pending).catch(() => pending.forEach((entryId) => recorded.delete(entryId)));
+  }, [job]);
+
   const visibleSegments = useMemo(
     () => job?.segments.filter((segment) => filter === "all" || segment.status === filter) ?? [],
     [job, filter],
@@ -87,8 +113,16 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   const actionable = job?.segments.filter((segment) => segment.status !== "skipped").length ?? 0;
 
   function prepare() {
-    if (!glossaryReady) return;
-    setJob(createTranslationJob(analysis, ocrItems, { source_language: sourceLanguage, target_language: targetLanguage, glossary: glossary!, glossary_set_hash: persistentGlossaryHash || null }));
+    if (!glossaryReady || !translationMemoryReady) return;
+    setJob(createTranslationJob(analysis, ocrItems, {
+      source_language: sourceLanguage,
+      target_language: targetLanguage,
+      glossary: glossary!,
+      glossary_set_hash: persistentGlossaryHash || null,
+      translation_memory: translationMemory.status === "ready" ? translationMemory.entries : [],
+      translation_memory_set_hash: translationMemory.status === "ready" ? translationMemory.active_set_hash : null,
+      domain: translationDomain,
+    }));
     setMessage(persistentGlossary.status === "explicitly_skipped"
       ? "Segmenti so pripravljeni brez trajnega glosarja. Prevod zahteva posebej pozoren pregled."
       : "Segmenti so pripravljeni. Prevod lahko vnesete ročno.");
@@ -136,13 +170,22 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
     if (!file) return;
     try {
       const imported = importTranslationJob(await file.text());
-      const expected = createTranslationJob(analysis, ocrItems, { source_language: imported.source_language, target_language: imported.target_language, glossary: imported.glossary, created_at: imported.created_at });
+      const expected = createTranslationJob(analysis, ocrItems, {
+        source_language: imported.source_language,
+        target_language: imported.target_language,
+        glossary: imported.glossary,
+        translation_memory: imported.translation_memory_snapshot,
+        translation_memory_set_hash: imported.translation_memory_set_hash,
+        domain: imported.domain,
+        created_at: imported.created_at,
+      });
       validateTranslationJobCompatibility(imported, expected);
       const compatible = bindTranslationJobToAnalysis(imported, expected);
       setJob(compatible);
       setDocumentGlossary(compatible.glossary.filter((entry) => entry.scope === "document"));
       setSourceLanguage(imported.source_language);
       setTargetLanguage(imported.target_language);
+      setTranslationDomain(imported.domain);
       setMessage("Prevajalsko opravilo je bilo uspešno uvoženo.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Uvoz prevajalskega opravila ni uspel.");
@@ -150,6 +193,8 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       if (importRef.current) importRef.current.value = "";
     }
   }
+
+  const updateTranslationMemory = useCallback((state: TranslationMemoryLoadState) => setTranslationMemory(state), []);
 
   return (
     <section className="translation-workspace">
@@ -170,10 +215,15 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
               <option value="sl">Slovenščina</option><option value="en">English</option><option value="de">Deutsch</option>
             </select>
           </label>
+          <label>Področje (neobvezno)
+            <input value={translationDomain} onChange={(event) => setTranslationDomain(event.target.value)} disabled={Boolean(job)} placeholder="npr. construction_adhesives" />
+          </label>
         </div>
       </div>
 
       <GlossaryManager proposal={glossaryProposal} onProposalConsumed={() => setGlossaryProposal(null)} onApprovedEntriesChange={updatePersistentGlossary} />
+
+      <TranslationMemoryManager proposal={translationMemoryProposal} reloadRequest={translationMemoryReloadRequest} onProposalConsumed={() => setTranslationMemoryProposal(null)} onApprovedEntriesChange={updateTranslationMemory} />
 
       <GlossaryEditor entries={documentGlossary} onChange={changeDocumentGlossary} onAdd={addGlossaryEntry} />
 
@@ -184,7 +234,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       </div>
 
       <div className="translation-actions">
-        <button className="button" disabled={!glossaryReady} onClick={prepare}>{job ? "Znova pripravi prevod" : "Pripravi prevod"}</button>
+        <button className="button" disabled={!glossaryReady || !translationMemoryReady} onClick={prepare}>{job ? "Znova pripravi prevod" : "Pripravi prevod"}</button>
         <button className="button secondary" disabled={!job || !local.status?.available || local.running} onClick={() => void local.translate()}>Prevedi čakajoče</button>
         <button className="button secondary" disabled={!local.running} onClick={local.cancel}>Prekliči</button>
         <button className="button secondary" disabled={!job} onClick={exportJob}>Izvozi JSON</button>
@@ -197,6 +247,13 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
         <button className="button secondary" onClick={() => setPersistentGlossary({ status: "explicitly_skipped" })}>Nadaljuj brez trajnega glosarja</button>
       </div>}
       {persistentGlossary.status === "explicitly_skipped" && <p className="translation-warning">Nadaljujete brez trajnega glosarja. Uporabljena bodo samo dokumentna navodila in vgrajeni izrazi.</p>}
+      {translationMemory.status === "loading" && <p className="translation-provider-message">Nalaganje prevajalskega spomina …</p>}
+      {translationMemory.status === "error" && <div className="translation-error">
+        <p>{translationMemory.message} Prevajalsko opravilo še ni pripravljeno s preverjenim posnetkom TM.</p>
+        <button className="button secondary" onClick={() => setTranslationMemoryReloadRequest((value) => value + 1)}>Poskusi znova</button>
+        <button className="button secondary" onClick={() => setTranslationMemory({ status: "explicitly_skipped" })}>Nadaljuj brez prevajalskega spomina</button>
+      </div>}
+      {translationMemory.status === "explicitly_skipped" && <p className="translation-warning">Nadaljujete brez lokalnega prevajalskega spomina.</p>}
 
       {job && (
         <>
@@ -211,6 +268,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
             onTerminologySourcesChange={(sources) => setJob((current) => current ? updateTerminologySources(current, sources) : current)}
           />
           {isGlossarySnapshotStale(job, persistentGlossaryHash) && <p className="translation-warning">Glosar je bil po prevodu spremenjen. Obstoječi prevodi ostajajo nespremenjeni; za uporabo novega nabora izrecno znova pripravite prevod.</p>}
+          {isTranslationMemorySnapshotStale(job, translationMemoryHash) && <p className="translation-warning">Prevajalski spomin je bil po pripravi opravila spremenjen. Odprti prevodi ostajajo nespremenjeni; nov posnetek se uporabi šele ob izrecni ponovni pripravi.</p>}
           <PdfExportPanel sourceFile={sourceFile} job={job} analysis={analysis} ocrItems={ocrItems} />
           <div className="translation-filters" aria-label="Filtri prevodov">
             {FILTERS.map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{FILTER_LABELS[value]}</button>)}
@@ -222,7 +280,8 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
                 onReview={() => updateSegment(segment.segment_id, reviewTranslation)}
                 onReset={() => updateSegment(segment.segment_id, resetTranslation)}
                 onRetry={() => updateSegment(segment.segment_id, retryFailedTranslation)}
-                onPropose={() => setGlossaryProposal({ key: `${segment.segment_id}-${Date.now()}`, ...createReviewedCorrectionDraft(segment) })} />
+                onPropose={() => setGlossaryProposal({ key: `${segment.segment_id}-${Date.now()}`, ...createReviewedCorrectionDraft(segment) })}
+                onProposeMemory={() => job && setTranslationMemoryProposal({ key: `${segment.segment_id}-${Date.now()}`, ...createTranslationMemoryDraft(segment, job) })} />
             ))}
             {visibleSegments.length === 0 && <p>V tem filtru ni segmentov.</p>}
           </div>
@@ -232,14 +291,14 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   );
 }
 
-function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, onPropose }: {
-  segment: TranslationSegment; onEdit: (text: string) => void; onReview: () => void; onReset: () => void; onRetry: () => void; onPropose: () => void;
+function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, onPropose, onProposeMemory }: {
+  segment: TranslationSegment; onEdit: (text: string) => void; onReview: () => void; onReset: () => void; onRetry: () => void; onPropose: () => void; onProposeMemory: () => void;
 }) {
   return (
     <article className={`translation-segment translation-${segment.status}`}>
       <header>
         <strong>Stran {segment.page_number} · {segment.block_type}</strong>
-        <span>{segment.status} · besedilo: {segment.source_text_origin === "accepted_ocr" ? "potrjeni OCR" : "native"} · prevod: {segment.translation_origin ?? "še ni"}</span>
+        <span>{segment.status} · besedilo: {segment.source_text_origin === "accepted_ocr" ? "potrjeni OCR" : "native"} · prevod: {segment.translation_origin === "mixed" ? "mešano (TM + lokalni model)" : segment.translation_origin ?? "še ni"}</span>
       </header>
       <div className="translation-columns">
         <div><h3>Izvorno</h3><pre>{segment.source_text || "Ni izvornega besedila."}</pre></div>
@@ -249,15 +308,17 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
       </div>
       {segment.glossary_matches.length > 0 && <div className="glossary-matches">Slovar: {segment.glossary_matches.map((match) => `${match.matched_text} → ${match.mode === "do_not_translate" ? "ne prevajaj" : match.target_term} (${match.mode})`).join(", ")}</div>}
       {segment.glossary_entry_id && <div className="translation-origin">Uporabljen slovarski vnos: {segment.glossary_entry_id}</div>}
+      {segment.translation_memory_entry_id && <div className="translation-origin">Prevajalski spomin: {segment.translation_memory_entry_id} · rev. {segment.translation_memory_revision} · exact</div>}
       {segment.model_id && <div className="translation-origin">Model: {segment.model_id}</div>}
       {segment.needs_review && <p className="translation-warning">Potreben je ročni pregled.</p>}
       {segment.warnings.length > 0 && <div className="translation-origin">Opozorila: {segment.warnings.join(", ")}</div>}
       {segment.chunks.length > 1 && <details className="translation-chunks">
-        <summary>Modelni deli: {segment.chunks.filter((chunk) => chunk.status === "translated").length}/{segment.chunks.length}</summary>
+        <summary>Prevajalske enote: {segment.chunks.filter((chunk) => chunk.status === "translated").length}/{segment.chunks.length}</summary>
         {segment.chunks.map((chunk) => <div key={chunk.chunk_id} className={`translation-chunk ${chunk.status}`}>
-          <strong>{chunk.chunk_id} · {chunk.status}</strong>
+          <strong>{chunk.chunk_id} · {chunk.status} · {chunk.translation_origin === "translation_memory" ? "natančen zadetek TM" : chunk.translation_origin === "provider" ? "lokalni model" : "brez izvora"}</strong>
           <p>{chunk.source_text}</p>
           {chunk.translated_text && <p>{chunk.translated_text}</p>}
+          {chunk.translation_memory_entry_id && <small>TM exact za celotno prevajalsko enoto: {chunk.translation_memory_entry_id} · rev. {chunk.translation_memory_revision} · {chunk.translation_memory_domain || "splošno"}</small>}
           {chunk.decoding && <small>{chunk.source_token_count} vhodnih tokenov · {chunk.decoding.output_token_count}/{chunk.decoding.max_decoding_length} izhodnih</small>}
           {chunk.warnings.length > 0 && <small>Opozorila: {chunk.warnings.join(", ")}</small>}
         </div>)}
@@ -267,6 +328,7 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
         <button className="button secondary" disabled={!segment.edited_translation.trim()} onClick={onReview}>Potrdi prevod</button>
         <button className="button secondary" onClick={onReset}>Ponastavi</button>
         {segment.status === "reviewed" && segment.translation_origin === "manual" && <button className="button secondary" onClick={onPropose}>Predlagaj za glosar</button>}
+        {segment.status === "reviewed" && segment.translation_origin === "manual" && <button className="button secondary" onClick={onProposeMemory}>Predlagaj za prevajalski spomin</button>}
         {segment.status === "failed" && <button className="button secondary" onClick={onRetry}>Poskusi znova</button>}
       </div>}
     </article>

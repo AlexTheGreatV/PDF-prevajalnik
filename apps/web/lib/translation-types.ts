@@ -15,7 +15,7 @@ export type AcceptedOcrSource = {
   source: "block" | "page" | "image" | "manual";
   reason: string;
 };
-export type TranslationOrigin = "glossary" | "provider" | "manual" | null;
+export type TranslationOrigin = "glossary" | "translation_memory" | "provider" | "mixed" | "manual" | null;
 export type GlossaryMode = "exact_segment" | "do_not_translate" | "preferred" | "locked_inline";
 export type GlossaryOrigin = "built_in" | "user";
 export type GlossaryScope = "document" | "persistent_user" | "built_in";
@@ -104,6 +104,11 @@ export type TranslationChunk = {
     has_end_token: boolean | null;
     beam_size: number;
   } | null;
+  translation_origin: "translation_memory" | "provider" | null;
+  translation_memory_entry_id?: string | null;
+  translation_memory_revision?: number | null;
+  translation_memory_match?: "exact" | null;
+  translation_memory_domain?: string | null;
 };
 
 export type TranslationSegment = {
@@ -130,6 +135,10 @@ export type TranslationSegment = {
   glossary_matches: GlossaryMatch[];
   translation_origin: TranslationOrigin;
   glossary_entry_id: string | null;
+  translation_memory_entry_id?: string | null;
+  translation_memory_revision?: number | null;
+  translation_memory_match?: "exact" | null;
+  translation_memory_domain?: string | null;
   model_id: string | null;
   provider_id: string | null;
   placeholder_attempts: PlaceholderAttempt[];
@@ -143,16 +152,20 @@ export type TranslationSegment = {
 };
 
 export type TranslationJob = {
-  schema_version: 6;
+  schema_version: 8;
   source_filename: string;
   source_language: string;
   target_language: string;
+  domain: string;
   created_at: string;
   document_identity: PdfDocumentIdentity | null;
   glossary: GlossaryEntry[];
   glossary_snapshot: GlossaryEntry[];
   glossary_set_hash: string | null;
   glossary_usage: GlossaryUsageRecord[];
+  translation_memory_snapshot: import("./translation-memory").TranslationMemoryEntry[];
+  translation_memory_set_hash: string | null;
+  translation_memory_usage: Array<{ segment_id: string; entry_id: string; revision: number; match: "exact"; domain: string }>;
   segments: TranslationSegment[];
   translation_profile: TranslationProfileSnapshot | null;
   quality_checklist: TranslationQualityCheck[];

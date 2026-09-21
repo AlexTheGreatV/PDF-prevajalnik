@@ -3,6 +3,7 @@ import type { OcrReviewItem } from "./ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "./pdf-types";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
+import { selectExactTranslationMemoryMatch, type TranslationMemoryEntry } from "./translation-memory";
 import {
   createActiveTranslationProfileMetadata,
   refreshTranslationProfileMetadata,
@@ -20,15 +21,25 @@ import type {
   TranslationSegment,
 } from "./translation-types";
 
-export const TRANSLATION_JOB_SCHEMA_VERSION = 6 as const;
+export const TRANSLATION_JOB_SCHEMA_VERSION = 8 as const;
 
 export function createTranslationJob(
   analysis: PdfAnalysis,
   ocrItems: OcrReviewItem[],
-  options: { source_language: string; target_language: string; glossary?: GlossaryEntry[]; glossary_set_hash?: string | null; created_at?: string },
+  options: {
+    source_language: string;
+    target_language: string;
+    glossary?: GlossaryEntry[];
+    glossary_set_hash?: string | null;
+    translation_memory?: TranslationMemoryEntry[];
+    translation_memory_set_hash?: string | null;
+    domain?: string;
+    created_at?: string;
+  },
 ): TranslationJob {
   const created_at = options.created_at ?? new Date().toISOString();
   const glossary = cloneGlossary(options.glossary ?? []);
+  const translationMemory = (options.translation_memory ?? []).map((entry) => ({ ...entry }));
   const segments: TranslationSegment[] = [];
   const pages = [...(analysis.document?.pages ?? [])].sort((a, b) => a.page_number - b.page_number);
 
@@ -51,6 +62,8 @@ export function createTranslationJob(
               source_language: options.source_language,
               target_language: options.target_language,
               glossary,
+              translation_memory: translationMemory,
+              domain: options.domain ?? "",
               created_at,
             }));
           }));
@@ -63,7 +76,7 @@ export function createTranslationJob(
           item.selected_text_source === "ocr" &&
           item.effective_text.trim(),
         );
-        segments.push(createSegment(acceptedOcr?.effective_text ?? block.original_text, {
+        segments.push(createSegment(acceptedOcr?.effective_text ?? block.normalized_text, {
           segment_id: blockId,
           block_id: blockId,
           block_type: block.kind,
@@ -78,6 +91,8 @@ export function createTranslationJob(
           source_language: options.source_language,
           target_language: options.target_language,
           glossary,
+          translation_memory: translationMemory,
+          domain: options.domain ?? "",
           created_at,
         }));
       }
@@ -111,6 +126,8 @@ export function createTranslationJob(
       source_language: options.source_language,
       target_language: options.target_language,
       glossary,
+      translation_memory: translationMemory,
+      domain: options.domain ?? "",
       created_at,
     }));
   }
@@ -120,6 +137,7 @@ export function createTranslationJob(
     source_filename: analysis.filename,
     source_language: options.source_language,
     target_language: options.target_language,
+    domain: options.domain ?? "",
     created_at,
     document_identity: {
       sha256: analysis.sha256,
@@ -136,6 +154,9 @@ export function createTranslationJob(
     glossary_snapshot: cloneGlossary(glossary),
     glossary_set_hash: options.glossary_set_hash ?? null,
     glossary_usage: [],
+    translation_memory_snapshot: translationMemory,
+    translation_memory_set_hash: options.translation_memory_set_hash ?? null,
+    translation_memory_usage: [],
     segments,
     ...(options.target_language === "sl"
       ? createActiveTranslationProfileMetadata()
@@ -183,6 +204,8 @@ type SegmentInput = {
   source_language: string;
   target_language: string;
   glossary: GlossaryEntry[];
+  translation_memory: TranslationMemoryEntry[];
+  domain: string;
   created_at: string;
 };
 
@@ -213,6 +236,10 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     glossary_matches: findGlossaryMatches(source_text, input.glossary),
     translation_origin: null,
     glossary_entry_id: null,
+    translation_memory_entry_id: null,
+    translation_memory_revision: null,
+    translation_memory_match: null,
+    translation_memory_domain: null,
     model_id: null,
     provider_id: null,
     placeholder_attempts: [],
@@ -224,7 +251,11 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     translation_rule_adjustments: [],
     created_at: input.created_at,
   };
-  return skip_reason ? segment : applyExactSegmentGlossary(segment, input.glossary);
+  if (skip_reason) return segment;
+  const glossaryResult = applyExactSegmentGlossary(segment, input.glossary);
+  return glossaryResult.translation_origin === "glossary"
+    ? glossaryResult
+    : applyExactTranslationMemory(glossaryResult, input.translation_memory, input.domain);
 }
 
 function isAcceptedStandaloneOcr(item: OcrReviewItem): boolean {
@@ -301,7 +332,7 @@ export function restoreProtectedTokens(text: string, tokens: ProtectedToken[]): 
   let restored = restoreTechnicalTokens(text, technical);
   for (const token of tokens.filter((item) => item.kind === "glossary")) {
     if (restored.split(token.placeholder).length !== 2) throw new Error("Prevod vsebuje manjkajoč ali poškodovan slovarski placeholder.");
-    const integrity = validateGlossaryTechnicalIntegrity(token.value, token.replacement_value ?? token.value);
+    const integrity = validateTranslationTechnicalIntegrity(token.value, token.replacement_value ?? token.value);
     if (!integrity.valid) throw new Error("Glosarski prevod ne ohrani tehničnih vrednosti iz izvornega izraza.");
     restored = restored.replace(token.placeholder, integrity.normalizedTarget);
   }
@@ -336,6 +367,10 @@ export function editTranslation(segment: TranslationSegment, text: string): Tran
     error: null,
     translation_origin: text.trim() ? "manual" : null,
     glossary_entry_id: null,
+    translation_memory_entry_id: null,
+    translation_memory_revision: null,
+    translation_memory_match: null,
+    translation_memory_domain: null,
     needs_review: false,
     translation_rules_version: null,
     translation_rule_adjustments: [],
@@ -357,6 +392,10 @@ export function resetTranslation(segment: TranslationSegment): TranslationSegmen
     error: null,
     translation_origin: null,
     glossary_entry_id: null,
+    translation_memory_entry_id: null,
+    translation_memory_revision: null,
+    translation_memory_match: null,
+    translation_memory_domain: null,
     model_id: null,
     provider_id: null,
     placeholder_attempts: [],
@@ -386,7 +425,10 @@ export function updateJobGlossary(job: TranslationJob, glossary: GlossaryEntry[]
         glossary_matches: findGlossaryMatches(segment.source_text, snapshot),
       };
       if (segment.status === "reviewed" || segment.translation_origin === "manual" || segment.translation_origin === "provider") return refreshed;
-      return applyExactSegmentGlossary(resetTranslation(refreshed), snapshot);
+      const glossaryResult = applyExactSegmentGlossary(resetTranslation(refreshed), snapshot);
+      return glossaryResult.translation_origin === "glossary"
+        ? glossaryResult
+        : applyExactTranslationMemory(glossaryResult, job.translation_memory_snapshot, job.domain);
     }),
   });
 }
@@ -468,14 +510,41 @@ type PreparedChunk = { chunk: TranslationChunk; request: TranslationRequest; tok
 
 async function translateChunkSet(chunksBySegment: Map<string, TranslationChunk[]>, segments: TranslationSegment[], glossary: GlossaryEntry[], provider: TranslationProvider, job: TranslationJob, strategy: PlaceholderStrategy, signal?: AbortSignal, onProgress?: (completed: number, total: number) => void): Promise<TranslationSegment[]> {
   const segmentById = new Map(segments.map((segment) => [segment.segment_id, segment]));
-  const prepared = [...chunksBySegment.values()].flat().map((chunk): PreparedChunk => {
-    const protectedValue = protectForTranslation(chunk.source_text, glossary, strategy);
+  const memoryCompleted = new Map<string, TranslationChunk>();
+  const prepared = [...chunksBySegment.values()].flat().flatMap((chunk): PreparedChunk[] => {
     const segment = segmentById.get(chunk.segment_id)!;
-    return { chunk, tokens: protectedValue.tokens, request: { segment_id: chunk.chunk_id, text: protectedValue.protected_text, context: { segment_id: segment.segment_id, page_number: segment.page_number, block_type: segment.block_type, glossary_matches: segment.glossary_matches } } };
+    const sourceLanguage = segment.source_language === "auto" ? "en" : segment.source_language;
+    const memory = selectExactTranslationMemoryMatch(
+      chunk.source_text, sourceLanguage, segment.target_language, job.domain, job.translation_memory_snapshot,
+    );
+    if (memory.status === "match") {
+      const entry = memory.match!;
+      const integrity = validateTranslationTechnicalIntegrity(chunk.source_text, entry.target_text);
+      if (integrity.valid) {
+        memoryCompleted.set(chunk.chunk_id, {
+          ...chunk, translated_text: integrity.normalizedTarget, status: "translated",
+          warnings: [...chunk.warnings, "translation_memory_exact_match"],
+          translation_origin: "translation_memory", translation_memory_match: "exact",
+          translation_memory_entry_id: entry.id, translation_memory_revision: entry.revision,
+          translation_memory_domain: entry.domain,
+        });
+        return [];
+      }
+      chunk = {
+        ...chunk,
+        warnings: [...chunk.warnings, translationMemoryRejectionWarning(entry.id, entry.revision, "technical_integrity")],
+      };
+    } else if (memory.status === "conflict") {
+      chunk = { ...chunk, warnings: [...chunk.warnings, "translation_memory_conflict"] };
+    }
+    const protectedValue = protectForTranslation(chunk.source_text, glossary, strategy);
+    return [{ chunk, tokens: protectedValue.tokens, request: { segment_id: chunk.chunk_id, text: protectedValue.protected_text, context: { segment_id: segment.segment_id, page_number: segment.page_number, block_type: segment.block_type, glossary_matches: segment.glossary_matches } } }];
   });
   let results: TranslationProviderResult[];
   try {
-    results = await provider.translateBatch(prepared.map((item) => item.request), { source_language: job.source_language, target_language: job.target_language, signal, onProgress });
+    results = prepared.length
+      ? await provider.translateBatch(prepared.map((item) => item.request), { source_language: job.source_language, target_language: job.target_language, signal, onProgress })
+      : [];
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return segments.map((segment) => assembleSegment(segment, (chunksBySegment.get(segment.segment_id) ?? []).map((chunk) => ({ ...chunk, status: "failed", warnings: [message] }))));
@@ -484,6 +553,9 @@ async function translateChunkSet(chunksBySegment: Map<string, TranslationChunk[]
   for (const result of results) resultCounts.set(result.segment_id, (resultCounts.get(result.segment_id) ?? 0) + 1);
   const byId = new Map(results.map((result) => [result.segment_id, result]));
   const completed = new Map<string, TranslationChunk[]>();
+  for (const chunk of memoryCompleted.values()) {
+    completed.set(chunk.segment_id, [...(completed.get(chunk.segment_id) ?? []), chunk]);
+  }
   for (const item of prepared) {
     const result = byId.get(item.chunk.chunk_id);
     const chunk = resultCounts.get(item.chunk.chunk_id) === 1
@@ -492,6 +564,8 @@ async function translateChunkSet(chunksBySegment: Map<string, TranslationChunk[]
     completed.set(chunk.segment_id, [...(completed.get(chunk.segment_id) ?? []), chunk]);
   }
   return segments.map((segment) => {
+    const orderedChunks = (completed.get(segment.segment_id) ?? []).sort((left, right) => left.source_start - right.source_start);
+    const memoryChunks = orderedChunks.filter((chunk) => chunk.translation_memory_entry_id);
     const firstResult = prepared
       .filter((item) => item.chunk.segment_id === segment.segment_id)
       .map((item) => byId.get(item.chunk.chunk_id))
@@ -500,10 +574,15 @@ async function translateChunkSet(chunksBySegment: Map<string, TranslationChunk[]
     return assembleSegment({
       ...segment,
       model_id: firstResult?.model_id ?? segment.model_id,
-      provider_id: firstResult?.provider_id ?? provider.id,
-      needs_review: segment.needs_review || lockedInline,
+      provider_id: firstResult?.provider_id ?? (prepared.some((item) => item.chunk.segment_id === segment.segment_id) ? provider.id : segment.provider_id),
       warnings: lockedInline ? [...new Set([...segment.warnings, "locked_inline_glossary"])] : segment.warnings,
-    }, completed.get(segment.segment_id) ?? []);
+      translation_memory_entry_id: memoryChunks[0]?.translation_memory_entry_id ?? segment.translation_memory_entry_id,
+      translation_memory_revision: memoryChunks[0]?.translation_memory_revision ?? segment.translation_memory_revision,
+      translation_memory_match: memoryChunks.length ? "exact" : segment.translation_memory_match,
+      translation_memory_domain: memoryChunks[0]?.translation_memory_domain ?? segment.translation_memory_domain,
+      translation_origin: aggregateChunkTranslationOrigin(orderedChunks, segment.translation_origin),
+      needs_review: segment.needs_review || lockedInline || memoryChunks.length > 0,
+    }, orderedChunks);
   });
 }
 
@@ -515,12 +594,35 @@ function applyChunkResult(prepared: PreparedChunk, result: TranslationProviderRe
   if (result.reached_decoding_limit) return { ...prepared.chunk, ...metadata, status: "failed", warnings: ["decoding_limit"] };
   try {
     const translated_text = restoreProtectedTokens(result.translated_text, prepared.tokens);
-    const retainedWarnings = prepared.chunk.warnings.filter((warning) => warning === "forced_chunking");
-    return { ...prepared.chunk, ...metadata, translated_text, status: translated_text.trim() ? "translated" : "failed", warnings: translated_text.trim() ? retainedWarnings : [...retainedWarnings, "empty_chunk_result"], placeholder_attempts: [...prepared.chunk.placeholder_attempts, placeholderAttempt(strategy, result.translated_text, true, null)] };
+    const retainedWarnings = prepared.chunk.warnings.filter((warning) =>
+      warning === "forced_chunking" || warning.startsWith("translation_memory_"),
+    );
+    return {
+      ...prepared.chunk,
+      ...metadata,
+      translated_text,
+      status: translated_text.trim() ? "translated" : "failed",
+      translation_origin: translated_text.trim() ? "provider" : null,
+      warnings: translated_text.trim() ? retainedWarnings : [...retainedWarnings, "empty_chunk_result"],
+      placeholder_attempts: [...prepared.chunk.placeholder_attempts, placeholderAttempt(strategy, result.translated_text, true, null)],
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ...prepared.chunk, ...metadata, status: "failed", warnings: ["placeholder_integrity"], placeholder_attempts: [...prepared.chunk.placeholder_attempts, placeholderAttempt(strategy, result.translated_text, false, message)] };
   }
+}
+
+function aggregateChunkTranslationOrigin(
+  chunks: TranslationChunk[],
+  fallback: TranslationSegment["translation_origin"],
+): TranslationSegment["translation_origin"] {
+  const origins = new Set(chunks.map((chunk) => chunk.translation_origin).filter(Boolean));
+  if (origins.size > 1) return "mixed";
+  return origins.values().next().value ?? fallback;
+}
+
+function translationMemoryRejectionWarning(entryId: string, revision: number, reason: string): string {
+  return `translation_memory_rejected:${entryId}:rev:${revision}:${reason}`;
 }
 
 function assembleSegment(segment: TranslationSegment, chunks: TranslationChunk[], placeholderRetry = false): TranslationSegment {
@@ -560,9 +662,9 @@ function assembleSegment(segment: TranslationSegment, chunks: TranslationChunk[]
     edited_translation: translated,
     status: complete ? "translated" : "failed",
     error: complete ? null : "Vsaj en modelni del segmenta ni bil uspešno preveden.",
-    translation_origin: complete ? "provider" : segment.translation_origin,
+    translation_origin: complete ? aggregateChunkTranslationOrigin(chunks, segment.translation_origin) : segment.translation_origin,
     placeholder_attempts: chunks.flatMap((chunk) => chunk.placeholder_attempts),
-    needs_review: segment.needs_review || placeholderRetry || segment.forced_chunking || adjustments.length > 0 || technical.warnings.length > 0 || segment.glossary_matches.length > 0,
+    needs_review: segment.needs_review || chunks.some((chunk) => chunk.translation_memory_entry_id) || placeholderRetry || segment.forced_chunking || adjustments.length > 0 || technical.warnings.length > 0 || segment.glossary_matches.length > 0,
     warnings,
     model_id: segment.model_id,
     provider_id: segment.provider_id,
@@ -589,6 +691,11 @@ export function createTranslationChunks(segment: TranslationSegment): Translatio
     warnings: [],
     placeholder_attempts: [],
     decoding: null,
+    translation_origin: null,
+    translation_memory_entry_id: null,
+    translation_memory_revision: null,
+    translation_memory_match: null,
+    translation_memory_domain: null,
   }));
 }
 
@@ -629,7 +736,7 @@ function applyExactSegmentGlossary(segment: TranslationSegment, glossary: Glossa
   const entry = findExactSegmentGlossaryMatch(segment.source_text, glossary);
   if (!entry?.target_term.trim()) return segment;
   const needsReview = entry.scope === "document" || entry.scope === "persistent_user" || entry.origin === "user";
-  const integrity = validateGlossaryTechnicalIntegrity(segment.source_text, entry.target_term);
+  const integrity = validateTranslationTechnicalIntegrity(segment.source_text, entry.target_term);
   if (!integrity.valid) {
     return {
       ...segment,
@@ -666,7 +773,7 @@ function applyExactSegmentGlossary(segment: TranslationSegment, glossary: Glossa
   };
 }
 
-function validateGlossaryTechnicalIntegrity(source: string, target: string): { valid: boolean; normalizedTarget: string } {
+export function validateTranslationTechnicalIntegrity(source: string, target: string): { valid: boolean; normalizedTarget: string } {
   const normalizedSource = source.replace(/−/g, "-");
   const normalizedInput = target.replace(/−/g, "-");
   const sourceProtection = protectTechnicalTokens(normalizedSource);
@@ -677,6 +784,41 @@ function validateGlossaryTechnicalIntegrity(source: string, target: string): { v
   return {
     valid,
     normalizedTarget: valid ? restoreTechnicalTokens(targetProtection.protected_text, targetProtection.tokens) : "",
+  };
+}
+
+function applyExactTranslationMemory(segment: TranslationSegment, entries: TranslationMemoryEntry[], domain: string): TranslationSegment {
+  const sourceLanguage = segment.source_language === "auto" ? "en" : segment.source_language;
+  const result = selectExactTranslationMemoryMatch(segment.source_text, sourceLanguage, segment.target_language, domain, entries);
+  if (result.status === "none") return segment;
+  if (result.status === "conflict") {
+    return { ...segment, needs_review: true, warnings: [...segment.warnings, "translation_memory_conflict"] };
+  }
+  const entry = result.match!;
+  const integrity = validateTranslationTechnicalIntegrity(segment.source_text, entry.target_text);
+  if (!integrity.valid) {
+    return {
+      ...segment,
+      status: "pending",
+      error: null,
+      needs_review: true,
+      warnings: [...segment.warnings, translationMemoryRejectionWarning(entry.id, entry.revision, "technical_integrity")],
+    };
+  }
+  return {
+    ...segment,
+    translated_text: integrity.normalizedTarget,
+    edited_translation: integrity.normalizedTarget,
+    status: "translated",
+    quality: null,
+    error: null,
+    translation_origin: "translation_memory",
+    translation_memory_entry_id: entry.id,
+    translation_memory_revision: entry.revision,
+    translation_memory_match: "exact",
+    translation_memory_domain: entry.domain,
+    needs_review: true,
+    warnings: [...segment.warnings, "translation_memory_exact_match"],
   };
 }
 
@@ -709,7 +851,7 @@ export function importTranslationJob(value: string): TranslationJob {
   try { parsed = JSON.parse(value); }
   catch { throw new Error("Datoteka ni veljaven JSON."); }
   if (!isRecord(parsed)) throw new Error("JSON nima veljavne strukture prevajalskega opravila.");
-  const migrated = parsed.schema_version === 1
+  const migratedSix = parsed.schema_version === 1
     ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(migrateSchemaFour(migrateSchemaThree(migrateSchemaTwo(migrateSchemaOne(parsed))))))
     : parsed.schema_version === 2
       ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(migrateSchemaFour(migrateSchemaThree(migrateSchemaTwo(parsed)))))
@@ -720,6 +862,7 @@ export function importTranslationJob(value: string): TranslationJob {
           : parsed.schema_version === 5
             ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(parsed))
             : migrateSchemaSixMetadata(parsed);
+  const migrated = migrateSchemaEight(migrateSchemaSeven(migratedSix));
   if (!isRecord(migrated) || migrated.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
   validateJobShape(migrated);
   return finalizeTranslationJob(migrated as TranslationJob);
@@ -851,6 +994,56 @@ function migrateSchemaSixMetadata(job: Record<string, unknown>): Record<string, 
   };
 }
 
+function migrateSchemaSeven(job: Record<string, unknown>): Record<string, unknown> {
+  if (job.schema_version === 7) return job;
+  if (job.schema_version !== 6) return job;
+  return {
+    ...job,
+    schema_version: 7,
+    domain: "",
+    translation_memory_snapshot: [],
+    translation_memory_set_hash: null,
+    translation_memory_usage: [],
+    segments: Array.isArray(job.segments) ? job.segments.map((value) => isRecord(value) ? {
+      ...value,
+      translation_memory_entry_id: null,
+      translation_memory_revision: null,
+      translation_memory_match: null,
+      translation_memory_domain: null,
+    } : value) : job.segments,
+  };
+}
+
+function migrateSchemaEight(job: Record<string, unknown>): Record<string, unknown> {
+  if (job.schema_version === 8) return job;
+  if (job.schema_version !== 7) return job;
+  const segments = Array.isArray(job.segments) ? job.segments.map((value) => {
+    if (!isRecord(value)) return value;
+    const chunks = Array.isArray(value.chunks) ? value.chunks.map((chunk) => {
+      if (!isRecord(chunk)) return chunk;
+      const memoryEntryId = typeof chunk.translation_memory_entry_id === "string" ? chunk.translation_memory_entry_id : null;
+      const translated = chunk.status === "translated" && typeof chunk.translated_text === "string" && chunk.translated_text.trim().length > 0;
+      return {
+        ...chunk,
+        translation_origin: memoryEntryId ? "translation_memory" : translated ? "provider" : null,
+        translation_memory_match: memoryEntryId ? "exact" : null,
+      };
+    }) : [];
+    const chunkOrigins = new Set(chunks.flatMap((chunk) =>
+      isRecord(chunk) && typeof chunk.translation_origin === "string" ? [chunk.translation_origin] : [],
+    ));
+    const existingOrigin = value.translation_origin;
+    return {
+      ...value,
+      chunks,
+      translation_origin: existingOrigin === "manual" || existingOrigin === "glossary"
+        ? existingOrigin
+        : chunkOrigins.size > 1 ? "mixed" : existingOrigin,
+    };
+  }) : job.segments;
+  return { ...job, schema_version: 8, segments };
+}
+
 function migrateSchemaFiveProfileMetadata(job: Record<string, unknown>): Record<string, unknown> {
   if (job.schema_version !== 5 || !isRecord(job.translation_profile)) return job;
   const profile = job.translation_profile;
@@ -894,6 +1087,14 @@ function validateJobShape(job: Record<string, unknown>): void {
     !Array.isArray(job.glossary_usage) || !job.glossary_usage.every(isGlossaryUsage)) {
     throw new Error("JSON vsebuje neveljavno sledljivost glosarja.");
   }
+  if (!Array.isArray(job.translation_memory_snapshot) ||
+    !job.translation_memory_snapshot.every(isTranslationMemoryEntry) ||
+    !(job.translation_memory_set_hash === null || typeof job.translation_memory_set_hash === "string") ||
+    !Array.isArray(job.translation_memory_usage) ||
+    !job.translation_memory_usage.every(isTranslationMemoryUsage)) {
+    throw new Error("JSON vsebuje neveljavno sledljivost prevajalskega spomina.");
+  }
+  if (typeof job.domain !== "string") throw new Error("JSON vsebuje neveljavno domeno prevajalskega opravila.");
   for (const entry of [...job.glossary as unknown[], ...job.glossary_snapshot]) validateGlossaryEntry(entry);
   for (const segment of job.segments as unknown[]) {
     if (!isRecord(segment) ||
@@ -913,7 +1114,7 @@ function validateJobShape(job: Record<string, unknown>): void {
       typeof segment.translated_text !== "string" ||
       typeof segment.edited_translation !== "string" ||
       !["pending", "translating", "translated", "reviewed", "failed", "skipped"].includes(String(segment.status)) ||
-      ![null, "glossary", "provider", "manual"].includes(segment.translation_origin as null | string) ||
+      ![null, "glossary", "translation_memory", "provider", "mixed", "manual"].includes(segment.translation_origin as null | string) ||
       !isStringOrNull(segment.glossary_entry_id) ||
       !isStringOrNull(segment.model_id) ||
       !isStringOrNull(segment.provider_id) ||
@@ -1055,16 +1256,41 @@ function isPlaceholderAttempt(value: unknown): boolean {
 }
 
 function isTranslationChunk(value: unknown): boolean {
-  return isRecord(value) &&
-    typeof value.chunk_id === "string" &&
+  if (!isRecord(value)) return false;
+  const origin = value.translation_origin;
+  const memoryEntryId = value.translation_memory_entry_id;
+  const memoryRevision = value.translation_memory_revision;
+  const memoryMatch = value.translation_memory_match;
+  const validMemoryProvenance = origin === "translation_memory"
+    ? typeof memoryEntryId === "string" && Number.isInteger(memoryRevision) && Number(memoryRevision) >= 1 && memoryMatch === "exact"
+    : (memoryEntryId === undefined || memoryEntryId === null) &&
+      (memoryRevision === undefined || memoryRevision === null) &&
+      (memoryMatch === undefined || memoryMatch === null);
+  return typeof value.chunk_id === "string" &&
     typeof value.segment_id === "string" &&
     typeof value.source_text === "string" &&
     typeof value.source_start === "number" &&
     typeof value.source_end === "number" &&
     typeof value.separator_after === "string" &&
     ["pending", "translated", "failed"].includes(String(value.status)) &&
+    [null, "translation_memory", "provider"].includes(origin as null | string) &&
+    validMemoryProvenance &&
     Array.isArray(value.warnings) &&
     Array.isArray(value.placeholder_attempts);
+}
+
+function isTranslationMemoryEntry(value: unknown): boolean {
+  return isRecord(value) && typeof value.id === "string" && typeof value.source_text === "string" &&
+    typeof value.target_text === "string" && typeof value.normalized_source === "string" &&
+    typeof value.normalized_source_sha256 === "string" && /^[a-f0-9]{64}$/.test(value.normalized_source_sha256) &&
+    typeof value.source_language === "string" && typeof value.target_language === "string" &&
+    typeof value.domain === "string" && ["proposed", "approved", "rejected", "archived"].includes(String(value.status)) &&
+    value.origin === "manual_review" && Number.isInteger(value.revision) && Number(value.revision) >= 1;
+}
+
+function isTranslationMemoryUsage(value: unknown): boolean {
+  return isRecord(value) && typeof value.segment_id === "string" && typeof value.entry_id === "string" &&
+    Number.isInteger(value.revision) && Number(value.revision) >= 1 && value.match === "exact" && typeof value.domain === "string";
 }
 
 function isStringOrNull(value: unknown): boolean {
@@ -1084,7 +1310,23 @@ function cloneGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
 }
 
 function finalizeTranslationJob(job: TranslationJob): TranslationJob {
-  return refreshTranslationProfileMetadata({ ...job, glossary_usage: collectGlossaryUsage(job) });
+  return refreshTranslationProfileMetadata({
+    ...job,
+    glossary_usage: collectGlossaryUsage(job),
+    translation_memory_usage: job.segments.flatMap((segment) => {
+      const direct = segment.translation_memory_entry_id && segment.translation_memory_revision && segment.translation_memory_match === "exact"
+        ? [{ segment_id: segment.segment_id, entry_id: segment.translation_memory_entry_id,
+          revision: segment.translation_memory_revision, match: "exact" as const,
+          domain: segment.translation_memory_domain ?? "" }]
+        : [];
+      const chunks = segment.chunks.flatMap((chunk) => chunk.translation_memory_entry_id && chunk.translation_memory_revision
+        ? [{ segment_id: segment.segment_id, entry_id: chunk.translation_memory_entry_id,
+          revision: chunk.translation_memory_revision, match: "exact" as const,
+          domain: chunk.translation_memory_domain ?? "" }]
+        : []);
+      return [...new Map([...direct, ...chunks].map((usage) => [`${usage.segment_id}:${usage.entry_id}:${usage.revision}`, usage])).values()];
+    }),
+  });
 }
 
 function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usage"] {

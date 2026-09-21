@@ -103,13 +103,13 @@ class PdfExportSegment(BaseModel):
     accepted_ocr_source: AcceptedOcrSource | None = None
     edited_translation: str = Field(max_length=200_000)
     status: Literal["pending", "translating", "translated", "reviewed", "failed", "skipped"]
-    translation_origin: Literal["glossary", "provider", "manual"] | None = None
+    translation_origin: Literal["glossary", "translation_memory", "provider", "mixed", "manual"] | None = None
 
 
 class PdfExportJob(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    schema_version: Literal[4, 5, 6]
+    schema_version: Literal[4, 5, 6, 7, 8]
     source_filename: str
     document_identity: PdfDocumentIdentity
     segments: list[PdfExportSegment] = Field(max_length=10_000)

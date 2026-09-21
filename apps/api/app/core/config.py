@@ -27,10 +27,11 @@ class Settings(BaseSettings):
     local_translation_device: str = "cpu"
     local_translation_compute_type: str = "int8"
     glossary_database_path: Path = Path("local-data/glossary.sqlite3")
+    translation_memory_database_path: Path = Path("local-data/translation-memory.sqlite3")
 
-    @field_validator("glossary_database_path", mode="after")
+    @field_validator("glossary_database_path", "translation_memory_database_path", mode="after")
     @classmethod
-    def resolve_glossary_database_path(cls, value: Path) -> Path:
+    def resolve_local_database_path(cls, value: Path) -> Path:
         return value if value.is_absolute() else (PROJECT_ROOT / value).resolve()
 
     @field_validator("cors_origins", mode="before")
