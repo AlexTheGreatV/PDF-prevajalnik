@@ -25,6 +25,16 @@ export type PersistentGlossaryEntry = {
   updated_at: string;
   usage_count: number;
   last_used_at: string | null;
+  external_source?: string | null;
+  external_record_id?: string | null;
+  source_confidence?: string | null;
+  definition?: string | null;
+  context?: string | null;
+  source_version?: string | null;
+  license_info?: string | null;
+  import_file_sha256?: string | null;
+  import_batch_id?: string | null;
+  imported_at?: string | null;
 };
 
 export type GlossaryEntryDraft = Pick<PersistentGlossaryEntry,
@@ -196,6 +206,10 @@ export function persistentToRuntimeEntry(entry: PersistentGlossaryEntry): Glossa
     revision: entry.revision,
     status: entry.status,
     source: entry.origin,
+    domain: entry.domain,
+    external_source: entry.external_source ?? null,
+    external_record_id: entry.external_record_id ?? null,
+    source_version: entry.source_version ?? null,
   };
 }
 

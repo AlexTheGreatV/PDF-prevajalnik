@@ -1,0 +1,3 @@
+source,target,subject,record_id,definition,ignored
+open time,odprti cas,adhesives,csv-1,Time during which an adhesive remains workable,fixture-only
+curing,utrjevanje,adhesives,csv-2,Process of becoming solid,fixture-only

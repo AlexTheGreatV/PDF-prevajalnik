@@ -37,8 +37,24 @@ test("maps an approved persistent entry without losing revision or provenance", 
   assert.deepEqual(persistentToRuntimeEntry(entry), {
     id: "entry-1", source_term: "curing", target_term: "utrjevanje", case_sensitive: false,
     mode: "preferred", enabled: true, origin: "user", scope: "persistent_user", revision: 3,
-    status: "approved", source: "manual",
+    status: "approved", source: "manual", domain: "gradbeništvo",
+    external_source: null, external_record_id: null, source_version: null,
   });
+});
+
+test("keeps external provenance when an imported candidate becomes an approved runtime entry", () => {
+  const runtime = persistentToRuntimeEntry({
+    ...entry,
+    origin: "import",
+    external_source: "User-supplied TBX",
+    external_record_id: "term-42",
+    source_version: "2026-09",
+  });
+  assert.equal(runtime.source, "import");
+  assert.equal(runtime.domain, "gradbeništvo");
+  assert.equal(runtime.external_source, "User-supplied TBX");
+  assert.equal(runtime.external_record_id, "term-42");
+  assert.equal(runtime.source_version, "2026-09");
 });
 
 test("creates a proposed entry only from a reviewed manual correction", () => {

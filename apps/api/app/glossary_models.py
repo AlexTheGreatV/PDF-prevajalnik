@@ -114,6 +114,16 @@ class GlossaryEntry(StrictModel):
     updated_at: datetime
     usage_count: int
     last_used_at: datetime | None
+    external_source: str | None = None
+    external_record_id: str | None = None
+    source_confidence: str | None = None
+    definition: str | None = None
+    context: str | None = None
+    source_version: str | None = None
+    license_info: str | None = None
+    import_file_sha256: str | None = None
+    import_batch_id: str | None = None
+    imported_at: datetime | None = None
 
 
 class GlossaryHistoryRecord(StrictModel):
@@ -174,3 +184,119 @@ class GlossaryImportResult(StrictModel):
     created: int
     updated: int
     skipped: int
+
+
+class TerminologyCsvMapping(StrictModel):
+    source_term: str = Field(min_length=1, max_length=100)
+    target_term: str = Field(min_length=1, max_length=100)
+    source_language: str | None = Field(default=None, max_length=100)
+    target_language: str | None = Field(default=None, max_length=100)
+    domain: str | None = Field(default=None, max_length=100)
+    match_mode: str | None = Field(default=None, max_length=100)
+    external_record_id: str | None = Field(default=None, max_length=100)
+    confidence: str | None = Field(default=None, max_length=100)
+    definition: str | None = Field(default=None, max_length=100)
+    context: str | None = Field(default=None, max_length=100)
+    note: str | None = Field(default=None, max_length=100)
+    source_version: str | None = Field(default=None, max_length=100)
+
+
+class TerminologyImportOptions(StrictModel):
+    source_language: str = Field(default="en", min_length=2, max_length=12)
+    target_language: str = Field(default="sl", min_length=2, max_length=12)
+    default_domain: str = Field(default="", max_length=100)
+    default_match_mode: GlossaryMatchMode = "preferred_term"
+    external_source: str = Field(min_length=1, max_length=MAX_SOURCE_LABEL_CHARS)
+    source_version: str | None = Field(default=None, max_length=200)
+    license_info: str | None = Field(default=None, max_length=500)
+    csv_mapping: TerminologyCsvMapping | None = None
+
+    @field_validator("source_language", "target_language")
+    @classmethod
+    def validate_import_language(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized.replace("-", "").isalpha():
+            raise ValueError("Jezikovna oznaka ni veljavna.")
+        return normalized
+
+
+class TerminologyImportCandidate(StrictModel):
+    candidate_id: str
+    row_number: int = Field(ge=1)
+    source_term: str = Field(min_length=1, max_length=MAX_TERM_CHARS)
+    target_term: str = Field(min_length=1, max_length=MAX_TERM_CHARS)
+    source_language: str = Field(min_length=2, max_length=12)
+    target_language: str = Field(min_length=2, max_length=12)
+    domain: str = Field(default="", max_length=100)
+    match_mode: GlossaryMatchMode = "preferred_term"
+    external_source: str = Field(min_length=1, max_length=MAX_SOURCE_LABEL_CHARS)
+    external_record_id: str | None = Field(default=None, max_length=200)
+    source_confidence: str | None = Field(default=None, max_length=100)
+    definition: str | None = Field(default=None, max_length=2_000)
+    context: str | None = Field(default=None, max_length=2_000)
+    note: str = Field(default="", max_length=MAX_NOTE_CHARS)
+    source_version: str | None = Field(default=None, max_length=200)
+    license_info: str | None = Field(default=None, max_length=500)
+    classification: Literal["new", "duplicate", "conflict", "invalid"] = "new"
+    existing_entry_ids: list[str] = Field(default_factory=list, max_length=50)
+    existing_entry_revisions: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("source_language", "target_language")
+    @classmethod
+    def validate_candidate_language(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized.replace("-", "").isalpha():
+            raise ValueError("Jezikovna oznaka ni veljavna.")
+        return normalized
+
+
+class TerminologyImportIssue(StrictModel):
+    row_number: int
+    kind: Literal["duplicate", "conflict", "invalid", "ambiguous", "missing_language", "missing_translation"]
+    message: str
+    candidate_id: str | None = None
+    existing_entry_ids: list[str] = Field(default_factory=list)
+
+
+class TerminologyImportPreview(StrictModel):
+    preview_id: str
+    import_batch_id: str
+    expires_at: datetime
+    format: Literal["csv", "tbx"]
+    file_sha256: str
+    candidates: list[TerminologyImportCandidate]
+    valid_count: int
+    new_count: int
+    duplicate_count: int
+    conflict_count: int
+    invalid_count: int
+    missing_translation_count: int
+    missing_language_count: int
+    issues: list[TerminologyImportIssue]
+    domains: list[str]
+    ignored_fields: list[str]
+    external_source: str
+    source_version: str | None
+    license_info: str | None
+
+
+class TerminologyImportConfirm(StrictModel):
+    preview_id: str
+    file_sha256: str = Field(min_length=64, max_length=64)
+    candidate_ids: list[str] = Field(min_length=1, max_length=1_000)
+
+    @field_validator("file_sha256")
+    @classmethod
+    def validate_import_hash(cls, value: str) -> str:
+        normalized = value.lower()
+        if any(character not in "0123456789abcdef" for character in normalized):
+            raise ValueError("SHA-256 uvozne datoteke ni veljaven.")
+        return normalized
+
+
+class TerminologyImportCommitResult(StrictModel):
+    import_batch_id: str
+    created: int
+    skipped_duplicates: int
+    skipped_conflicts: int
+    skipped_unselected: int

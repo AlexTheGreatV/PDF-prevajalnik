@@ -157,6 +157,76 @@ test("document exact glossary has priority over translation memory", () => {
   assert.equal(segment.translation_memory_entry_id, null);
 });
 
+test("approved manual persistent glossary outranks an approved external candidate", () => {
+  const source = "Open time";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions[1].blocks = [block(1, "heading", source)];
+  const shared = { source_term: source, case_sensitive: true, mode: "exact_segment" as const, enabled: true, origin: "user" as const, scope: "persistent_user" as const, status: "approved" as const };
+  const glossary: GlossaryEntry[] = [
+    { ...shared, id: "external", target_term: "Zunanji kandidat", revision: 1, source: "import", external_source: "Synthetic TBX" },
+    { ...shared, id: "company", target_term: "Odobren podjetniški termin", revision: 4, source: "manual" },
+  ];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl", glossary });
+  const segment = job.segments.find((item) => item.source_text === source)!;
+  assert.equal(segment.edited_translation, "Odobren podjetniški termin");
+  assert.equal(segment.glossary_entry_id, "company");
+  assert.equal(segment.status, "translated");
+  assert.equal(segment.needs_review, true);
+});
+
+test("approved external candidate remains unreviewed and keeps source provenance", () => {
+  const source = "Open time";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions[1].blocks = [block(1, "heading", source)];
+  const glossary: GlossaryEntry[] = [{
+    id: "external", source_term: source, target_term: "Odprti čas", case_sensitive: true,
+    mode: "exact_segment", enabled: true, origin: "user", scope: "persistent_user",
+    status: "approved", revision: 2, source: "import", domain: "adhesives",
+    external_source: "Synthetic TBX", external_record_id: "term-1",
+  }];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl", glossary });
+  const segment = job.segments.find((item) => item.source_text === source)!;
+  const usage = job.glossary_usage.find((item) => item.glossary_id === "external");
+  assert.equal(segment.edited_translation, "Odprti čas");
+  assert.equal(segment.status, "translated");
+  assert.equal(segment.needs_review, true);
+  assert.notEqual(segment.status, "reviewed");
+  assert.equal(usage?.revision, 2);
+  assert.equal(usage?.external_source, "Synthetic TBX");
+  assert.equal(usage?.external_record_id, "term-1");
+  assert.equal(usage?.domain, "adhesives");
+});
+
+test("external candidate affects only jobs created after explicit approval", () => {
+  const source = "Open time";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions[1].blocks = [block(1, "heading", source)];
+  const candidate: GlossaryEntry = {
+    id: "external-lifecycle", source_term: source, target_term: "Odprti čas", case_sensitive: true,
+    mode: "exact_segment", enabled: true, origin: "user", scope: "persistent_user",
+    revision: 1, source: "import", status: "proposed", domain: "adhesives",
+    external_source: "Synthetic TBX", external_record_id: "term-lifecycle",
+  };
+  const prepare = (status: "proposed" | "approved" | "rejected" | "archived", revision: number) =>
+    createTranslationJob(analysis, [], {
+      source_language: "en", target_language: "sl", glossary: [{ ...candidate, status, revision }],
+    });
+
+  assert.equal(prepare("proposed", 1).segments.find((item) => item.source_text === source)!.glossary_entry_id, null);
+  const approvedJob = prepare("approved", 2);
+  const approved = approvedJob.segments.find((item) => item.source_text === source)!;
+  const usage = approvedJob.glossary_usage.find((item) => item.glossary_id === "external-lifecycle");
+  assert.equal(approved.edited_translation, "Odprti čas");
+  assert.equal(approved.glossary_entry_id, "external-lifecycle");
+  assert.equal(usage?.revision, 2);
+  assert.equal(usage?.domain, "adhesives");
+  assert.equal(usage?.external_source, "Synthetic TBX");
+  assert.equal(approved.status, "translated");
+  assert.equal(approved.needs_review, true);
+  assert.equal(prepare("rejected", 3).segments.find((item) => item.source_text === source)!.glossary_entry_id, null);
+  assert.equal(prepare("archived", 4).segments.find((item) => item.source_text === source)!.glossary_entry_id, null);
+});
+
 test("rejects a technically invalid memory result and falls back to the provider with provenance", async () => {
   const source = "Use CO₂ at +25 °C and 2.5 MPa with 50 % coverage.";
   const entry = tmEntry(source, "Uporabite pri +20 °C in 3 MPa.");
@@ -432,6 +502,9 @@ test("protects complete do-not-translate names before technical values", async (
     origin: "user",
     scope: "persistent_user",
     revision: 2,
+    domain: "construction_adhesives",
+    external_source: "Synthetic user TBX",
+    external_record_id: "term-65",
   }];
   const source = "Acme MS 65 Panel Bond";
   for (const value of ["ACME MS 65 Panel Bond", source]) {
@@ -466,7 +539,11 @@ test("protects complete do-not-translate names before technical values", async (
   assert.equal(product.accepted_ocr_source, null);
   assert.equal(product.glossary_matches[0].glossary_id, "product-name");
   assert.equal(product.glossary_matches[0].revision, 2);
-  assert.equal(translated.glossary_usage.find((usage) => usage.glossary_id === "product-name")?.revision, 2);
+  const usage = translated.glossary_usage.find((item) => item.glossary_id === "product-name");
+  assert.equal(usage?.revision, 2);
+  assert.equal(usage?.domain, "construction_adhesives");
+  assert.equal(usage?.external_source, "Synthetic user TBX");
+  assert.equal(usage?.external_record_id, "term-65");
   assert.equal(description.translated_text, "Panelno lepilo");
   assert.equal(description.glossary_matches.length, 0);
 });

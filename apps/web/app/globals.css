@@ -1124,6 +1124,26 @@ pre {
   font-size: 0.84rem;
 }
 
+.terminology-import-panel { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px; }
+.terminology-import-panel header h4 { margin: 0 0 4px; }
+.terminology-import-panel header p { margin: 0 0 12px; color: var(--muted); }
+.terminology-import-settings,
+.csv-mapping { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.terminology-import-settings label,
+.csv-mapping label { display: grid; gap: 4px; min-width: 0; font-size: 12px; font-weight: 700; }
+.terminology-import-settings input,
+.terminology-import-settings select,
+.csv-mapping select { min-width: 0; width: 100%; }
+.import-summary { display: grid; grid-template-columns: repeat(6, minmax(90px, 1fr)); border: 1px solid var(--border); margin: 12px 0; }
+.import-summary div { padding: 9px; border-right: 1px solid var(--border); }
+.import-summary div:last-child { border-right: 0; }
+.import-summary dt { color: var(--muted); font-size: 11px; }
+.import-summary dd { margin: 2px 0 0; font-weight: 700; }
+.candidate-details { margin-top: 4px; font-size: 12px; }
+.candidate-details summary { cursor: pointer; color: var(--muted); }
+.candidate-details p { margin: 4px 0; font-weight: 400; }
+.terminology-import-panel code { overflow-wrap: anywhere; }
+
 .terminology-source-row {
   display: grid;
   grid-template-columns: minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(170px, 1.4fr) 120px auto auto;
@@ -1138,6 +1158,9 @@ pre {
 }
 
 @media (max-width: 980px) {
+  .terminology-import-settings,
+  .csv-mapping { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .import-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .terminology-source-row {
     grid-template-columns: 1fr 1fr;
   }
@@ -1305,6 +1328,9 @@ pre {
 }
 
 @media (max-width: 640px) {
+  .terminology-import-settings,
+  .csv-mapping,
+  .import-summary { grid-template-columns: 1fr; }
   .app-shell {
     padding: 18px;
   }

@@ -1343,6 +1343,9 @@ function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usa
       outcome: warned ? "warned" as const : "applied" as const,
       conflict: new Set(sameSource.map((candidate) => candidate.target_term)).size > 1,
       precedence: match.scope === "document" ? "document" as const : match.scope === "persistent_user" || match.origin === "user" ? "approved_user" as const : "built_in" as const,
+      domain: match.domain,
+      external_source: match.external_source,
+      external_record_id: match.external_record_id,
     };
   }));
 }

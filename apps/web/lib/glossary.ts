@@ -1,7 +1,12 @@
 import type { GlossaryEntry, GlossaryMatch } from "./translation-types";
 
 export function orderedGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
-  const priority = (entry: GlossaryEntry) => entry.scope === "document" ? 3 : entry.scope === "persistent_user" ? 2 : entry.origin === "user" ? 2 : 1;
+  const priority = (entry: GlossaryEntry) => {
+    if (entry.scope === "document") return 4;
+    if (entry.scope === "persistent_user" && entry.source !== "import") return 3;
+    if (entry.scope === "persistent_user" || entry.origin === "user") return 2;
+    return 1;
+  };
   return [...entries]
     .filter((entry) => entry.status === undefined || entry.status === "approved")
     .sort((a, b) =>
@@ -47,6 +52,9 @@ function toMatch(entry: GlossaryEntry, matched_text: string): GlossaryMatch {
     origin: entry.origin,
     revision: entry.revision,
     scope: entry.scope,
+    domain: entry.domain,
+    external_source: entry.external_source,
+    external_record_id: entry.external_record_id,
   };
 }
 

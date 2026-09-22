@@ -55,6 +55,10 @@ export type GlossaryEntry = {
   revision?: number;
   status?: "proposed" | "approved" | "rejected" | "archived";
   source?: "manual" | "reviewed_correction" | "import" | "built_in";
+  domain?: string;
+  external_source?: string | null;
+  external_record_id?: string | null;
+  source_version?: string | null;
 };
 
 export type GlossaryMatch = {
@@ -66,6 +70,9 @@ export type GlossaryMatch = {
   origin: GlossaryOrigin;
   revision?: number;
   scope?: GlossaryScope;
+  domain?: string;
+  external_source?: string | null;
+  external_record_id?: string | null;
 };
 
 export type GlossaryUsageRecord = {
@@ -76,6 +83,9 @@ export type GlossaryUsageRecord = {
   outcome: "applied" | "warned";
   conflict: boolean;
   precedence: "document" | "approved_user" | "built_in";
+  domain?: string;
+  external_source?: string | null;
+  external_record_id?: string | null;
 };
 
 export type PlaceholderAttempt = {

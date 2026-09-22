@@ -8,11 +8,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import app.services.glossary_repository as glossary_repository_module
 from app.api.glossary import _csv_escaped_fields, _csv_restore, _csv_safe, get_glossary_repository
 from app.core.config import PROJECT_ROOT, Settings
 from app.glossary_models import GlossaryEntryCreate, GlossaryEntryUpdate
 from app.main import app
 from app.services.glossary_repository import (
+    MIGRATIONS,
     GlossaryRepositoryError,
     GlossaryRevisionConflictError,
     SqliteGlossaryRepository,
@@ -54,14 +56,81 @@ def client(repository: SqliteGlossaryRepository):
 def test_migration_is_idempotent_and_enables_safety_pragmas(repository: SqliteGlossaryRepository) -> None:
     repository.initialize()
     repository.initialize()
-    assert repository.schema_version() == 1
+    assert repository.schema_version() == 2
     with repository._connection() as configured_connection:
         assert configured_connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert configured_connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
         assert configured_connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert configured_connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     with sqlite3.connect(repository.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 1").fetchone()[0] == 1
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+def test_schema_one_database_migrates_without_changing_existing_data(tmp_path: Path) -> None:
+    database = tmp_path / "schema-one.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(MIGRATIONS[0][1])
+        connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-01-01T00:00:00Z')")
+        connection.execute(
+            """INSERT INTO glossary_entries(
+                id, source_term, target_term, source_language, target_language, domain, match_mode,
+                case_sensitive, status, origin, note, source_label, document_hash, revision,
+                created_at, updated_at, usage_count, last_used_at
+            ) VALUES ('old', 'curing', 'strjevanje', 'en', 'sl', '', 'preferred_term', 0,
+                      'archived', 'manual', 'legacy note', 'legacy source', NULL, 3, '2026-01-01T00:00:00Z',
+                      '2026-02-01T00:00:00Z', 7, '2026-02-02T00:00:00Z')"""
+        )
+        connection.execute(
+            """INSERT INTO glossary_history(history_id, entry_id, revision, action, snapshot_json, created_at)
+               VALUES ('history-old', 'old', 3, 'archive', '{"id":"old"}', '2026-02-01T00:00:00Z')"""
+        )
+        before_entry = connection.execute(
+            """SELECT id, source_term, target_term, status, revision, usage_count, note, source_label,
+                      created_at, updated_at, last_used_at FROM glossary_entries WHERE id = 'old'"""
+        ).fetchone()
+        before_history = connection.execute(
+            "SELECT history_id, entry_id, revision, action, snapshot_json, created_at FROM glossary_history"
+        ).fetchall()
+    migrated = SqliteGlossaryRepository(database)
+    assert migrated.schema_version() == 2
+    assert SqliteGlossaryRepository(database).schema_version() == 2
+    entry = migrated.get_entry("old")
+    assert entry.target_term == "strjevanje"
+    assert entry.status == "archived"
+    assert entry.revision == 3
+    assert entry.usage_count == 7
+    assert entry.external_source is None
+    with sqlite3.connect(database) as connection:
+        after_entry = connection.execute(
+            """SELECT id, source_term, target_term, status, revision, usage_count, note, source_label,
+                      created_at, updated_at, last_used_at FROM glossary_entries WHERE id = 'old'"""
+        ).fetchone()
+        after_history = connection.execute(
+            "SELECT history_id, entry_id, revision, action, snapshot_json, created_at FROM glossary_history"
+        ).fetchall()
+        assert before_entry == after_entry
+        assert before_history == after_history
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 2").fetchone()[0] == 1
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_failed_schema_migration_rolls_back_entire_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = tmp_path / "failed-migration.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(MIGRATIONS[0][1])
+        connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-01-01T00:00:00Z')")
+    failing = MIGRATIONS + ((3, "ALTER TABLE glossary_entries ADD COLUMN migration_probe TEXT; INVALID SQL;"),)
+    monkeypatch.setattr(glossary_repository_module, "MIGRATIONS", failing)
+
+    with pytest.raises(GlossaryRepositoryError):
+        SqliteGlossaryRepository(database).initialize()
+
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(glossary_entries)")}
+        assert "migration_probe" not in columns
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 3").fetchone()[0] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
 def test_create_update_history_and_revision_conflict(repository: SqliteGlossaryRepository) -> None:
@@ -180,15 +249,13 @@ def test_csv_preview_detects_duplicates_and_conflicts_inside_the_upload(client: 
     assert len(data["valid_rows"]) == 2
 
 
-def test_csv_import_requires_explicit_conflict_overwrite(client: TestClient) -> None:
+def test_legacy_csv_confirm_cannot_overwrite_existing_entries(client: TestClient) -> None:
     existing = client.post("/api/glossary/entries", json=payload(status="approved").model_dump()).json()
     row = payload(target_term="utrjevanje", status="approved", origin="import").model_dump() | {"row_number": 2}
-    skipped = client.post("/api/glossary/imports/csv/confirm", json={"rows": [row], "overwrite_conflicts": False}).json()
-    assert skipped == {"created": 0, "updated": 0, "skipped": 1}
-    imported = client.post("/api/glossary/imports/csv/confirm", json={"rows": [row], "overwrite_conflicts": True}).json()
-    assert imported == {"created": 0, "updated": 1, "skipped": 0}
+    response = client.post("/api/glossary/imports/csv/confirm", json={"rows": [row], "overwrite_conflicts": True})
+    assert response.status_code == 409
     history = client.get(f"/api/glossary/entries/{existing['id']}/history").json()
-    assert history[-1]["action"] == "import"
+    assert [item["action"] for item in history] == ["create"]
 
 
 def test_csv_export_escapes_spreadsheet_formulas_and_json_is_local(client: TestClient) -> None:
@@ -206,7 +273,7 @@ def test_csv_export_escapes_spreadsheet_formulas_and_json_is_local(client: TestC
     issue = next(item for item in preview["issues"] if item["existing_entry_id"] == created["id"])
     assert issue["kind"] == "duplicate"
     json_response = client.get("/api/glossary/export.json")
-    assert json_response.json()["schema_version"] == 1
+    assert json_response.json()["schema_version"] == 2
 
 
 def test_csv_negative_technical_term_round_trips_without_formula_prefix(client: TestClient) -> None:
@@ -325,3 +392,13 @@ def test_default_database_path_is_independent_of_working_directory(monkeypatch: 
         monkeypatch.chdir(working_directory)
         paths.append(Settings(_env_file=None).glossary_database_path)
     assert paths == [expected, expected]
+
+
+def test_default_database_path_does_not_create_database_under_arbitrary_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(_env_file=None)
+    assert settings.glossary_database_path == PROJECT_ROOT / "local-data" / "glossary.sqlite3"
+    assert not (tmp_path / "local-data" / "glossary.sqlite3").exists()

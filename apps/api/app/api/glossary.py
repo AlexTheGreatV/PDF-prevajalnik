@@ -43,6 +43,8 @@ MAX_IMPORT_ROWS = 1_000
 CSV_DATA_FIELDS = (
     "source_term", "target_term", "source_language", "target_language", "domain",
     "match_mode", "case_sensitive", "status", "origin", "note", "source_label", "document_hash",
+    "external_source", "external_record_id", "source_confidence", "definition", "context",
+    "source_version", "license_info", "import_file_sha256", "import_batch_id", "imported_at",
 )
 CSV_FIELDS = CSV_DATA_FIELDS + ("formula_escape_version", "formula_escaped_fields")
 FORMULA_ESCAPE_VERSION = "1"
@@ -164,7 +166,7 @@ def record_glossary_usage(
 def export_json(repository: SqliteGlossaryRepository = Depends(get_glossary_repository)) -> Response:
     try:
         entries, _ = repository.list_entries(limit=500, offset=0)
-        payload = {"schema_version": 1, "entries": [entry.model_dump(mode="json") for entry in entries]}
+        payload = {"schema_version": 2, "entries": [entry.model_dump(mode="json") for entry in entries]}
         return Response(
             json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="glossary.json"'},
@@ -219,24 +221,11 @@ def confirm_csv(
     payload: GlossaryImportConfirm,
     repository: SqliteGlossaryRepository = Depends(get_glossary_repository),
 ) -> GlossaryImportResult:
-    created = updated = skipped = 0
-    for row in payload.rows:
-        create = GlossaryEntryCreate.model_validate(row.model_dump(exclude={"row_number"}) | {"origin": "import"})
-        matches = repository.find_same_source(create)
-        duplicate = next((entry for entry in matches if _same_definition(entry, create)), None)
-        if duplicate:
-            skipped += 1
-            continue
-        if matches:
-            if not payload.overwrite_conflicts:
-                skipped += 1
-                continue
-            repository.import_overwrite(matches[0].id, matches[0].revision, create)
-            updated += 1
-            continue
-        repository.create_entry(create, action="import")
-        created += 1
-    return GlossaryImportResult(created=created, updated=updated, skipped=skipped)
+    del payload, repository
+    raise HTTPException(
+        status_code=409,
+        detail="Potrditev starega CSV predogleda ni več podprta. Uporabite varen terminološki predogled z vezanim SHA-256.",
+    )
 
 
 def _preview_rows(text: str, repository: SqliteGlossaryRepository) -> GlossaryImportPreview:
@@ -267,7 +256,7 @@ def _preview_rows(text: str, repository: SqliteGlossaryRepository) -> GlossaryIm
                 source_term=restored["source_term"], target_term=restored["target_term"],
                 source_language=restored["source_language"] or "en", target_language=restored["target_language"] or "sl",
                 domain=restored["domain"], match_mode=restored["match_mode"] or "preferred_term",
-                case_sensitive=_csv_bool(restored["case_sensitive"]), status=restored["status"] or "proposed",
+                case_sensitive=_csv_bool(restored["case_sensitive"]), status="proposed",
                 origin="import", note=restored["note"], source_label=restored["source_label"] or None,
                 document_hash=restored["document_hash"] or None,
             )
@@ -377,7 +366,7 @@ def _same_definition(entry: GlossaryEntry, row: GlossaryEntryCreate) -> bool:
         entry.source_term == row.source_term and entry.target_term == row.target_term and
         entry.source_language == row.source_language and entry.target_language == row.target_language and
         entry.domain == row.domain and entry.match_mode == row.match_mode and
-        entry.case_sensitive == row.case_sensitive and entry.status == row.status
+        entry.case_sensitive == row.case_sensitive
     )
 
 
@@ -394,5 +383,5 @@ def _same_import_source(left: GlossaryImportRow, right: GlossaryImportRow) -> bo
 def _same_import_definition(left: GlossaryImportRow, right: GlossaryImportRow) -> bool:
     return _same_import_source(left, right) and (
         left.target_term == right.target_term and left.match_mode == right.match_mode and
-        left.case_sensitive == right.case_sensitive and left.status == right.status
+        left.case_sensitive == right.case_sensitive
     )

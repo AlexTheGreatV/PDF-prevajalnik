@@ -7,6 +7,7 @@ from app.api.pdf import router as pdf_router
 from app.api.translation import router as translation_router
 from app.api.glossary import router as glossary_router
 from app.api.translation_memory import router as translation_memory_router
+from app.api.terminology_import import router as terminology_import_router
 from app.core.config import settings
 
 app = FastAPI(title="JUB/KOOP PDF Pipeline", version="0.1.0")
@@ -39,3 +40,4 @@ app.include_router(ocr_router, prefix="/api/ocr", tags=["ocr"])
 app.include_router(translation_router, prefix="/api/translation/providers", tags=["translation"])
 app.include_router(glossary_router, prefix="/api/glossary", tags=["glossary"])
 app.include_router(translation_memory_router, prefix="/api/translation-memory", tags=["translation-memory"])
+app.include_router(terminology_import_router, prefix="/api/glossary/imports/terminology", tags=["terminology-import"])

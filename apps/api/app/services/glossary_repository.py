@@ -17,9 +17,10 @@ from app.glossary_models import (
     GlossaryEntryUpdate,
     GlossaryHistoryRecord,
     GlossaryStats,
+    TerminologyImportCandidate,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class GlossaryRepositoryError(RuntimeError):
@@ -93,7 +94,19 @@ CREATE INDEX IF NOT EXISTS idx_glossary_terms
     ON glossary_entries(source_term, target_term);
 CREATE INDEX IF NOT EXISTS idx_glossary_history_entry
     ON glossary_history(entry_id, revision);
-"""),)
+"""), (2, """
+ALTER TABLE glossary_entries ADD COLUMN external_source TEXT;
+ALTER TABLE glossary_entries ADD COLUMN external_record_id TEXT;
+ALTER TABLE glossary_entries ADD COLUMN source_confidence TEXT;
+ALTER TABLE glossary_entries ADD COLUMN definition TEXT;
+ALTER TABLE glossary_entries ADD COLUMN context TEXT;
+ALTER TABLE glossary_entries ADD COLUMN source_version TEXT;
+ALTER TABLE glossary_entries ADD COLUMN license_info TEXT;
+ALTER TABLE glossary_entries ADD COLUMN import_file_sha256 TEXT;
+ALTER TABLE glossary_entries ADD COLUMN import_batch_id TEXT;
+ALTER TABLE glossary_entries ADD COLUMN imported_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_glossary_import_batch ON glossary_entries(import_batch_id);
+"""))
 
 
 class SqliteGlossaryRepository:
@@ -253,6 +266,69 @@ class SqliteGlossaryRepository:
         updates = payload.model_dump(exclude={"origin"})
         return self._write_update(entry_id, expected_revision, updates, "import")
 
+    def import_candidates(
+        self,
+        candidates: list[TerminologyImportCandidate],
+        *,
+        import_batch_id: str,
+        file_sha256: str,
+    ) -> tuple[int, int, int]:
+        """Insert selected external candidates atomically without overwriting existing entries."""
+        self.initialize()
+        created = skipped_duplicates = skipped_conflicts = 0
+        timestamp = _now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for candidate in candidates:
+                    matches = connection.execute(
+                        """SELECT * FROM glossary_entries
+                           WHERE source_language = ? AND target_language = ? AND domain = ?""",
+                        (candidate.source_language, candidate.target_language, candidate.domain),
+                    ).fetchall()
+                    same_source = [
+                        _entry(row) for row in matches
+                        if _term_equal(row["source_term"], candidate.source_term, bool(row["case_sensitive"]))
+                    ]
+                    if any(
+                        entry.target_term == candidate.target_term and entry.match_mode == candidate.match_mode
+                        for entry in same_source
+                    ):
+                        skipped_duplicates += 1
+                        continue
+                    current_revisions = {entry.id: entry.revision for entry in same_source}
+                    if current_revisions != candidate.existing_entry_revisions:
+                        skipped_conflicts += 1
+                        continue
+                    entry_id = str(uuid.uuid4())
+                    connection.execute(
+                        """INSERT INTO glossary_entries(
+                            id, source_term, target_term, source_language, target_language, domain,
+                            match_mode, case_sensitive, status, origin, note, source_label,
+                            document_hash, revision, created_at, updated_at, usage_count, last_used_at,
+                            external_source, external_record_id, source_confidence, definition, context,
+                            source_version, license_info, import_file_sha256, import_batch_id, imported_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'proposed', 'import', ?, ?, NULL, 1, ?, ?, 0, NULL,
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            entry_id, candidate.source_term, candidate.target_term,
+                            candidate.source_language, candidate.target_language, candidate.domain,
+                            candidate.match_mode, candidate.note, candidate.external_source,
+                            timestamp, timestamp, candidate.external_source,
+                            candidate.external_record_id, candidate.source_confidence,
+                            candidate.definition, candidate.context, candidate.source_version,
+                            candidate.license_info, file_sha256, import_batch_id, timestamp,
+                        ),
+                    )
+                    entry = self._get_in_connection(connection, entry_id)
+                    self._append_history(connection, entry, "import")
+                    created += 1
+                connection.commit()
+                return created, skipped_duplicates, skipped_conflicts
+            except Exception:
+                connection.rollback()
+                raise
+
     def _write_update(self, entry_id: str, expected_revision: int, updates: dict[str, object], action: GlossaryAction) -> GlossaryEntry:
         allowed = {
             "source_term", "target_term", "source_language", "target_language", "domain",
@@ -355,6 +431,8 @@ class SqliteGlossaryRepository:
 
 
 def _entry(row: sqlite3.Row) -> GlossaryEntry:
+    columns = set(row.keys())
+    optional = lambda name: row[name] if name in columns else None
     return GlossaryEntry(
         id=row["id"], source_term=row["source_term"], target_term=row["target_term"],
         source_language=row["source_language"], target_language=row["target_language"],
@@ -362,6 +440,11 @@ def _entry(row: sqlite3.Row) -> GlossaryEntry:
         status=row["status"], origin=row["origin"], note=row["note"], source_label=row["source_label"],
         document_hash=row["document_hash"], revision=row["revision"], created_at=row["created_at"],
         updated_at=row["updated_at"], usage_count=row["usage_count"], last_used_at=row["last_used_at"],
+        external_source=optional("external_source"), external_record_id=optional("external_record_id"),
+        source_confidence=optional("source_confidence"), definition=optional("definition"),
+        context=optional("context"), source_version=optional("source_version"),
+        license_info=optional("license_info"), import_file_sha256=optional("import_file_sha256"),
+        import_batch_id=optional("import_batch_id"), imported_at=optional("imported_at"),
     )
 
 

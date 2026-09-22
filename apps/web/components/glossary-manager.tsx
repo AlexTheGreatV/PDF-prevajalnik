@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { TerminologyImportPanel } from "./terminology-import-panel";
 
 import { createDefaultGlossary } from "../lib/default-glossary";
 import {
   EMPTY_GLOSSARY_DRAFT,
-  confirmGlossaryCsv,
   createLatestGlossaryRequestCoordinator,
   createGlossaryEntry,
   getGlossaryHistory,
@@ -13,13 +13,11 @@ import {
   glossaryExportUrl,
   listGlossaryEntries,
   persistentToRuntimeEntry,
-  previewGlossaryCsv,
   transitionGlossaryEntry,
   updateGlossaryEntry,
   type GlossaryEntryDraft,
   type GlossaryFilters,
   type GlossaryHistoryRecord,
-  type GlossaryImportPreview,
   type PersistentGlossaryEntry,
   type PersistentGlossaryLoadState,
 } from "../lib/persistent-glossary";
@@ -37,7 +35,6 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
   onProposalConsumed: () => void;
   onApprovedEntriesChange: (state: PersistentGlossaryLoadState) => void;
 }) {
-  const importRef = useRef<HTMLInputElement | null>(null);
   const loadCoordinator = useRef(createLatestGlossaryRequestCoordinator());
   const [tab, setTab] = useState<"overview" | "import">("overview");
   const [entries, setEntries] = useState<PersistentGlossaryEntry[]>([]);
@@ -46,8 +43,6 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
   const [draft, setDraft] = useState<GlossaryEntryDraft | null>(null);
   const [editing, setEditing] = useState<PersistentGlossaryEntry | null>(null);
   const [history, setHistory] = useState<{ id: string; rows: GlossaryHistoryRecord[] } | null>(null);
-  const [preview, setPreview] = useState<GlossaryImportPreview | null>(null);
-  const [overwrite, setOverwrite] = useState(false);
   const [available, setAvailable] = useState<boolean | null>(null);
   const [message, setMessage] = useState("Nalagam lokalni glosar …");
 
@@ -167,24 +162,6 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
     catch (error) { setMessage(error instanceof Error ? error.message : "Zgodovine ni bilo mogoče prebrati."); }
   }
 
-  async function previewImport(file: File | null) {
-    if (!file) return;
-    try { setPreview(await previewGlossaryCsv(file)); setMessage("Predogled je pripravljen; podatki še niso zapisani."); }
-    catch (error) { setPreview(null); setMessage(error instanceof Error ? error.message : "Predogled uvoza ni uspel."); }
-    finally { if (importRef.current) importRef.current.value = ""; }
-  }
-
-  async function confirmImport() {
-    if (!preview) return;
-    try {
-      const result = await confirmGlossaryCsv(preview, overwrite);
-      setMessage(`Uvoz: ${result.created} novih, ${result.updated} posodobljenih, ${result.skipped} preskočenih.`);
-      setPreview(null);
-      setOverwrite(false);
-      await refresh();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Uvoz ni uspel."); }
-  }
-
   return <section className="persistent-glossary" aria-label="Trajni lokalni glosar">
     <div className="translation-subhead">
       <div><h3>Trajni lokalni glosar</h3><p>Shranjeni so samo termini in sledljivost, ne dokumenti ali odstavki.</p></div>
@@ -192,7 +169,7 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
     </div>
     <div className="segmented glossary-tabs" role="tablist">
       <button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Pregled</button>
-      <button className={tab === "import" ? "active" : ""} onClick={() => setTab("import")}>Uvoz in izvoz</button>
+      <button className={tab === "import" ? "active" : ""} onClick={() => setTab("import")}>Zunanji kandidati</button>
     </div>
     {message && <p className={available === false ? "translation-error" : "translation-provider-message"}>{message}</p>}
     {available === false && <button className="button secondary" onClick={() => void refresh()}>Poskusi znova</button>}
@@ -226,7 +203,7 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
             {visibleBuiltIns.map((entry) => <tr key={entry.id}><td>{entry.source_term}</td><td>{entry.target_term}</td><td>organizacijski</td><td>Celoten segment</td><td>Odobreno</td><td><span className="glossary-badge built_in">BUILT-IN</span></td><td>Ni mogoče urejati</td></tr>)}
             {entries.map((entry) => <tr key={entry.id}>
               <td>{entry.source_term} {conflictIds.has(entry.id) && <span className="glossary-badge conflict">KONFLIKT</span>}</td><td>{entry.match_mode === "do_not_translate" ? "Ne prevajaj" : entry.target_term}</td><td>{entry.domain || "splošno"}</td><td>{modeLabel(entry.match_mode)}</td><td>{statusLabel(entry.status)}</td>
-              <td><span className={`glossary-badge ${entry.origin}`}>{originLabel(entry.origin)}</span>{entry.source_label && <small>{entry.source_label}</small>}</td>
+              <td><span className={`glossary-badge ${entry.origin}`}>{originLabel(entry.origin)}</span>{entry.source_label && <small>{entry.source_label}</small>}{entry.external_source && <small>{entry.external_source}{entry.external_record_id ? ` · ${entry.external_record_id}` : ""}</small>}</td>
               <td><div className="compact-actions"><button onClick={() => edit(entry)}>Uredi</button><button onClick={() => void showHistory(entry)}>Zgodovina</button>
                 {entry.status === "proposed" && <><button onClick={() => void transition(entry, "approve")}>Odobri</button><button onClick={() => void transition(entry, "reject")}>Zavrni</button></>}
                 {entry.status === "archived" ? <button onClick={() => void transition(entry, "restore")}>Obnovi</button> : <button onClick={() => void transition(entry, "archive")}>Arhiviraj</button>}
@@ -238,19 +215,8 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
     </>}
 
     {tab === "import" && <div className="glossary-import-export">
-      <div className="compact-actions"><a className="button secondary" href={glossaryExportUrl("csv")}>Izvozi CSV</a><a className="button secondary" href={glossaryExportUrl("json")}>Izvozi JSON</a><button className="button" onClick={() => importRef.current?.click()}>Predogled CSV uvoza</button></div>
-      <input ref={importRef} className="visually-hidden" type="file" accept="text/csv,.csv" onChange={(event) => void previewImport(event.target.files?.[0] ?? null)} />
-      {preview && <div className="import-preview"><dl><div><dt>Novi</dt><dd>{preview.new_count}</dd></div><div><dt>Dvojniki</dt><dd>{preview.duplicate_count}</dd></div><div><dt>Konflikti</dt><dd>{preview.conflict_count}</dd></div><div><dt>Neveljavni</dt><dd>{preview.invalid_count}</dd></div><div><dt>Preglasitve</dt><dd>{preview.override_count}</dd></div></dl>
-        {preview.valid_rows.length > 0 && <div className="glossary-table-wrap">
-          <h4>Vrednosti po varni obnovi</h4>
-          <table className="glossary-table"><thead><tr><th>Vrstica</th><th>Izvor</th><th>Prevod</th><th>Status</th></tr></thead>
-            <tbody>{preview.valid_rows.map((row) => <tr key={row.row_number}><td>{row.row_number}</td><td>{row.source_term}</td><td>{row.match_mode === "do_not_translate" ? "Ne prevajaj" : row.target_term}</td><td>{statusLabel(row.status)}</td></tr>)}</tbody>
-          </table>
-        </div>}
-        {preview.issues.map((issue) => <p key={`${issue.row_number}-${issue.kind}`}>Vrstica {issue.row_number}: {issue.message}</p>)}
-        {preview.conflict_count > 0 && <label><input type="checkbox" checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} /> Izrecno prepiši konflikte</label>}
-        <button className="button" disabled={preview.valid_rows.length === 0} onClick={() => void confirmImport()}>Potrdi uvoz</button>
-      </div>}
+      <div className="compact-actions"><a className="button secondary" href={glossaryExportUrl("csv")}>Izvozi CSV</a><a className="button secondary" href={glossaryExportUrl("json")}>Izvozi JSON</a></div>
+      <TerminologyImportPanel onImported={refresh} />
     </div>}
   </section>;
 }

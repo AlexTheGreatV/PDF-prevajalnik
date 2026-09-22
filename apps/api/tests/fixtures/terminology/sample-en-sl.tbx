@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tbx xmlns="urn:iso:std:iso:30042:ed-2">
+  <text>
+    <body>
+      <termEntry id="tbx-1">
+        <descrip type="subjectField">adhesives</descrip>
+        <descrip type="definition">Process of becoming solid.</descrip>
+        <langSet xml:lang="en"><tig><term>curing</term></tig></langSet>
+        <langSet xml:lang="sl"><tig><term>utrjevanje</term></tig></langSet>
+      </termEntry>
+    </body>
+  </text>
+</tbx>
