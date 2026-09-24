@@ -104,6 +104,98 @@ test("creates stable document-order segments including table cells", () => {
   assert.deepEqual(first.segments.filter((segment) => segment.block_type === "table_cell").map((segment) => segment.source_text), ["Package", "290 ml", "Colour", "RAL 9001"]);
 });
 
+test("keeps structural table geometry but omits cells without visible source text", () => {
+  const analysis = fixture();
+  const table = analysis.document!.pages[0].regions[1].blocks.find((item) => item.kind === "table")!;
+  table.table_cells = [
+    ["Visible", ""],
+    [" \t\n", "\u00a0"],
+    ["\u200b", "—"],
+    ["%", "+"],
+  ];
+  const originalGrid = structuredClone(table.table_cells);
+
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  const cells = job.segments.filter((segment) => segment.block_type === "table_cell");
+
+  assert.deepEqual(cells.map((segment) => segment.source_text), ["Visible", "—", "%", "+"]);
+  assert.deepEqual(cells.map((segment) => segment.segment_id), [
+    "p1-r2-b5-c1-1", "p1-r2-b5-c3-2", "p1-r2-b5-c4-1", "p1-r2-b5-c4-2",
+  ]);
+  assert.deepEqual(table.table_cells, originalGrid);
+});
+
+test("accepted OCR turns an explicitly linked empty table cell into a translation unit", () => {
+  const analysis = fixture();
+  const table = analysis.document!.pages[0].regions[1].blocks.find((item) => item.kind === "table")!;
+  table.table_cells = [["Label", ""]];
+  const item: OcrReviewItem = {
+    ...acceptedOcr(),
+    id: "table-cell-ocr",
+    linked_block_reading_order: table.reading_order,
+    linked_table_cell: { row_index: 0, column_index: 1 },
+    native_text: "",
+    ocr_text: "Recovered value",
+    effective_text: "Recovered value",
+    pdf_bbox: { x0: 50, y0: 40, x1: 95, y1: 50 },
+  };
+
+  const segment = createTranslationJob(analysis, [item], { source_language: "en", target_language: "sl" })
+    .segments.find((candidate) => candidate.segment_id === "p1-r2-b5-c1-2");
+
+  assert.equal(segment?.source_text, "Recovered value");
+  assert.equal(segment?.source_text_origin, "accepted_ocr");
+  assert.deepEqual(segment?.source_bbox, item.pdf_bbox);
+  assert.equal(segment?.accepted_ocr_source?.review_id, item.id);
+  assert.equal(table.table_cells[0][1], "");
+});
+
+test("imports legacy jobs with empty table cells without exposing them as translation units", () => {
+  const expected = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const legacy = JSON.parse(exportTranslationJob(expected));
+  const template = expected.segments.find((segment) => segment.block_type === "table_cell")!;
+  legacy.segments.push({
+    ...template,
+    segment_id: "p1-r2-b5-c9-9",
+    source_text: "\u200b",
+    translated_text: "",
+    edited_translation: "",
+    status: "skipped",
+    skip_reason: "Prazno besedilo.",
+    protected_tokens: [],
+    glossary_matches: [],
+    chunks: [],
+  });
+
+  const imported = importTranslationJob(JSON.stringify(legacy));
+  assert.equal(imported.segments.some((segment) => segment.segment_id === "p1-r2-b5-c9-9"), false);
+  assert.doesNotThrow(() => validateTranslationJobCompatibility(imported, expected));
+  assert.equal(JSON.parse(exportTranslationJob(imported)).segments.length, expected.segments.length);
+});
+
+test("never sends a legacy empty table cell to glossary memory or provider processing", async () => {
+  const base = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const template = base.segments.find((segment) => segment.block_type === "table_cell")!;
+  const provider = new DeterministicProvider();
+  const translated = await translateJobBatch({
+    ...base,
+    segments: [{
+      ...template,
+      segment_id: "legacy-empty-cell",
+      source_text: "\u00a0\u200b",
+      status: "pending",
+      skip_reason: null,
+      glossary_matches: [],
+      protected_tokens: [],
+    }],
+  }, provider);
+
+  assert.equal(provider.calls, 0);
+  assert.deepEqual(translated.segments, []);
+  assert.deepEqual(translated.glossary_usage, []);
+  assert.deepEqual(translated.translation_memory_usage, []);
+});
+
 test("uses accepted OCR effective text and retains native origin otherwise", () => {
   const native = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" }).segments[0];
   const ocr = createTranslationJob(fixture(), [acceptedOcr()], { source_language: "en", target_language: "sl" }).segments[0];

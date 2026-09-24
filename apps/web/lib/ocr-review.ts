@@ -60,6 +60,7 @@ export type OcrReviewItem = {
   error: string | null;
   source: "block" | "page" | "image" | "manual";
   linked_block_reading_order?: number;
+  linked_table_cell?: { row_index: number; column_index: number };
   warnings: string[];
   preprocessing_method?: string;
   segmentation_mode?: BrowserOcrSegmentationMode;

@@ -1,6 +1,7 @@
 import { apiBaseUrl } from "./pdf-client";
 import type { BBox } from "./pdf-types";
 import type { TranslationJob } from "./translation-types";
+import { isTranslationUnitSegment } from "./translation-units";
 
 export type PdfExportMode = "diagnostic" | "replacement_preview";
 export type ImageOverlapKind = "none" | "simple_background" | "complex_background" | "image_only_text" | "uncertain";
@@ -137,7 +138,10 @@ export async function downloadPdfExport(file: File, job: TranslationJob, mode: P
 function postExportRequest(path: string, file: File, job: TranslationJob, mode: PdfExportMode): Promise<Response> {
   const form = new FormData();
   form.append("file", file);
-  form.append("translation_job", JSON.stringify(job));
+  form.append("translation_job", JSON.stringify({
+    ...job,
+    segments: job.segments.filter(isTranslationUnitSegment),
+  }));
   form.append("mode", mode);
   return fetch(`${apiBaseUrl}${path}`, { method: "POST", body: form });
 }

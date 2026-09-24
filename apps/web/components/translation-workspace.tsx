@@ -38,6 +38,7 @@ import {
   type TranslationMemoryLoadState,
 } from "../lib/translation-memory";
 import { TranslationMemoryManager, type TranslationMemoryProposal } from "./translation-memory-manager";
+import { isTranslationUnitSegment } from "../lib/translation-units";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -106,11 +107,13 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   }, [job]);
 
   const visibleSegments = useMemo(
-    () => job?.segments.filter((segment) => filter === "all" || segment.status === filter) ?? [],
+    () => job?.segments.filter((segment) =>
+      isTranslationUnitSegment(segment) && (filter === "all" || segment.status === filter),
+    ) ?? [],
     [job, filter],
   );
-  const completed = job?.segments.filter((segment) => segment.status === "reviewed").length ?? 0;
-  const actionable = job?.segments.filter((segment) => segment.status !== "skipped").length ?? 0;
+  const completed = job?.segments.filter((segment) => isTranslationUnitSegment(segment) && segment.status === "reviewed").length ?? 0;
+  const actionable = job?.segments.filter((segment) => isTranslationUnitSegment(segment) && segment.status !== "skipped").length ?? 0;
 
   function prepare() {
     if (!glossaryReady || !translationMemoryReady) return;

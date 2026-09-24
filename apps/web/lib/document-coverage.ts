@@ -2,6 +2,7 @@ import type { OcrReviewItem } from "./ocr-review";
 import type { PdfExportPlan } from "./pdf-export-client";
 import type { PdfAnalysis, PdfKind, StructuredImage } from "./pdf-types";
 import type { TranslationJob, TranslationSegment } from "./translation-types";
+import { isTranslationUnitSegment } from "./translation-units";
 
 export function createCoverageRevisionKey(input: {
   analysis: PdfAnalysis;
@@ -79,7 +80,9 @@ export function calculateDocumentCoverage(input: {
   const pages = analysis.pages.map((analysisPage) => {
     const pageNumber = analysisPage.page_number;
     const structuredPage = analysis.document?.pages.find((page) => page.page_number === pageNumber);
-    const segments = job.segments.filter((segment) => segment.page_number === pageNumber);
+    const segments = job.segments.filter((segment) =>
+      segment.page_number === pageNumber && isTranslationUnitSegment(segment),
+    );
     const pageOcrItems = ocrItems.filter((item) => item.page_number === pageNumber);
     const digitalSegments = segments.filter((segment) =>
       segment.source_text_origin === "native" && Boolean(segment.source_text.trim()),

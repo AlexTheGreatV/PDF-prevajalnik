@@ -38,6 +38,10 @@ BODY_MIN_SCALE = 0.75
 TABLE_MIN_FONT_SIZE = 5.5
 TABLE_BODY_MIN_SCALE = 0.75
 TABLE_TITLE_MIN_SCALE = 0.85
+INVISIBLE_STRUCTURAL_TEXT = frozenset(
+    "\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b\u200c\u200d\u200e\u200f"
+    "\u2060\u2061\u2062\u2063\u2064\u2066\u2067\u2068\u2069\u3164\ufeff\uffa0"
+)
 
 
 class PdfExportValidationError(ValueError):
@@ -289,10 +293,14 @@ def _plan_tables(
     typography: PdfTypographyResolver,
     overlap_analyzer: PdfImageOverlapAnalyzer,
 ) -> tuple[list[PdfTableExportPlan], list[PdfReplacement]]:
+    segments_for_export = [
+        segment for segment in job.segments
+        if not _is_empty_structural_table_cell(segment)
+    ]
     detector = PdfTableAnalyzer()
     detected = {
         page_number: detector.detect(document[page_number - 1], page_number)
-        for page_number in sorted({segment.page_number for segment in job.segments if segment.block_type in {"table", "table_cell"}})
+        for page_number in sorted({segment.page_number for segment in segments_for_export if segment.block_type in {"table", "table_cell"}})
         if 1 <= page_number <= document.page_count
     }
     table_plans = {
@@ -312,15 +320,15 @@ def _plan_tables(
     cell_groups: dict[tuple[int, str], list[PdfExportSegment]] = defaultdict(list)
     container_blocks = {
         (segment.page_number, segment.block_id)
-        for segment in job.segments
+        for segment in segments_for_export
         if segment.block_type == "table"
     }
     cell_group_keys = {
         (segment.page_number, segment.block_id)
-        for segment in job.segments
+        for segment in segments_for_export
         if segment.block_type == "table_cell"
     }
-    for segment in job.segments:
+    for segment in segments_for_export:
         if segment.block_type == "table_cell":
             cell_groups[(segment.page_number, segment.block_id)].append(segment)
         elif segment.block_type == "table":
@@ -380,6 +388,15 @@ def _plan_tables(
             for cell in plan.cells:
                 _skip(cell, "duplicate_table_content", "Vsebina je podvojena s tabelnim vsebnikom.")
     return list(table_plans.values()), replacements
+
+
+def _is_empty_structural_table_cell(segment: PdfExportSegment) -> bool:
+    if segment.block_type != "table_cell":
+        return False
+    return not any(
+        not character.isspace() and character not in INVISIBLE_STRUCTURAL_TEXT
+        for character in segment.source_text
+    )
 
 
 def _table_match_score(table: DetectedTable, segments: list[PdfExportSegment]) -> float:

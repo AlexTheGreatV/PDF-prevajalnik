@@ -27,6 +27,29 @@ export type TerminologyImportOptions = {
   csv_mapping?: CsvColumnMapping;
 };
 
+export const TERMINOLOGY_PREVIEW_BUTTON_LABEL = "Pripravi predogled";
+
+export type TerminologyPreviewFormState = {
+  file_selected: boolean;
+  format: "csv" | "tbx";
+  source_language: string;
+  target_language: string;
+  external_source: string;
+  csv_mapping: CsvColumnMapping;
+};
+
+export function terminologyPreviewValidation(state: TerminologyPreviewFormState): string[] {
+  const issues: string[] = [];
+  if (!state.file_selected) issues.push("Izberite CSV ali TBX datoteko.");
+  if (!state.source_language.trim()) issues.push("Vnesite izvorni jezik.");
+  if (!state.target_language.trim()) issues.push("Vnesite ciljni jezik.");
+  if (!state.external_source.trim()) issues.push("Vnesite dejanski zunanji vir zaradi sledljivosti.");
+  if (state.format === "csv" && (!state.csv_mapping.source_term || !state.csv_mapping.target_term)) {
+    issues.push("Preslikajte stolpca za izvorni in ciljni termin.");
+  }
+  return issues;
+}
+
 export type TerminologyCandidate = {
   candidate_id: string;
   row_number: number;

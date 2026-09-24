@@ -98,17 +98,21 @@ def test_multiline_scale_and_cell_overflow_are_isolated(tmp_path: Path) -> None:
         assert "Values" in document[0].get_text()
 
 
-def test_empty_and_none_cells_remain_unchanged(tmp_path: Path) -> None:
+def test_empty_and_none_cells_remain_in_grid_but_not_in_replacement_plan(tmp_path: Path) -> None:
     source = tmp_path / "merged.pdf"
     _make_table(source, merged_header=True)
+    before_hash = _hash(source)
     detected = _detected(source)
     assert detected.cells[0][0].column_span == 2
     payload = _job_payload(source)
     empty = next(segment for segment in payload["segments"] if segment["segment_id"].endswith("-c1-2"))
-    empty.update(status="reviewed", edited_translation="ne sme biti izvoženo")
+    empty.update(source_text="\u00a0\u200b", status="reviewed", edited_translation="ne sme biti izvoženo")
     plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "diagnostic", tmp_path / "work")
-    cell = next(cell for cell in plan.tables[0].cells if cell.row_index == 0 and cell.column_index == 1)
-    assert cell.skip_reason == "empty_cell"
+    assert _hash(source) == before_hash
+    assert plan.tables[0].row_count == 2
+    assert plan.tables[0].column_count == 2
+    assert not any(cell.row_index == 0 and cell.column_index == 1 for cell in plan.tables[0].cells)
+    assert not any(item.segment_id == empty["segment_id"] for item in plan.replacements)
 
 
 def test_duplicate_container_and_cell_content_are_rejected(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ import type { OcrReviewItem } from "./ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "./pdf-types";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
+import { hasVisibleTranslationText, isTranslationUnitSegment } from "./translation-units";
 import { selectExactTranslationMemoryMatch, type TranslationMemoryEntry } from "./translation-memory";
 import {
   createActiveTranslationProfileMetadata,
@@ -49,7 +50,18 @@ export function createTranslationJob(
         const blockId = `p${page.page_number}-r${region.reading_order}-b${block.reading_order}`;
         if (block.kind === "table" && block.table_cells) {
           block.table_cells.forEach((row, rowIndex) => row.forEach((cell, columnIndex) => {
-            segments.push(createSegment(cell, {
+            const acceptedOcr = ocrItems.find((item) =>
+              item.page_number === page.page_number &&
+              item.linked_block_reading_order === block.reading_order &&
+              item.linked_table_cell?.row_index === rowIndex &&
+              item.linked_table_cell.column_index === columnIndex &&
+              item.status === "accepted" &&
+              item.selected_text_source === "ocr" &&
+              hasVisibleTranslationText(item.effective_text),
+            );
+            const sourceText = acceptedOcr?.effective_text ?? cell;
+            if (!hasVisibleTranslationText(sourceText)) return;
+            segments.push(createSegment(sourceText, {
               segment_id: `${blockId}-c${rowIndex + 1}-${columnIndex + 1}`,
               block_id: blockId,
               block_type: "table_cell",
@@ -58,7 +70,9 @@ export function createTranslationJob(
               page_rotation: page.rotation,
               region,
               block,
-              source_origin: "native",
+              source_origin: acceptedOcr ? "accepted_ocr" : "native",
+              accepted_ocr_source: acceptedOcr ? acceptedOcrSource(acceptedOcr) : null,
+              source_bbox: acceptedOcr?.pdf_bbox,
               source_language: options.source_language,
               target_language: options.target_language,
               glossary,
@@ -74,7 +88,7 @@ export function createTranslationJob(
           item.linked_block_reading_order === block.reading_order &&
           item.status === "accepted" &&
           item.selected_text_source === "ocr" &&
-          item.effective_text.trim(),
+          hasVisibleTranslationText(item.effective_text),
         );
         segments.push(createSegment(acceptedOcr?.effective_text ?? block.normalized_text, {
           segment_id: blockId,
@@ -172,7 +186,7 @@ export function invalidateStaleOcrApprovals(job: TranslationJob, ocrItems: OcrRe
     const provenance = segment.accepted_ocr_source;
     if (segment.source_text_origin !== "accepted_ocr" || !provenance) return segment;
     const current = items.get(provenance.review_id);
-    const accepted = current?.status === "accepted" && current.selected_text_source === "ocr" && current.effective_text.trim();
+    const accepted = current?.status === "accepted" && current.selected_text_source === "ocr" && hasVisibleTranslationText(current.effective_text);
     const next = accepted ? acceptedOcrSource(current) : null;
     if (next && JSON.stringify(next) === JSON.stringify(provenance)) return segment;
     changed = true;
@@ -221,7 +235,9 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     target_language: input.target_language,
     source_text,
     source_text_origin: input.source_origin,
-    source_bbox: input.block_type === "table_cell" ? null : { ...(input.source_bbox ?? input.block.bbox) },
+    source_bbox: input.block_type === "table_cell" && input.source_origin === "native"
+      ? null
+      : { ...(input.source_bbox ?? input.block.bbox) },
     source_page_type: input.page_type,
     source_rotation: input.page_rotation,
     source_style: input.block_type === "table_cell" ? null : { ...input.block.style },
@@ -259,7 +275,7 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
 }
 
 function isAcceptedStandaloneOcr(item: OcrReviewItem): boolean {
-  return item.status === "accepted" && item.selected_text_source === "ocr" && item.effective_text.trim().length > 0 &&
+  return item.status === "accepted" && item.selected_text_source === "ocr" && hasVisibleTranslationText(item.effective_text) &&
     item.linked_block_reading_order === undefined && ["manual", "image", "page"].includes(item.source);
 }
 
@@ -452,10 +468,11 @@ export async function translateJobBatch(
 ): Promise<TranslationJob> {
   if (signal?.aborted) return job;
   const glossary = cloneGlossary(job.glossary);
+  const translationUnits = job.segments.filter(isTranslationUnitSegment);
   const withGlossary = {
     ...job,
     glossary_snapshot: cloneGlossary(glossary),
-    segments: job.segments.map((segment) =>
+    segments: translationUnits.map((segment) =>
       ["pending", "failed"].includes(segment.status) && !segment.skip_reason
         ? applyExactSegmentGlossary(segment, glossary)
         : segment,
@@ -1310,10 +1327,12 @@ function cloneGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
 }
 
 function finalizeTranslationJob(job: TranslationJob): TranslationJob {
+  const segments = job.segments.filter(isTranslationUnitSegment);
+  const normalizedJob = segments.length === job.segments.length ? job : { ...job, segments };
   return refreshTranslationProfileMetadata({
-    ...job,
-    glossary_usage: collectGlossaryUsage(job),
-    translation_memory_usage: job.segments.flatMap((segment) => {
+    ...normalizedJob,
+    glossary_usage: collectGlossaryUsage(normalizedJob),
+    translation_memory_usage: normalizedJob.segments.flatMap((segment) => {
       const direct = segment.translation_memory_entry_id && segment.translation_memory_revision && segment.translation_memory_match === "exact"
         ? [{ segment_id: segment.segment_id, entry_id: segment.translation_memory_entry_id,
           revision: segment.translation_memory_revision, match: "exact" as const,

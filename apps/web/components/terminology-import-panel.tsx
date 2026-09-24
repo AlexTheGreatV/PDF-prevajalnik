@@ -6,6 +6,8 @@ import {
   confirmTerminologyImport,
   previewTerminologyImport,
   readCsvHeaders,
+  TERMINOLOGY_PREVIEW_BUTTON_LABEL,
+  terminologyPreviewValidation,
   type CsvColumnMapping,
   type TerminologyImportPreview,
 } from "../lib/terminology-import";
@@ -40,6 +42,15 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
     (!sourceFilter || candidate.external_source === sourceFilter) &&
     (!query || `${candidate.source_term} ${candidate.target_term} ${candidate.external_record_id ?? ""}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())),
   ), [classification, domainFilter, languageFilter, preview, query, sourceFilter]);
+  const previewIssues = terminologyPreviewValidation({
+    file_selected: Boolean(file),
+    format,
+    source_language: sourceLanguage,
+    target_language: targetLanguage,
+    external_source: externalSource,
+    csv_mapping: mapping,
+  });
+  const previewDisabled = busy || previewIssues.length > 0;
 
   async function chooseFile(nextFile: File | null) {
     setFile(nextFile); setPreview(null); setSelected(new Set());
@@ -99,12 +110,14 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
   return <div className="terminology-import-panel">
     <header><h4>Zunanji terminološki kandidati</h4><p>TBX ali CSV se obdela samo lokalno. Kandidati se vedno uvozijo kot predlagani in ne vplivajo na prevajanje do ločene odobritve.</p></header>
     <div className="terminology-import-settings">
-      <label>Datoteka<input type="file" accept=".csv,.tbx,text/csv,application/xml,text/xml" onChange={(event) => void chooseFile(event.target.files?.[0] ?? null)} /></label>
+      <label>Datoteka <RequiredMark /><input required aria-invalid={!file} type="file" accept=".csv,.tbx,text/csv,application/xml,text/xml" onChange={(event) => void chooseFile(event.target.files?.[0] ?? null)} /></label>
       <label>Oblika<select value={format} onChange={(event) => setFormat(event.target.value as "csv" | "tbx")}><option value="csv">CSV</option><option value="tbx">TBX Basic</option></select></label>
-      <label>Izvorni jezik<input value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} /></label>
-      <label>Ciljni jezik<input value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} /></label>
+      <label>Izvorni jezik <RequiredMark /><input required aria-invalid={!sourceLanguage.trim()} value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} /></label>
+      <label>Ciljni jezik <RequiredMark /><input required aria-invalid={!targetLanguage.trim()} value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} /></label>
       <label>Privzeta domena<input value={domain} onChange={(event) => setDomain(event.target.value)} /></label>
-      <label>Zunanji vir<input required value={externalSource} onChange={(event) => setExternalSource(event.target.value)} placeholder="npr. uporabniški IATE izvoz" /></label>
+      <label>Zunanji vir <RequiredMark /><input required aria-invalid={!externalSource.trim()} aria-describedby={!externalSource.trim() ? "terminology-source-error" : undefined} value={externalSource} onChange={(event) => setExternalSource(event.target.value)} placeholder="npr. lokalni terminološki izvoz" />
+        {!externalSource.trim() && <span id="terminology-source-error" className="field-error">Vnesite dejanski vir podatkov zaradi sledljivosti.</span>}
+      </label>
       <label>Datum ali različica vira<input value={sourceVersion} onChange={(event) => setSourceVersion(event.target.value)} /></label>
       <label>Licenca ali atribucija<input value={licenseInfo} onChange={(event) => setLicenseInfo(event.target.value)} /></label>
     </div>
@@ -122,7 +135,12 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
       <ColumnSelect label="Opomba" headers={headers} value={mapping.note ?? ""} onChange={(value) => setMapping({ ...mapping, note: value || undefined })} />
       <ColumnSelect label="Različica vira" headers={headers} value={mapping.source_version ?? ""} onChange={(value) => setMapping({ ...mapping, source_version: value || undefined })} />
     </div>}
-    <div className="compact-actions"><button className="button" disabled={busy || !file || !externalSource.trim() || (format === "csv" && (!mapping.source_term || !mapping.target_term))} onClick={() => void runPreview()}>{busy ? "Preverjam …" : "Pripravi predogled"}</button></div>
+    <div className="compact-actions terminology-preview-actions">
+      <button type="button" className="button terminology-preview-button" disabled={previewDisabled} aria-busy={busy} aria-describedby="terminology-preview-help" onClick={() => void runPreview()}>{TERMINOLOGY_PREVIEW_BUTTON_LABEL}</button>
+      <p id="terminology-preview-help" className="action-help" role="status">
+        {busy ? "Predogled se pripravlja …" : previewIssues.length > 0 ? previewIssues.join(" ") : "Vsi zahtevani podatki so izpolnjeni; priprava predogleda še ne zapisuje v glosar."}
+      </p>
+    </div>
     <p className="translation-provider-message">{message}</p>
     {preview && <>
       <dl className="import-summary">
@@ -152,7 +170,11 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
 }
 
 function ColumnSelect({ label, headers, value, required = false, onChange }: { label: string; headers: string[]; value: string; required?: boolean; onChange: (value: string) => void }) {
-  return <label>{label}<select required={required} value={value} onChange={(event) => onChange(event.target.value)}><option value="">Ni preslikano</option>{headers.map((header) => <option key={header}>{header}</option>)}</select></label>;
+  return <label>{label}{required && <> <RequiredMark /></>}<select required={required} aria-invalid={required && !value} value={value} onChange={(event) => onChange(event.target.value)}><option value="">Ni preslikano</option>{headers.map((header) => <option key={header}>{header}</option>)}</select></label>;
+}
+
+function RequiredMark() {
+  return <span className="required-mark" aria-hidden="true">*</span>;
 }
 
 function CandidateDetails({ candidate }: { candidate: TerminologyImportPreview["candidates"][number] }) {

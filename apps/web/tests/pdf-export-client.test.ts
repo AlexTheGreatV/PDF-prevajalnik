@@ -65,6 +65,26 @@ test("prepares a local multipart PDF export plan", async () => {
   }
 });
 
+test("does not send legacy empty table cells to the PDF replacement plan", async () => {
+  const currentJob = job();
+  currentJob.segments = [
+    segment({ segment_id: "visible", block_type: "table_cell", source_text: "—", status: "reviewed", edited_translation: "—" }),
+    segment({ segment_id: "empty", block_type: "table_cell", source_text: "\u00a0\u200b", status: "skipped", skip_reason: "Prazno besedilo." }),
+  ];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input, init) => {
+    const form = init?.body as FormData;
+    const sent = JSON.parse(String(form.get("translation_job"))) as TranslationJob;
+    assert.deepEqual(sent.segments.map((item) => item.segment_id), ["visible"]);
+    return new Response(JSON.stringify(plan([])), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    await preparePdfExport(new File(["%PDF-"], "source.pdf", { type: "application/pdf" }), currentJob, "diagnostic");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("downloads a new local PDF with the server filename", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(new Blob(["%PDF-output"], { type: "application/pdf" }), {
@@ -180,6 +200,26 @@ test("reports partial table and overflow export without hiding safe output", () 
   assert.equal(coverage.pdf_export.exported, 1);
   assert.ok(coverage.states.includes("partially_exported"));
   assert.deepEqual(coverage.pages[0].skips, [{ reason: "cell_overflow", count: 1 }]);
+});
+
+test("excludes legacy empty table cells from coverage counters and skips", () => {
+  const currentJob = job();
+  currentJob.segments = [
+    segment({ segment_id: "cell-visible", block_type: "table_cell", source_text: "%", status: "reviewed", edited_translation: "%" }),
+    segment({ segment_id: "cell-empty", block_type: "table_cell", source_text: "\u200b", status: "skipped", skip_reason: "Prazno besedilo." }),
+  ];
+  const coverage = calculateDocumentCoverage({
+    analysis: analysis(["digital"]), ocrItems: [], job: currentJob,
+    plan: plan([{ segment_id: "cell-visible", page_number: 1, eligible: true, skip_reason: null }]),
+    downloadCompleted: true,
+  });
+
+  assert.equal(coverage.pages[0].digital_segments, 1);
+  assert.deepEqual(coverage.translation, { translated: 1, translatable: 1 });
+  assert.deepEqual(coverage.review, { reviewed: 1, translated: 1 });
+  assert.equal(coverage.pages[0].reviewed_segments, 1);
+  assert.equal(coverage.pdf_export.exported, 1);
+  assert.deepEqual(coverage.pages[0].skips, []);
 });
 
 test("reports security skips separately from successful safe replacements", () => {

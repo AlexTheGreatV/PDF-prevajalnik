@@ -174,6 +174,11 @@ input {
   background: var(--accent-dark);
 }
 
+.button:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
 .button.secondary {
   border: 1px solid var(--border);
   background: #ffffff;
@@ -977,7 +982,7 @@ pre {
 .glossary-badge.conflict { margin-left: 4px; border-color: #c2413b; color: #9f2d28; background: #fff4f3; }
 
 .compact-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.compact-actions button { padding: 6px 8px; border: 1px solid #aebbb6; background: #fff; cursor: pointer; }
+.compact-actions button:not(.button) { padding: 6px 8px; border: 1px solid #aebbb6; background: #fff; color: var(--text); cursor: pointer; }
 .glossary-history { margin-top: 12px; }
 .glossary-history p { margin: 6px 0; font-size: 0.82rem; }
 .glossary-import-export { display: grid; gap: 14px; }
@@ -1143,6 +1148,11 @@ pre {
 .candidate-details summary { cursor: pointer; color: var(--muted); }
 .candidate-details p { margin: 4px 0; font-weight: 400; }
 .terminology-import-panel code { overflow-wrap: anywhere; }
+.terminology-preview-actions { align-items: flex-start; }
+.terminology-preview-button:disabled { border: 1px solid #aebbb6; background: #e2e7e5; color: #42514c; opacity: 1; }
+.action-help { flex: 1 1 280px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.field-error { color: var(--danger); font-size: 11px; font-weight: 600; }
+.required-mark { color: var(--danger); }
 
 .terminology-source-row {
   display: grid;
