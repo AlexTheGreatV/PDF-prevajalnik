@@ -35,6 +35,12 @@ export type PersistentGlossaryEntry = {
   import_file_sha256?: string | null;
   import_batch_id?: string | null;
   imported_at?: string | null;
+  external_evaluation?: string | null;
+  external_primarity?: string | null;
+  external_lifecycle?: string | null;
+  external_institution?: string | null;
+  external_origins?: string | null;
+  external_modified_at?: string | null;
 };
 
 export type GlossaryEntryDraft = Pick<PersistentGlossaryEntry,

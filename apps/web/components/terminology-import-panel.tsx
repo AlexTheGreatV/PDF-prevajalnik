@@ -4,11 +4,13 @@ import { useMemo, useState } from "react";
 
 import {
   confirmTerminologyImport,
+  detectTerminologyFileProfile,
+  IATE_ATTRIBUTION,
   previewTerminologyImport,
-  readCsvHeaders,
   TERMINOLOGY_PREVIEW_BUTTON_LABEL,
   terminologyPreviewValidation,
   type CsvColumnMapping,
+  type TerminologyImportFormat,
   type TerminologyImportPreview,
 } from "../lib/terminology-import";
 
@@ -16,7 +18,7 @@ const EMPTY_MAPPING: CsvColumnMapping = { source_term: "", target_term: "" };
 
 export function TerminologyImportPanel({ onImported }: { onImported: () => Promise<void> }) {
   const [file, setFile] = useState<File | null>(null);
-  const [format, setFormat] = useState<"csv" | "tbx">("csv");
+  const [format, setFormat] = useState<TerminologyImportFormat>("csv");
   const [headers, setHeaders] = useState<string[]>([]);
   const [mapping, setMapping] = useState<CsvColumnMapping>(EMPTY_MAPPING);
   const [sourceLanguage, setSourceLanguage] = useState("en");
@@ -55,15 +57,18 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
   async function chooseFile(nextFile: File | null) {
     setFile(nextFile); setPreview(null); setSelected(new Set());
     if (!nextFile) { setHeaders([]); return; }
-    const nextFormat = nextFile.name.toLocaleLowerCase().endsWith(".tbx") ? "tbx" : "csv";
-    setFormat(nextFormat);
-    if (nextFormat === "csv") {
-      try {
-        const nextHeaders = await readCsvHeaders(nextFile);
-        setHeaders(nextHeaders);
-        setMapping({ source_term: nextHeaders[0] ?? "", target_term: nextHeaders[1] ?? "" });
-      } catch (error) { setMessage(error instanceof Error ? error.message : "Glave CSV ni bilo mogoče prebrati."); }
-    } else setHeaders([]);
+    try {
+      const profile = await detectTerminologyFileProfile(nextFile);
+      setFormat(profile.format);
+      setHeaders(profile.headers);
+      if (profile.format === "iate_csv") {
+        setMapping(EMPTY_MAPPING);
+        setSourceLanguage("en"); setTargetLanguage("sl"); setExternalSource(IATE_ATTRIBUTION);
+        setMessage("Prepoznan je uradni profil IATE CSV. Ročna preslikava stolpcev ni potrebna.");
+      } else if (profile.format === "csv") {
+        setMapping({ source_term: profile.headers[0] ?? "", target_term: profile.headers[1] ?? "" });
+      }
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Glave datoteke ni bilo mogoče prebrati."); }
   }
 
   async function runPreview() {
@@ -81,7 +86,9 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
         csv_mapping: format === "csv" ? mapping : undefined,
       });
       setPreview(result);
-      setSelected(new Set(result.candidates.filter((item) => item.classification === "new").map((item) => item.candidate_id)));
+      setSelected(result.format === "iate_csv"
+        ? new Set()
+        : new Set(result.candidates.filter((item) => item.classification === "new").map((item) => item.candidate_id)));
       setMessage("Predogled je pripravljen. V glosar še ni bilo nič zapisano.");
     } catch (error) { setPreview(null); setMessage(error instanceof Error ? error.message : "Predogled ni uspel."); }
     finally { setBusy(false); }
@@ -111,11 +118,11 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
     <header><h4>Zunanji terminološki kandidati</h4><p>TBX ali CSV se obdela samo lokalno. Kandidati se vedno uvozijo kot predlagani in ne vplivajo na prevajanje do ločene odobritve.</p></header>
     <div className="terminology-import-settings">
       <label>Datoteka <RequiredMark /><input required aria-invalid={!file} type="file" accept=".csv,.tbx,text/csv,application/xml,text/xml" onChange={(event) => void chooseFile(event.target.files?.[0] ?? null)} /></label>
-      <label>Oblika<select value={format} onChange={(event) => setFormat(event.target.value as "csv" | "tbx")}><option value="csv">CSV</option><option value="tbx">TBX Basic</option></select></label>
+      <label>Oblika<select value={format} onChange={(event) => setFormat(event.target.value as TerminologyImportFormat)}><option value="csv">CSV</option><option value="iate_csv">IATE CSV</option><option value="tbx">TBX Basic</option></select></label>
       <label>Izvorni jezik <RequiredMark /><input required aria-invalid={!sourceLanguage.trim()} value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} /></label>
       <label>Ciljni jezik <RequiredMark /><input required aria-invalid={!targetLanguage.trim()} value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} /></label>
       <label>Privzeta domena<input value={domain} onChange={(event) => setDomain(event.target.value)} /></label>
-      <label>Zunanji vir <RequiredMark /><input required aria-invalid={!externalSource.trim()} aria-describedby={!externalSource.trim() ? "terminology-source-error" : undefined} value={externalSource} onChange={(event) => setExternalSource(event.target.value)} placeholder="npr. lokalni terminološki izvoz" />
+      <label>Zunanji vir <RequiredMark /><input required readOnly={format === "iate_csv"} aria-invalid={!externalSource.trim()} aria-describedby={!externalSource.trim() ? "terminology-source-error" : undefined} value={externalSource} onChange={(event) => setExternalSource(event.target.value)} placeholder="npr. lokalni terminološki izvoz" />
         {!externalSource.trim() && <span id="terminology-source-error" className="field-error">Vnesite dejanski vir podatkov zaradi sledljivosti.</span>}
       </label>
       <label>Datum ali različica vira<input value={sourceVersion} onChange={(event) => setSourceVersion(event.target.value)} /></label>
@@ -135,6 +142,7 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
       <ColumnSelect label="Opomba" headers={headers} value={mapping.note ?? ""} onChange={(value) => setMapping({ ...mapping, note: value || undefined })} />
       <ColumnSelect label="Različica vira" headers={headers} value={mapping.source_version ?? ""} onChange={(value) => setMapping({ ...mapping, source_version: value || undefined })} />
     </div>}
+    {format === "iate_csv" && <p className="translation-provider-message"><strong>IATE CSV:</strong> stolpci in jezika EN–SL so prepoznani iz dokumentirane glave; preslikava ni potrebna.</p>}
     <div className="compact-actions terminology-preview-actions">
       <button type="button" className="button terminology-preview-button" disabled={previewDisabled} aria-busy={busy} aria-describedby="terminology-preview-help" onClick={() => void runPreview()}>{TERMINOLOGY_PREVIEW_BUTTON_LABEL}</button>
       <p id="terminology-preview-help" className="action-help" role="status">
@@ -148,6 +156,14 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
         <div><dt>Dvojniki</dt><dd>{preview.duplicate_count}</dd></div><div><dt>Konflikti</dt><dd>{preview.conflict_count}</dd></div>
         <div><dt>Neveljavni</dt><dd>{preview.invalid_count}</dd></div><div><dt>Manjkajoči jeziki/prevodi</dt><dd>{preview.missing_language_count + preview.missing_translation_count}</dd></div>
       </dl>
+      {preview.format === "iate_csv" && <dl className="import-summary">
+        <div><dt>Vhodne vrstice</dt><dd>{preview.input_row_count}</dd></div><div><dt>IATE ID</dt><dd>{preview.concept_count}</dd></div>
+        <div><dt>EN / SL vrstice</dt><dd>{preview.source_row_count} / {preview.target_row_count}</dd></div><div><dt>Varni kandidati</dt><dd>{preview.safe_candidate_count}</dd></div>
+        <div><dt>Manjkajoč jezik</dt><dd>{preview.missing_language_count}</dd></div><div><dt>Večtermni (končna kategorija)</dt><dd>{preview.multi_term_count}</dd></div>
+        <div><dt>Večtermni (surovo, s prekrivanjem)</dt><dd>{preview.raw_multi_term_count}</dd></div><div><dt>Zavrnjen status/lifecycle</dt><dd>{preview.rejected_status_or_lifecycle_count}</dd></div>
+        <div><dt>Status / lifecycle podrobno</dt><dd>{preview.status_rejected_count} / {preview.lifecycle_rejected_count}</dd></div><div><dt>Podvojene vrstice</dt><dd>{preview.duplicate_row_count}</dd></div>
+        <div><dt>Izločeni konfliktni koncepti</dt><dd>{preview.interconcept_conflict_count}</dd></div><div><dt>Konfliktne skupine</dt><dd>{preview.interconcept_conflict_group_count}</dd></div>
+      </dl>}
       <p><strong>SHA-256:</strong> <code>{preview.file_sha256}</code><br /><strong>Vir:</strong> {preview.external_source}{preview.license_info ? ` · ${preview.license_info}` : ""}</p>
       {preview.ignored_fields.length > 0 && <p>Prezrta polja: {preview.ignored_fields.join(", ")}</p>}
       <div className="glossary-toolbar">
@@ -163,7 +179,8 @@ export function TerminologyImportPanel({ onImported }: { onImported: () => Promi
           <td>{candidate.source_term}<CandidateDetails candidate={candidate} /></td><td>{candidate.target_term}</td><td>{candidate.domain || "splošno"}</td><td>{classificationLabel(candidate.classification)}</td><td>{candidate.external_source}{candidate.external_record_id ? ` · ${candidate.external_record_id}` : ""}</td>
         </tr>)}
       </tbody></table></div>
-      {preview.issues.map((issue, index) => <p className="translation-warning" key={`${issue.row_number}-${issue.kind}-${index}`}>Zapis {issue.row_number}: {issue.message}</p>)}
+      {preview.issues.slice(0, 100).map((issue, index) => <p className="translation-warning" key={`${issue.row_number}-${issue.kind}-${index}`}>Zapis {issue.row_number}: {issue.message}</p>)}
+      {preview.issues.length > 100 && <p className="translation-provider-message">Prikazanih je prvih 100 od {preview.issues.length} diagnostičnih zapisov; celotne kategorije so zajete v povzetku.</p>}
       <div className="compact-actions"><button className="button" disabled={busy || selected.size === 0} onClick={() => void commit()}>Uvozi {selected.size} izbranih kot predlagane</button></div>
     </>}
   </div>;
@@ -178,8 +195,8 @@ function RequiredMark() {
 }
 
 function CandidateDetails({ candidate }: { candidate: TerminologyImportPreview["candidates"][number] }) {
-  if (!candidate.definition && !candidate.context && !candidate.source_confidence) return null;
-  return <details className="candidate-details"><summary>Podrobnosti</summary>{candidate.definition && <p><strong>Definicija:</strong> {candidate.definition}</p>}{candidate.context && <p><strong>Kontekst:</strong> {candidate.context}</p>}{candidate.source_confidence && <p><strong>Zanesljivost vira:</strong> {candidate.source_confidence}</p>}</details>;
+  if (!candidate.definition && !candidate.context && !candidate.source_confidence && !candidate.external_evaluation && !candidate.external_lifecycle) return null;
+  return <details className="candidate-details"><summary>Podrobnosti</summary>{candidate.definition && <p><strong>Definicija:</strong> {candidate.definition}</p>}{candidate.context && <p><strong>Kontekst:</strong> {candidate.context}</p>}{candidate.source_confidence && <p><strong>Zanesljivost:</strong> {candidate.source_confidence}</p>}{candidate.external_evaluation && <p><strong>Vrednotenje:</strong> {candidate.external_evaluation}</p>}{candidate.external_primarity && <p><strong>Primarnost:</strong> {candidate.external_primarity}</p>}{candidate.external_lifecycle && <p><strong>Lifecycle:</strong> {candidate.external_lifecycle}</p>}{candidate.external_institution && <p><strong>Institucija:</strong> {candidate.external_institution}</p>}{candidate.external_origins && <p><strong>Izvor:</strong> {candidate.external_origins}</p>}{candidate.external_modified_at && <p><strong>Spremenjeno:</strong> {candidate.external_modified_at}</p>}</details>;
 }
 
 function classificationLabel(value: TerminologyImportPreview["candidates"][number]["classification"]) {

@@ -16,6 +16,7 @@ Allowed:
 - User-controlled exact, preferred, do-not-translate, and explicitly locked glossary entries
 - A provider-independent persistent local glossary backed by SQLite, with explicit approval, revision history, and import preview
 - Local streaming preview and explicit import of user-supplied CSV or supported TBX Basic terminology candidates into the persistent glossary
+- A dedicated local adapter for user-supplied official IATE pipe-delimited CSV exports, with exact-header detection, concept grouping, bounded diagnostics, and explicit candidate selection
 - A separate persistent local translation memory for manually reviewed complete segments or deterministic sentence chunks, with conservative exact matching and explicit approval
 - Local diagnostic and replacement-preview PDF export into a new temporary file
 - Local FiraGO typography resolution with regular, bold, italic, and bold-italic faces
@@ -39,6 +40,7 @@ Guardrails:
 - Never download terminology during startup, tests, builds, or translation. External terminology imports must be user-supplied, processed locally, SHA-256 bound to a server preview, and inserted only as `proposed` records in one transaction.
 - Keep terminology previews process-local, expiring, bounded by count and memory size, single-use after confirmation, and authoritative for parsed candidates and provenance. Recheck current glossary state inside the write transaction.
 - Reject XML DTD and ENTITY declarations. Do not silently overwrite existing glossary entries, guess missing source metadata, or let unapproved imported candidates affect translation.
+- Never form Cartesian products from IATE terms. Group only by `E_ID`, reject ambiguous, inactive, unknown-status, or cross-concept-conflicting concepts, and retain official provenance separately from local review status.
 - Keep translation-memory databases, WAL/SHM files, exports, and backups out of Git. Only an explicit user action may propose a manually reviewed correction, and only approved exact matches may affect a new job.
 - Never use fuzzy or semantic translation-memory matching in milestone 8D1. Case, punctuation, numbers, units, and sentence boundaries remain significant; TM output must pass technical-integrity checks and always remain unreviewed.
 - Never perform translation-memory substring matching. Preserve per-chunk provenance and mark a segment as mixed when approved TM and local-model chunks are assembled together.

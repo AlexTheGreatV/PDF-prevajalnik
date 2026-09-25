@@ -20,7 +20,7 @@ from app.glossary_models import (
     TerminologyImportCandidate,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class GlossaryRepositoryError(RuntimeError):
@@ -106,6 +106,13 @@ ALTER TABLE glossary_entries ADD COLUMN import_file_sha256 TEXT;
 ALTER TABLE glossary_entries ADD COLUMN import_batch_id TEXT;
 ALTER TABLE glossary_entries ADD COLUMN imported_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_glossary_import_batch ON glossary_entries(import_batch_id);
+"""), (3, """
+ALTER TABLE glossary_entries ADD COLUMN external_evaluation TEXT;
+ALTER TABLE glossary_entries ADD COLUMN external_primarity TEXT;
+ALTER TABLE glossary_entries ADD COLUMN external_lifecycle TEXT;
+ALTER TABLE glossary_entries ADD COLUMN external_institution TEXT;
+ALTER TABLE glossary_entries ADD COLUMN external_origins TEXT;
+ALTER TABLE glossary_entries ADD COLUMN external_modified_at TEXT;
 """))
 
 
@@ -307,9 +314,11 @@ class SqliteGlossaryRepository:
                             match_mode, case_sensitive, status, origin, note, source_label,
                             document_hash, revision, created_at, updated_at, usage_count, last_used_at,
                             external_source, external_record_id, source_confidence, definition, context,
-                            source_version, license_info, import_file_sha256, import_batch_id, imported_at
+                            source_version, license_info, import_file_sha256, import_batch_id, imported_at,
+                            external_evaluation, external_primarity, external_lifecycle,
+                            external_institution, external_origins, external_modified_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'proposed', 'import', ?, ?, NULL, 1, ?, ?, 0, NULL,
-                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             entry_id, candidate.source_term, candidate.target_term,
                             candidate.source_language, candidate.target_language, candidate.domain,
@@ -318,6 +327,9 @@ class SqliteGlossaryRepository:
                             candidate.external_record_id, candidate.source_confidence,
                             candidate.definition, candidate.context, candidate.source_version,
                             candidate.license_info, file_sha256, import_batch_id, timestamp,
+                            candidate.external_evaluation, candidate.external_primarity,
+                            candidate.external_lifecycle, candidate.external_institution,
+                            candidate.external_origins, candidate.external_modified_at,
                         ),
                     )
                     entry = self._get_in_connection(connection, entry_id)
@@ -445,6 +457,12 @@ def _entry(row: sqlite3.Row) -> GlossaryEntry:
         context=optional("context"), source_version=optional("source_version"),
         license_info=optional("license_info"), import_file_sha256=optional("import_file_sha256"),
         import_batch_id=optional("import_batch_id"), imported_at=optional("imported_at"),
+        external_evaluation=optional("external_evaluation"),
+        external_primarity=optional("external_primarity"),
+        external_lifecycle=optional("external_lifecycle"),
+        external_institution=optional("external_institution"),
+        external_origins=optional("external_origins"),
+        external_modified_at=optional("external_modified_at"),
     )
 
 

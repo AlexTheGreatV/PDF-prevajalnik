@@ -1,0 +1,7 @@
+E_ID|E_DOMAINS|L_CODE|T_TERM|T_TYPE|T_RELIABILITY|T_EVALUATION|E_PRIMARITY|E_LIFECYCLE|E_ORIGINS|T_INSTITUTION|T_MODIFICATION_TIMESTAMP
+100|"building|public works"|sl|odprti čas|Term|Reliable|Preferred|1||IATE|COM|2026-09-24
+100|"building|public works"|en|open time|Term|Reliable|Preferred|1||IATE|COM|2026-09-24
+101|building|en|sealant|Term|Reliable|Admitted|1||IATE|COM|2026-09-24
+102|building|en|curing|Term|Reliable||1||IATE|COM|2026-09-24
+102|building|en|hardening|Term|Reliable||0||IATE|COM|2026-09-24
+102|building|sl|strjevanje|Term|Reliable||1||IATE|COM|2026-09-24

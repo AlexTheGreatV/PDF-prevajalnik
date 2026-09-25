@@ -56,7 +56,7 @@ def client(repository: SqliteGlossaryRepository):
 def test_migration_is_idempotent_and_enables_safety_pragmas(repository: SqliteGlossaryRepository) -> None:
     repository.initialize()
     repository.initialize()
-    assert repository.schema_version() == 2
+    assert repository.schema_version() == 3
     with repository._connection() as configured_connection:
         assert configured_connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert configured_connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
@@ -93,8 +93,8 @@ def test_schema_one_database_migrates_without_changing_existing_data(tmp_path: P
             "SELECT history_id, entry_id, revision, action, snapshot_json, created_at FROM glossary_history"
         ).fetchall()
     migrated = SqliteGlossaryRepository(database)
-    assert migrated.schema_version() == 2
-    assert SqliteGlossaryRepository(database).schema_version() == 2
+    assert migrated.schema_version() == 3
+    assert SqliteGlossaryRepository(database).schema_version() == 3
     entry = migrated.get_entry("old")
     assert entry.target_term == "strjevanje"
     assert entry.status == "archived"
@@ -112,6 +112,52 @@ def test_schema_one_database_migrates_without_changing_existing_data(tmp_path: P
         assert before_entry == after_entry
         assert before_history == after_history
         assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 2").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 3").fetchone()[0] == 1
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_schema_two_database_migrates_to_three_without_changing_entries_or_history(tmp_path: Path) -> None:
+    database = tmp_path / "schema-two.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(MIGRATIONS[0][1])
+        connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-01-01T00:00:00Z')")
+        connection.executescript(MIGRATIONS[1][1])
+        connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (2, '2026-02-01T00:00:00Z')")
+        connection.execute(
+            """INSERT INTO glossary_entries(
+                id, source_term, target_term, source_language, target_language, domain, match_mode,
+                case_sensitive, status, origin, note, source_label, document_hash, revision,
+                created_at, updated_at, usage_count, last_used_at, external_source, external_record_id
+            ) VALUES ('schema-two', 'open time', 'odprti čas', 'en', 'sl', 'building', 'preferred_term',
+                      0, 'approved', 'import', 'legacy', 'source', NULL, 4,
+                      '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z', 9, NULL, 'legacy import', '42')"""
+        )
+        connection.execute(
+            """INSERT INTO glossary_history(history_id, entry_id, revision, action, snapshot_json, created_at)
+               VALUES ('schema-two-history', 'schema-two', 4, 'approve', '{}', '2026-02-01T00:00:00Z')"""
+        )
+        before_entry = connection.execute("SELECT * FROM glossary_entries WHERE id = 'schema-two'").fetchone()
+        before_history = connection.execute("SELECT * FROM glossary_history").fetchall()
+
+    repository = SqliteGlossaryRepository(database)
+    assert repository.schema_version() == 3
+    assert SqliteGlossaryRepository(database).schema_version() == 3
+    entry = repository.get_entry("schema-two")
+    assert (entry.id, entry.status, entry.revision, entry.usage_count) == ("schema-two", "approved", 4, 9)
+    assert all(value is None for value in (
+        entry.external_evaluation, entry.external_primarity, entry.external_lifecycle,
+        entry.external_institution, entry.external_origins, entry.external_modified_at,
+    ))
+    with sqlite3.connect(database) as connection:
+        after_entry = connection.execute(
+            "SELECT " + ", ".join(item[1] for item in connection.execute("PRAGMA table_info(glossary_entries)") if item[1] not in {
+                "external_evaluation", "external_primarity", "external_lifecycle",
+                "external_institution", "external_origins", "external_modified_at",
+            }) + " FROM glossary_entries WHERE id = 'schema-two'"
+        ).fetchone()
+        assert tuple(before_entry) == tuple(after_entry)
+        assert before_history == connection.execute("SELECT * FROM glossary_history").fetchall()
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 3").fetchone()[0] == 1
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -120,7 +166,7 @@ def test_failed_schema_migration_rolls_back_entire_version(tmp_path: Path, monke
     with sqlite3.connect(database) as connection:
         connection.executescript(MIGRATIONS[0][1])
         connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-01-01T00:00:00Z')")
-    failing = MIGRATIONS + ((3, "ALTER TABLE glossary_entries ADD COLUMN migration_probe TEXT; INVALID SQL;"),)
+    failing = MIGRATIONS + ((4, "ALTER TABLE glossary_entries ADD COLUMN migration_probe TEXT; INVALID SQL;"),)
     monkeypatch.setattr(glossary_repository_module, "MIGRATIONS", failing)
 
     with pytest.raises(GlossaryRepositoryError):
@@ -129,7 +175,7 @@ def test_failed_schema_migration_rolls_back_entire_version(tmp_path: Path, monke
     with sqlite3.connect(database) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(glossary_entries)")}
         assert "migration_probe" not in columns
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 3").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 4").fetchone()[0] == 0
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -273,7 +319,7 @@ def test_csv_export_escapes_spreadsheet_formulas_and_json_is_local(client: TestC
     issue = next(item for item in preview["issues"] if item["existing_entry_id"] == created["id"])
     assert issue["kind"] == "duplicate"
     json_response = client.get("/api/glossary/export.json")
-    assert json_response.json()["schema_version"] == 2
+    assert json_response.json()["schema_version"] == 3
 
 
 def test_csv_negative_technical_term_round_trips_without_formula_prefix(client: TestClient) -> None:

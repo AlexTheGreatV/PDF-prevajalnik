@@ -166,7 +166,7 @@ def record_glossary_usage(
 def export_json(repository: SqliteGlossaryRepository = Depends(get_glossary_repository)) -> Response:
     try:
         entries, _ = repository.list_entries(limit=500, offset=0)
-        payload = {"schema_version": 2, "entries": [entry.model_dump(mode="json") for entry in entries]}
+        payload = {"schema_version": 3, "entries": [entry.model_dump(mode="json") for entry in entries]}
         return Response(
             json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="glossary.json"'},

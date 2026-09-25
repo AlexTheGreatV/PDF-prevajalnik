@@ -13,6 +13,7 @@ GlossaryAction = Literal["create", "update", "approve", "reject", "archive", "re
 MAX_TERM_CHARS = 500
 MAX_NOTE_CHARS = 2_000
 MAX_SOURCE_LABEL_CHARS = 200
+MAX_DOMAIN_CHARS = 2_000
 
 
 class StrictModel(BaseModel):
@@ -24,7 +25,7 @@ class GlossaryEntryCreate(StrictModel):
     target_term: str = Field(default="", max_length=MAX_TERM_CHARS)
     source_language: str = Field(default="en", min_length=2, max_length=12)
     target_language: str = Field(default="sl", min_length=2, max_length=12)
-    domain: str = Field(default="", max_length=100)
+    domain: str = Field(default="", max_length=MAX_DOMAIN_CHARS)
     match_mode: GlossaryMatchMode = "preferred_term"
     case_sensitive: bool = False
     status: GlossaryStatus = "proposed"
@@ -71,7 +72,7 @@ class GlossaryEntryUpdate(StrictModel):
     target_term: str | None = Field(default=None, max_length=MAX_TERM_CHARS)
     source_language: str | None = Field(default=None, min_length=2, max_length=12)
     target_language: str | None = Field(default=None, min_length=2, max_length=12)
-    domain: str | None = Field(default=None, max_length=100)
+    domain: str | None = Field(default=None, max_length=MAX_DOMAIN_CHARS)
     match_mode: GlossaryMatchMode | None = None
     case_sensitive: bool | None = None
     note: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
@@ -124,6 +125,12 @@ class GlossaryEntry(StrictModel):
     import_file_sha256: str | None = None
     import_batch_id: str | None = None
     imported_at: datetime | None = None
+    external_evaluation: str | None = None
+    external_primarity: str | None = None
+    external_lifecycle: str | None = None
+    external_institution: str | None = None
+    external_origins: str | None = None
+    external_modified_at: str | None = None
 
 
 class GlossaryHistoryRecord(StrictModel):
@@ -191,7 +198,7 @@ class TerminologyCsvMapping(StrictModel):
     target_term: str = Field(min_length=1, max_length=100)
     source_language: str | None = Field(default=None, max_length=100)
     target_language: str | None = Field(default=None, max_length=100)
-    domain: str | None = Field(default=None, max_length=100)
+    domain: str | None = Field(default=None, max_length=MAX_DOMAIN_CHARS)
     match_mode: str | None = Field(default=None, max_length=100)
     external_record_id: str | None = Field(default=None, max_length=100)
     confidence: str | None = Field(default=None, max_length=100)
@@ -204,7 +211,7 @@ class TerminologyCsvMapping(StrictModel):
 class TerminologyImportOptions(StrictModel):
     source_language: str = Field(default="en", min_length=2, max_length=12)
     target_language: str = Field(default="sl", min_length=2, max_length=12)
-    default_domain: str = Field(default="", max_length=100)
+    default_domain: str = Field(default="", max_length=MAX_DOMAIN_CHARS)
     default_match_mode: GlossaryMatchMode = "preferred_term"
     external_source: str = Field(min_length=1, max_length=MAX_SOURCE_LABEL_CHARS)
     source_version: str | None = Field(default=None, max_length=200)
@@ -227,7 +234,7 @@ class TerminologyImportCandidate(StrictModel):
     target_term: str = Field(min_length=1, max_length=MAX_TERM_CHARS)
     source_language: str = Field(min_length=2, max_length=12)
     target_language: str = Field(min_length=2, max_length=12)
-    domain: str = Field(default="", max_length=100)
+    domain: str = Field(default="", max_length=MAX_DOMAIN_CHARS)
     match_mode: GlossaryMatchMode = "preferred_term"
     external_source: str = Field(min_length=1, max_length=MAX_SOURCE_LABEL_CHARS)
     external_record_id: str | None = Field(default=None, max_length=200)
@@ -237,6 +244,12 @@ class TerminologyImportCandidate(StrictModel):
     note: str = Field(default="", max_length=MAX_NOTE_CHARS)
     source_version: str | None = Field(default=None, max_length=200)
     license_info: str | None = Field(default=None, max_length=500)
+    external_evaluation: str | None = Field(default=None, max_length=100)
+    external_primarity: str | None = Field(default=None, max_length=100)
+    external_lifecycle: str | None = Field(default=None, max_length=100)
+    external_institution: str | None = Field(default=None, max_length=500)
+    external_origins: str | None = Field(default=None, max_length=2_000)
+    external_modified_at: str | None = Field(default=None, max_length=100)
     classification: Literal["new", "duplicate", "conflict", "invalid"] = "new"
     existing_entry_ids: list[str] = Field(default_factory=list, max_length=50)
     existing_entry_revisions: dict[str, int] = Field(default_factory=dict)
@@ -252,7 +265,11 @@ class TerminologyImportCandidate(StrictModel):
 
 class TerminologyImportIssue(StrictModel):
     row_number: int
-    kind: Literal["duplicate", "conflict", "invalid", "ambiguous", "missing_language", "missing_translation"]
+    kind: Literal[
+        "duplicate", "conflict", "invalid", "ambiguous", "missing_language", "missing_translation",
+        "duplicate_row", "status_rejected", "lifecycle_rejected", "unknown_status", "metadata_conflict",
+        "interconcept_conflict",
+    ]
     message: str
     candidate_id: str | None = None
     existing_entry_ids: list[str] = Field(default_factory=list)
@@ -262,7 +279,7 @@ class TerminologyImportPreview(StrictModel):
     preview_id: str
     import_batch_id: str
     expires_at: datetime
-    format: Literal["csv", "tbx"]
+    format: Literal["csv", "tbx", "iate_csv"]
     file_sha256: str
     candidates: list[TerminologyImportCandidate]
     valid_count: int
@@ -278,6 +295,19 @@ class TerminologyImportPreview(StrictModel):
     external_source: str
     source_version: str | None
     license_info: str | None
+    input_row_count: int = 0
+    concept_count: int = 0
+    source_row_count: int = 0
+    target_row_count: int = 0
+    safe_candidate_count: int = 0
+    raw_multi_term_count: int = 0
+    multi_term_count: int = 0
+    status_rejected_count: int = 0
+    lifecycle_rejected_count: int = 0
+    rejected_status_or_lifecycle_count: int = 0
+    duplicate_row_count: int = 0
+    interconcept_conflict_count: int = 0
+    interconcept_conflict_group_count: int = 0
 
 
 class TerminologyImportConfirm(StrictModel):

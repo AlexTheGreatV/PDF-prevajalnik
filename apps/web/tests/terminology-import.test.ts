@@ -4,6 +4,9 @@ import { resolve } from "node:path";
 
 import {
   confirmTerminologyImport,
+  detectTerminologyFileProfile,
+  IATE_ATTRIBUTION,
+  IATE_HEADERS,
   previewTerminologyImport,
   readCsvHeaders,
   TERMINOLOGY_PREVIEW_BUTTON_LABEL,
@@ -22,6 +25,10 @@ const preview: TerminologyImportPreview = {
   duplicate_count: 0, conflict_count: 0, invalid_count: 0, missing_translation_count: 0,
   missing_language_count: 0, issues: [], domains: ["lepila"], ignored_fields: ["unused"],
   external_source: "local test", source_version: null, license_info: null,
+  input_row_count: 0, concept_count: 0, source_row_count: 0, target_row_count: 0,
+  safe_candidate_count: 0, raw_multi_term_count: 0, multi_term_count: 0, status_rejected_count: 0,
+  lifecycle_rejected_count: 0, rejected_status_or_lifecycle_count: 0, duplicate_row_count: 0,
+  interconcept_conflict_count: 0, interconcept_conflict_group_count: 0,
 };
 
 test("renders a named preview button and explains why it is disabled", () => {
@@ -52,11 +59,48 @@ test("enables preview only after required file metadata and CSV mapping are read
     file_selected: true, format: "tbx", source_language: "en", target_language: "sl",
     external_source: "Lokalni test 8E1", csv_mapping: { source_term: "", target_term: "" },
   }), []);
+  assert.deepEqual(terminologyPreviewValidation({
+    file_selected: true, format: "iate_csv", source_language: "en", target_language: "sl",
+    external_source: IATE_ATTRIBUTION, csv_mapping: { source_term: "", target_term: "" },
+  }), []);
 });
 
 test("reads quoted CSV headers locally for explicit mapping", async () => {
   const file = new File(['"source, term",target,domain\nvalue,prevod,lepila'], "terms.csv", { type: "text/csv" });
   assert.deepEqual(await readCsvHeaders(file), ["source, term", "target", "domain"]);
+});
+
+test("detects only the exact documented pipe-delimited IATE header", async () => {
+  const exact = new File([`\uFEFF${IATE_HEADERS.join("|")}\n1|building|en|term`], "iate.csv", { type: "text/csv" });
+  assert.deepEqual(await detectTerminologyFileProfile(exact), { format: "iate_csv", headers: [...IATE_HEADERS] });
+  const reordered = [...IATE_HEADERS];
+  [reordered[0], reordered[1]] = [reordered[1], reordered[0]];
+  assert.equal((await detectTerminologyFileProfile(new File([reordered.join("|")], "terms.csv"))).format, "csv");
+  assert.equal((await detectTerminologyFileProfile(new File(["<tbx />"], "terms.tbx"))).format, "tbx");
+});
+
+test("IATE preview uses the dedicated profile without a CSV mapping and does not confirm", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies: FormData[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    bodies.push(init?.body as FormData);
+    return Response.json({ ...preview, format: "iate_csv", external_source: IATE_ATTRIBUTION });
+  }) as typeof fetch;
+  try {
+    await previewTerminologyImport(new File([IATE_HEADERS.join("|")], "iate.csv"), "iate_csv", {
+      source_language: "en", target_language: "sl", default_domain: "",
+      default_match_mode: "preferred_term", external_source: IATE_ATTRIBUTION,
+    });
+    assert.equal(bodies[0]?.get("import_format"), "iate_csv");
+    const sent = JSON.parse(String(bodies[0]?.get("options_json")));
+    assert.equal(sent.csv_mapping, undefined);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("IATE candidates are not preselected before an explicit user choice", () => {
+  const component = readFileSync(resolve(process.cwd(), "components/terminology-import-panel.tsx"), "utf8");
+  assert.match(component, /result\.format === "iate_csv"\s*\? new Set\(\)/);
+  assert.match(component, /Uvozi \{selected\.size\} izbranih kot predlagane/);
 });
 
 test("sends terminology preview only to the configured local API", async () => {

@@ -32,7 +32,7 @@ CHUNK_SIZE = 64 * 1024
 @router.post("/preview", response_model=TerminologyImportPreview)
 async def preview_terminology_import(
     file: UploadFile = File(...),
-    import_format: str = Form(..., pattern="^(csv|tbx)$"),
+    import_format: str = Form(..., pattern="^(csv|tbx|iate_csv)$"),
     options_json: str = Form(...),
     repository: SqliteGlossaryRepository = Depends(get_glossary_repository),
 ) -> TerminologyImportPreview:
