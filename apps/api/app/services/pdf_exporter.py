@@ -54,6 +54,7 @@ class PdfExportValidationError(ValueError):
 class ExportArtifact:
     path: Path
     plan: PdfExportPlan
+    applied_replacements: int
 
 
 def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: Path) -> PdfExportPlan:
@@ -91,7 +92,7 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
         _refresh_table_status(tables)
 
     return PdfExportPlan(
-        filename=_output_filename(job.source_filename),
+        filename=_output_filename(job.source_filename, mode),
         mode=mode,
         document_sha256=job.document_identity.sha256,
         summary=_summarize(replacements),
@@ -109,13 +110,22 @@ def export_translated_pdf(path: Path, job: PdfExportJob, mode: ExportMode, temp_
     with pymupdf.open(path) as document:
         if mode == "diagnostic":
             _write_diagnostics(document, plan)
+            applied_replacements = 0
         else:
-            _write_replacements(document, plan, PdfTypographyResolver(temp_dir))
+            expected_replacements = sum(
+                item.eligible for item in [*plan.replacements, *plan.ocr_replacements]
+            )
+            applied_replacements = _write_replacements(document, plan, PdfTypographyResolver(temp_dir))
+            if applied_replacements != expected_replacements:
+                raise PdfExportValidationError(
+                    "output_replacement_count_mismatch",
+                    "Končni PDF ne vsebuje pričakovanega števila varnih zamenjav.",
+                )
         document.subset_fonts()
         document.save(output_path, garbage=4, deflate=True)
     if mode == "replacement_preview":
         _verify_inserted_text(output_path, plan)
-    return ExportArtifact(path=output_path, plan=plan)
+    return ExportArtifact(path=output_path, plan=plan, applied_replacements=applied_replacements)
 
 
 def _validate_document_identity(path: Path, document: pymupdf.Document, job: PdfExportJob) -> None:
@@ -808,9 +818,10 @@ def _table_diagnostic_code(cell: PdfTableCellReplacement) -> str:
     return "R"
 
 
-def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typography: PdfTypographyResolver) -> None:
+def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typography: PdfTypographyResolver) -> int:
     eligible = [item for item in [*plan.replacements, *plan.ocr_replacements] if item.eligible and item.source_bbox is not None]
     pages = sorted({item.page_number for item in eligible})
+    applied = 0
     for page_number in pages:
         page = document[page_number - 1]
         page_items = [item for item in eligible if item.page_number == page_number]
@@ -831,6 +842,8 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
             )
             if spare < 0 or scale + 0.0001 < (item.scale or 1.0):
                 raise PdfExportValidationError("insert_failed", f"Prevod segmenta {item.segment_id} se pri končnem zapisu ni prilegal.")
+            applied += 1
+    return applied
 
 
 def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
@@ -838,8 +851,14 @@ def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
         for item in [*plan.replacements, *plan.ocr_replacements]:
             if not item.eligible or item.source_bbox is None:
                 continue
-            extracted = document[item.page_number - 1].get_text("text", clip=_rect(item.fitted_bbox or item.source_bbox), sort=True)
-            if not _text_matches(item.translated_text, extracted):
+            page = document[item.page_number - 1]
+            verification_boxes = [item.source_bbox]
+            if item.fitted_bbox is not None and not _same_bbox(item.fitted_bbox, item.source_bbox):
+                verification_boxes.append(item.fitted_bbox)
+            if not any(
+                _text_matches(item.translated_text, page.get_text("text", clip=_rect(bbox), sort=True))
+                for bbox in verification_boxes
+            ):
                 raise PdfExportValidationError("output_verification_failed", f"Vstavljenega prevoda segmenta {item.segment_id} ni bilo mogoče preveriti.")
 
 
@@ -921,7 +940,8 @@ def _text_matches(source: str, extracted: str) -> bool:
 
 
 def _canonical_text(value: str) -> str:
-    return " ".join(value.casefold().split())
+    without_list_markers = re.sub(r"(?m)^\s*[-–—•▪◦*]+\s+(?=[^\W\d_])", "", value)
+    return " ".join(without_list_markers.casefold().split())
 
 
 def _close(left: float, right: float) -> bool:
@@ -1001,6 +1021,7 @@ def _summarize_tables(tables: list[PdfTableExportPlan]) -> PdfTableExportSummary
     )
 
 
-def _output_filename(filename: str) -> str:
+def _output_filename(filename: str, mode: ExportMode) -> str:
     safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename).stem).strip(".-") or "document"
-    return f"{safe_stem}-sl-preview.pdf"
+    suffix = "sl-diagnostic" if mode == "diagnostic" else "sl"
+    return f"{safe_stem}-{suffix}.pdf"

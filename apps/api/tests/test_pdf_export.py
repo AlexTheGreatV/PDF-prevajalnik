@@ -13,12 +13,18 @@ from app.core.config import settings
 from app.main import app
 from app.pdf_export_models import PdfExportJob, PdfTextStyle
 from app.services.pdf_analyzer import analyze_pdf
-from app.services.pdf_exporter import PdfExportValidationError, export_translated_pdf, plan_pdf_export
+from app.services.pdf_exporter import PdfExportValidationError, _canonical_text, _text_matches, export_translated_pdf, plan_pdf_export
 from app.services.pdf_typography import PdfTypographyResolver
 
 SOURCE_TEXT = "Digital source text for a safe translated PDF preview."
 TRANSLATED_TEXT = "Varen prevod čšžČŠŽ, CO₂ in +5 °C."
 client = TestClient(app)
+
+
+def test_output_text_verification_tolerates_extracted_list_marker_semantics() -> None:
+    assert _text_matches("- HPL", "HPL") is True
+    assert _text_matches("• Varen prevod", "Varen prevod") is True
+    assert _canonical_text("−40 °C") == "−40 °c"
 
 
 def test_replacement_preserves_original_file_images_vectors_background_and_unicode(tmp_path: Path) -> None:
@@ -32,11 +38,16 @@ def test_replacement_preserves_original_file_images_vectors_background_and_unico
 
     assert _hash(source) == original_hash
     assert artifact.path != source
-    assert artifact.path.name == "source-sl-preview.pdf"
+    assert artifact.path.name == "source-sl.pdf"
+    assert artifact.applied_replacements == 1
     with pymupdf.open(artifact.path) as output:
         text = output[0].get_text()
         assert SOURCE_TEXT not in text
         assert TRANSLATED_TEXT in text
+        diagnostic_markers = {
+            "simple_background", "expanded_bbox", "scaled", "skipped", "overflow", "segment-1"
+        }
+        assert all(marker not in text for marker in diagnostic_markers)
         assert len(output[0].get_images(full=True)) == before[0]
         assert len(output[0].get_drawings()) >= before[1]
         pixel = output[0].get_pixmap().pixel(32, 32)
@@ -64,10 +75,75 @@ def test_diagnostic_mode_keeps_source_text(tmp_path: Path) -> None:
     source = tmp_path / "diagnostic.pdf"
     _make_pdf(source)
     artifact = export_translated_pdf(source, _job(source), "diagnostic", tmp_path / "work")
+    assert artifact.path.name == "diagnostic-sl-diagnostic.pdf"
+    assert artifact.applied_replacements == 0
     with pymupdf.open(artifact.path) as output:
         text = output[0].get_text()
         assert SOURCE_TEXT in text
         assert "segment-1" in text
+
+
+def test_final_and_diagnostic_exports_are_not_interchangeable(tmp_path: Path) -> None:
+    source = tmp_path / "modes.pdf"
+    _make_pdf(source)
+    diagnostic = export_translated_pdf(source, _job(source), "diagnostic", tmp_path / "diagnostic")
+    final = export_translated_pdf(source, _job(source), "replacement_preview", tmp_path / "final")
+
+    assert diagnostic.path.name != final.path.name
+    assert diagnostic.path.read_bytes() != final.path.read_bytes()
+    with pymupdf.open(diagnostic.path) as diagnostic_pdf, pymupdf.open(final.path) as final_pdf:
+        assert "segment-1" in diagnostic_pdf[0].get_text()
+        assert "segment-1" not in final_pdf[0].get_text()
+        assert TRANSLATED_TEXT in final_pdf[0].get_text()
+
+
+def test_empty_writer_result_rejects_false_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "empty-writer.pdf"
+    _make_pdf(source)
+    monkeypatch.setattr("app.services.pdf_exporter._write_replacements", lambda *_args: 0)
+
+    with pytest.raises(PdfExportValidationError, match="pričakovanega števila"):
+        export_translated_pdf(source, _job(source), "replacement_preview", tmp_path / "work")
+
+
+def test_partial_final_export_writes_eligible_translation_and_keeps_skipped_source(tmp_path: Path) -> None:
+    source = tmp_path / "partial.pdf"
+    first_source = "First source paragraph."
+    second_source = "Second source paragraph."
+    first_translation = "Prvi prevedeni odstavek."
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=200)
+        page.insert_textbox((30, 30, 270, 60), first_source, fontsize=10)
+        page.insert_textbox((30, 90, 270, 120), second_source, fontsize=10)
+        document.save(source)
+    payload = _job_payload(source, first_source, first_translation)
+    with pymupdf.open(source) as document:
+        second_bbox = document[0].search_for(second_source)[0]
+    payload["segments"].append({
+        **payload["segments"][0],
+        "segment_id": "segment-2",
+        "block_id": "block-2",
+        "source_text": second_source,
+        "source_bbox": {"x0": second_bbox.x0, "y0": second_bbox.y0, "x1": second_bbox.x1, "y1": second_bbox.y1},
+        "edited_translation": "Drugi prevedeni odstavek.",
+        "status": "translated",
+    })
+
+    artifact = export_translated_pdf(
+        source,
+        PdfExportJob.model_validate(payload),
+        "replacement_preview",
+        tmp_path / "work",
+    )
+
+    assert artifact.applied_replacements == 1
+    assert artifact.plan.summary.eligible == 1
+    assert artifact.plan.summary.skipped == 1
+    with pymupdf.open(artifact.path) as output:
+        text = output[0].get_text()
+        assert first_translation in text
+        assert first_source not in text
+        assert second_source in text
 
 
 def test_schema_five_profile_diagnostics_are_not_written_to_final_pdf(tmp_path: Path) -> None:
@@ -378,7 +454,9 @@ def test_export_endpoint_returns_new_pdf_and_cleans_temp_on_success_and_error(tm
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/pdf"
     assert response.content.startswith(b"%PDF-")
-    assert "endpoint-sl-preview.pdf" in response.headers["content-disposition"]
+    assert "endpoint-sl.pdf" in response.headers["content-disposition"]
+    assert response.headers["x-pdf-export-mode"] == "replacement_preview"
+    assert response.headers["x-pdf-replacements-applied"] == "1"
     assert list(processing.iterdir()) == []
 
     job["document_identity"]["sha256"] = "0" * 64

@@ -141,7 +141,8 @@ class DocumentImage(BaseModel):
     width: int | None = None
     height: int | None = None
     xref: int | None = None
-    needs_ocr_check: bool = True
+    needs_ocr_check: bool = False
+    ocr_relevance: Literal["text_candidate", "decorative", "export_safety_only"] = "export_safety_only"
     ocr_text: str | None = None
     ocr_confidence: float | None = None
 

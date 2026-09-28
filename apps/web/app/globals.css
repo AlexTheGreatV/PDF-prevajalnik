@@ -106,6 +106,41 @@ input {
   gap: 16px;
 }
 
+.workspace-mode {
+  display: inline-flex;
+  width: fit-content;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 3px;
+}
+
+.workspace-mode button {
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 9px 14px;
+}
+
+.workspace-mode button.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+
+.workspace-mode button:focus-visible,
+.guided-review a:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.simple-mode .advanced-only,
+.simple-translation-workspace .advanced-only {
+  display: none !important;
+}
+
 .panel,
 .dropzone,
 .page-detail {
@@ -772,6 +807,86 @@ pre {
   padding: 20px;
 }
 
+.guided-next-step,
+.guided-review,
+.guided-export {
+  border: 1px solid #a9c9bd;
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  background: #f6fbf9;
+  padding: 16px;
+}
+
+.guided-next-step > span,
+.guided-review header span {
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.guided-next-step h2,
+.guided-review h3,
+.guided-review h4 {
+  margin: 4px 0 8px;
+  letter-spacing: 0;
+}
+
+.guided-next-step p {
+  color: var(--muted);
+}
+
+.guided-review {
+  display: grid;
+  gap: 14px;
+}
+
+.guided-review header,
+.guided-review-copy {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.guided-review header {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.guided-review-copy > div,
+.guided-review-copy > label {
+  min-width: 0;
+}
+
+.guided-review-copy p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.guided-review-copy label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.guided-review-copy textarea {
+  min-height: 150px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+}
+
+.guided-export-details {
+  display: grid;
+  gap: 12px;
+}
+
 .translation-header,
 .translation-subhead,
 .translation-actions,
@@ -1204,6 +1319,13 @@ pre {
     border-left: 0;
     border-top: 1px solid var(--border);
     padding: 16px 0 0;
+  }
+}
+
+@media (max-width: 720px) {
+  .guided-review header,
+  .guided-review-copy {
+    grid-template-columns: 1fr;
   }
 }
 

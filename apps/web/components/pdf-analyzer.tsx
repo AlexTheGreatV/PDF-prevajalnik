@@ -39,6 +39,14 @@ import {
   structuredPageText,
   validatePdfFile,
 } from "../lib/pdf-view";
+import {
+  countUnresolvedOcr,
+  createExclusiveLatestAction,
+  hasRetainedNativeTextWarnings,
+  readWorkspaceModeFromWindow,
+  writeWorkspaceModeToWindow,
+  type WorkspaceMode,
+} from "../lib/guided-workflow";
 
 type ProcessingState = "idle" | "ready" | "analyzing" | "done" | "error";
 type OcrAvailability = "checking" | "ready" | "unavailable";
@@ -68,12 +76,30 @@ export function PdfAnalyzer() {
     item: OcrReviewItem; image: HTMLImageElement; crop: string; width: number; height: number;
   } | null>(null);
   const [preparingSelection, setPreparingSelection] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("simple");
   const selectionGeneration = useRef(0);
+  const documentGeneration = useRef(0);
+  const analysisAction = useRef(createExclusiveLatestAction());
 
   const selectedFileError = file ? validatePdfFile(file) : null;
   const totalBlocks = analysis ? countTextBlocks(analysis) : 0;
   const totalImages = analysis ? countImages(analysis) : 0;
   const pendingOcrCount = ocrItems.filter((item) => item.status === "pending").length;
+  const unresolvedOcrCount = countUnresolvedOcr(ocrItems);
+  const hasRetainedOcrWarning = hasRetainedNativeTextWarnings(ocrItems);
+  const missingTextPages = analysis?.pages.filter((page) => {
+    if (page.extracted_text_chars > 0) return false;
+    return !ocrItems.some((item) => item.page_number === page.page_number && item.status === "accepted" && item.server_revision_id?.trim());
+  }).length ?? 0;
+
+  useEffect(() => {
+    let active = true;
+    queueMicrotask(() => {
+      const saved = readWorkspaceModeFromWindow(window);
+      if (active) setWorkspaceMode(saved);
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     checkBrowserOcrRuntime()
@@ -102,6 +128,8 @@ export function PdfAnalyzer() {
   }, [analysis]);
 
   function chooseFile(nextFile: File | null) {
+    analysisAction.current.invalidate();
+    documentGeneration.current += 1;
     queue.cancel();
     selectionGeneration.current += 1;
     setPreparedSelection(null);
@@ -122,6 +150,9 @@ export function PdfAnalyzer() {
 
   async function runAnalysis() {
     if (!file) return;
+
+    const actionToken = analysisAction.current.begin();
+    if (actionToken === null) return;
 
     const validationError = validatePdfFile(file);
     if (validationError) {
@@ -145,18 +176,23 @@ export function PdfAnalyzer() {
         analyzePdf(file),
         renderPdf(file),
       ]);
+      if (!analysisAction.current.isCurrent(actionToken)) return;
       setAnalysis(analysisPayload);
       setRenderResult(renderPayload);
       setOcrItems(createOcrReviewItems(analysisPayload));
       setState("done");
     } catch (caught) {
+      if (!analysisAction.current.isCurrent(actionToken)) return;
       setError(caught instanceof Error ? caught.message : "Analiza ni uspela.");
       setState("error");
+    } finally {
+      analysisAction.current.finish(actionToken);
     }
   }
 
   async function runOcrReview(targetItems?: OcrReviewItem[], preparedImage?: HTMLImageElement) {
     if (!analysis || !renderResult) return;
+    const generation = documentGeneration.current;
     setOcrError(null);
     await queue.run(
       targetItems ?? ocrItems.filter((item) => item.status === "pending"),
@@ -172,7 +208,9 @@ export function PdfAnalyzer() {
         const result = await recognizeBestVariant(provider, image, item, pixels, page, padding, signal);
         return applyOcrSuggestion(item, result.best, result.attempts, result.cropImageUrl, result.cropDebug);
       },
-      (item) => updateOcrItem(item.id, () => item),
+      (item) => {
+        if (generation === documentGeneration.current) updateOcrItem(item.id, () => item);
+      },
     );
   }
 
@@ -182,12 +220,17 @@ export function PdfAnalyzer() {
     if (!file) return;
     const item = ocrItems.find((candidate) => candidate.id === id);
     if (!item) return;
+    const generation = documentGeneration.current;
     setOcrError(null);
     try {
       const revisionId = await registerAndAcceptOcrSource(file, item);
-      updateOcrItem(id, (current) => acceptOcrResult(current, revisionId));
+      if (generation === documentGeneration.current) {
+        updateOcrItem(id, (current) => acceptOcrResult(current, revisionId));
+      }
     } catch (caught) {
-      setOcrError(caught instanceof Error ? caught.message : "Sprejem OCR revizije ni uspel.");
+      if (generation === documentGeneration.current) {
+        setOcrError(caught instanceof Error ? caught.message : "Sprejem OCR revizije ni uspel.");
+      }
     }
   }
 
@@ -247,8 +290,17 @@ export function PdfAnalyzer() {
     setOcrItems((current) => current.map((item) => (item.id === id ? update(item) : item)));
   }
 
+  function changeWorkspaceMode(mode: WorkspaceMode) {
+    setWorkspaceMode(mode);
+    writeWorkspaceModeToWindow(window, mode);
+  }
+
   return (
-    <div className="pipeline">
+    <div className={`pipeline ${workspaceMode}-mode`}>
+      <nav className="workspace-mode" aria-label="Način uporabe">
+        <button className={workspaceMode === "simple" ? "active" : ""} aria-pressed={workspaceMode === "simple"} onClick={() => changeWorkspaceMode("simple")}>Enostavni način</button>
+        <button className={workspaceMode === "advanced" ? "active" : ""} aria-pressed={workspaceMode === "advanced"} onClick={() => changeWorkspaceMode("advanced")}>Napredni način</button>
+      </nav>
       <section
         className={`dropzone${isDragging ? " is-dragging" : ""}`}
         onDragOver={(event) => {
@@ -307,7 +359,7 @@ export function PdfAnalyzer() {
         )}
       </section>
 
-      <section className="panel ocr-panel">
+      {(workspaceMode === "advanced" || (analysis && (unresolvedOcrCount > 0 || missingTextPages > 0))) && <section id="ocr-review" className="panel ocr-panel">
         <div>
           <span>Lokalni browser OCR</span>
           <strong>
@@ -344,7 +396,7 @@ export function PdfAnalyzer() {
             </button>
           )}
           <button
-            className={`button secondary${manualMode ? " active" : ""}`}
+            className={`button secondary advanced-only${manualMode ? " active" : ""}`}
             disabled={!analysis || !renderResult || isOcrRunning || ocrAvailability !== "ready"}
             onClick={() => setManualMode((current) => !current)}
           >
@@ -352,8 +404,8 @@ export function PdfAnalyzer() {
           </button>
         </div>
         {isOcrRunning && <progress value={ocrProgress.done} max={ocrProgress.total || 1} />}
-        {manualMode && <small>Povlecite pravokotnik po predogledu strani in potrdite OCR območje.</small>}
-        {pendingSelection && (
+        {manualMode && <small className="advanced-only">Povlecite pravokotnik po predogledu strani in potrdite OCR območje.</small>}
+        {pendingSelection && workspaceMode === "advanced" && (
           <div className="actions">
             <button className="button" disabled={preparingSelection || isOcrRunning} onClick={() => void runManualOcr()}>
               {preparingSelection ? "Pripravljam izrez ..." : preparedSelection ? "Zaženi OCR izreza" : "Prikaži izrez pri 300 DPI"}
@@ -363,7 +415,7 @@ export function PdfAnalyzer() {
             </button>
           </div>
         )}
-        {preparedSelection && (
+        {preparedSelection && workspaceMode === "advanced" && (
           <div className="ocr-crop">
             <label>
               Razporeditev besedila
@@ -377,31 +429,31 @@ export function PdfAnalyzer() {
             <a href={preparedSelection.crop} download="ocr-selection.png">Prenesi izbrani izrez</a>
           </div>
         )}
-      </section>
+      </section>}
 
       {ocrError && <div className="error-box">{ocrError}</div>}
-      {ocrNetworkReport.length > 0 && (
+      {ocrNetworkReport.length > 0 && workspaceMode === "advanced" && (
         <div className="error-box">OCR je zaznal zunanje zahteve: {ocrNetworkReport.join(", ")}</div>
       )}
-      {ocrItems.length > 0 && (
-        <OcrReviewList
+      {ocrItems.length > 0 && (workspaceMode === "advanced" || unresolvedOcrCount > 0 || hasRetainedOcrWarning) && (
+        <div id="ocr-review-list"><OcrReviewList
           items={ocrItems}
           onAccept={(id) => void acceptOcrReview(id)}
           onReject={(id) => updateOcrItem(id, rejectOcrResult)}
-        />
+        /></div>
       )}
 
       {analysis?.document && file && (
         <div className="analysis-workbench">
           <div className="analysis-workbench-main">
-            <TranslationWorkspace key={analysis.sha256} analysis={analysis} ocrItems={ocrItems} sourceFile={file} />
+            <TranslationWorkspace key={analysis.sha256} analysis={analysis} ocrItems={ocrItems} sourceFile={file} mode={workspaceMode} missingTextPages={missingTextPages} />
           </div>
           <aside className="document-side-preview" aria-label="Predogled PDF dokumenta">
             <h2>Predogled PDF</h2>
             {analysis.pages.map((page) => {
               const preview = renderPagesByNumber.get(page.page_number);
               return preview ? (
-                <figure key={page.page_number}>
+                <figure id={`pdf-preview-page-${page.page_number}`} key={page.page_number}>
                   <figcaption>Stran {page.page_number}</figcaption>
                   <Image
                     src={preview.path}
@@ -417,7 +469,7 @@ export function PdfAnalyzer() {
         </div>
       )}
 
-      {analysis && (
+      {analysis && workspaceMode === "advanced" && (
         <>
           <section className="summary-grid">
             <Metric label="Vrsta PDF-ja" value={formatPdfKind(analysis.kind)} />

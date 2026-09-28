@@ -42,6 +42,8 @@ export type PageCoverage = {
   accepted_ocr_segments: number;
   unresolved_ocr_candidates: number;
   unreviewed_image_areas: number;
+  decorative_image_areas: number;
+  export_safety_image_areas: number;
   translatable_segments: number;
   translated_segments: number;
   reviewed_segments: number;
@@ -96,7 +98,11 @@ export function calculateDocumentCoverage(input: {
     }
     const unresolvedOcrCandidates = unresolvedOcrIds.size;
     const unreviewedImageAreas = (structuredPage?.images ?? []).filter((image) =>
-      image.needs_ocr_check && !hasAcceptedOcrForImage(image, pageOcrItems),
+      imageNeedsTextAcquisition(image, analysisPage.kind) && !hasAcceptedOcrForImage(image, pageOcrItems),
+    ).length;
+    const decorativeImageAreas = (structuredPage?.images ?? []).filter((image) => image.ocr_relevance === "decorative").length;
+    const exportSafetyImageAreas = (structuredPage?.images ?? []).filter((image) =>
+      (image.ocr_relevance ?? (analysisPage.kind === "digital" ? "export_safety_only" : "text_candidate")) === "export_safety_only",
     ).length;
     const translatable = segments.filter(isTranslatable);
     const translated = translatable.filter(isTranslated);
@@ -117,6 +123,8 @@ export function calculateDocumentCoverage(input: {
       accepted_ocr_segments: acceptedOcrSegments,
       unresolved_ocr_candidates: unresolvedOcrCandidates,
       unreviewed_image_areas: unreviewedImageAreas,
+      decorative_image_areas: decorativeImageAreas,
+      export_safety_image_areas: exportSafetyImageAreas,
       translatable_segments: translatable.length,
       translated_segments: translated.length,
       reviewed_segments: reviewed.length,
@@ -166,6 +174,11 @@ export function calculateDocumentCoverage(input: {
     unreviewed_image_areas: imageGaps,
     warnings,
   };
+}
+
+function imageNeedsTextAcquisition(image: StructuredImage, pageKind: PdfKind): boolean {
+  const relevance = image.ocr_relevance ?? (pageKind === "digital" ? "export_safety_only" : "text_candidate");
+  return relevance === "text_candidate" && image.needs_ocr_check;
 }
 
 function isTranslatable(segment: TranslationSegment): boolean {

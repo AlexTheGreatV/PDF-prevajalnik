@@ -100,6 +100,43 @@ def test_segmenter_detects_basic_table(tmp_path: Path) -> None:
     assert any("4 MPa" in cell for row in (table_blocks[0].table_cells or []) for cell in row)
 
 
+def test_image_relevance_separates_text_candidates_decorations_and_export_safety(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.png"
+    from PIL import Image
+    Image.new("RGB", (80, 40), "white").save(image_path)
+    pdf_path = tmp_path / "images.pdf"
+    document = fitz.open()
+    for page_number in range(2):
+        page = document.new_page(width=300, height=200)
+        page.insert_image(fitz.Rect(0, 0, 100, 40), filename=str(image_path))
+        page.insert_image(fitz.Rect(220, 100, 280, 140), filename=str(image_path))
+        page.insert_text((30, 90), f"Digital body text on page {page_number + 1} with enough characters.")
+    document.save(pdf_path)
+    document.close()
+
+    result = segment_pdf(pdf_path)
+    roles = [image.ocr_relevance for page in result.pages for image in page.images]
+    assert "decorative" in roles
+    assert "export_safety_only" in roles
+    assert all(not image.needs_ocr_check for page in result.pages for image in page.images)
+
+
+def test_scanned_page_image_is_a_text_candidate(tmp_path: Path) -> None:
+    image_path = tmp_path / "scan.png"
+    from PIL import Image
+    Image.new("RGB", (300, 200), "white").save(image_path)
+    pdf_path = tmp_path / "scan.pdf"
+    document = fitz.open()
+    page = document.new_page(width=300, height=200)
+    page.insert_image(page.rect, filename=str(image_path))
+    document.save(pdf_path)
+    document.close()
+
+    image = segment_pdf(pdf_path).pages[0].images[0]
+    assert image.ocr_relevance == "text_candidate"
+    assert image.needs_ocr_check is True
+
+
 def test_processing_tempdir_is_unique_and_cleaned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     processing_root = tmp_path / "processing"
     monkeypatch.setattr(settings, "processing_tmp_dir", processing_root)

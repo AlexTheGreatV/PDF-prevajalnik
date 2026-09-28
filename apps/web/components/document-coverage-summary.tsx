@@ -67,6 +67,9 @@ export function DocumentCoverageSummary({
           <div><dt>Digitalni segmenti</dt><dd>{page.digital_segments}</dd></div>
           <div><dt>Sprejeti OCR segmenti</dt><dd>{page.accepted_ocr_segments}</dd></div>
           <div><dt>Nerešeni OCR kandidati</dt><dd>{page.unresolved_ocr_candidates}</dd></div>
+          <div><dt>Slikovna območja za OCR</dt><dd>{page.unreviewed_image_areas}</dd></div>
+          <div><dt>Dekorativne slike</dt><dd>{page.decorative_image_areas}</dd></div>
+          <div><dt>Slike za varnost izvoza</dt><dd>{page.export_safety_image_areas}</dd></div>
           <div><dt>Prevodljivi / prevedeni</dt><dd>{page.translatable_segments} / {page.translated_segments}</dd></div>
           <div><dt>Pregledani / za PDF</dt><dd>{page.reviewed_segments} / {page.export_ready_segments}</dd></div>
           <div><dt>Izvoženi</dt><dd>{page.exported_segments}</dd></div>

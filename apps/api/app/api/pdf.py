@@ -167,7 +167,11 @@ async def translated_export(
     return Response(
         content=content,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+            "X-PDF-Export-Mode": artifact.plan.mode,
+            "X-PDF-Replacements-Applied": str(artifact.applied_replacements),
+        },
     )
 
 

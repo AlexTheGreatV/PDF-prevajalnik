@@ -1,5 +1,6 @@
 import Image from "next/image";
 import type { OcrReviewItem } from "../lib/ocr-review";
+import { retainedNativeTextWarning } from "../lib/guided-workflow";
 
 export function OcrReviewList({
   items,
@@ -114,6 +115,7 @@ export function OcrReviewList({
               {item.status === "accepted" ? "Ponovno registriraj in sprejmi OCR" : "Uporabi OCR rezultat"}
             </button>
           </div>
+          {retainedNativeTextWarning(item) && <p className="translation-warning">{retainedNativeTextWarning(item)}</p>}
         </div>
       ))}
     </section>

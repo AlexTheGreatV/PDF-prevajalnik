@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 
 import { calculateDocumentCoverage, createCoverageRevisionKey } from "../lib/document-coverage";
-import { downloadPdfExport, preparePdfExport, type PdfExportPlan } from "../lib/pdf-export-client";
+import {
+  downloadPdfExport,
+  preparePdfExport,
+  resolvePdfExportMode,
+  validatePdfExportDownload,
+  type PdfExportPlan,
+} from "../lib/pdf-export-client";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, PdfKind } from "../lib/pdf-types";
 import type { TranslationJob } from "../lib/translation-types";
@@ -42,7 +48,7 @@ test("prepares a local multipart PDF export plan", async () => {
     assert.equal(form.get("mode"), "diagnostic");
     assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 8);
     return new Response(JSON.stringify({
-      filename: "source-sl-preview.pdf",
+      filename: "source-sl-diagnostic.pdf",
       mode: "diagnostic",
       document_sha256: "a".repeat(64),
       summary: { total_segments: 0, reviewed: 0, eligible: 0, skipped: 0, overflow: 0, conflicts: 0 },
@@ -55,7 +61,7 @@ test("prepares a local multipart PDF export plan", async () => {
   }) as typeof fetch;
   try {
     const result = await preparePdfExport(new File(["%PDF-"], "source.pdf", { type: "application/pdf" }), job(), "diagnostic");
-    assert.equal(result.filename, "source-sl-preview.pdf");
+    assert.equal(result.filename, "source-sl-diagnostic.pdf");
     assert.equal(result.table_summary.detected_tables, 1);
     assert.equal(result.tables[0].partial_export, true);
     assert.equal(result.ocr_summary.unsafe_regions, 1);
@@ -89,12 +95,88 @@ test("downloads a new local PDF with the server filename", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(new Blob(["%PDF-output"], { type: "application/pdf" }), {
     status: 200,
-    headers: { "content-disposition": "attachment; filename*=UTF-8''source-sl-preview.pdf" },
+    headers: {
+      "content-disposition": "attachment; filename*=UTF-8''source-sl.pdf",
+      "x-pdf-export-mode": "replacement_preview",
+      "x-pdf-replacements-applied": "1",
+    },
   })) as typeof fetch;
   try {
     const result = await downloadPdfExport(new File(["%PDF-"], "source.pdf", { type: "application/pdf" }), job(), "replacement_preview");
-    assert.equal(result.filename, "source-sl-preview.pdf");
+    assert.equal(result.filename, "source-sl.pdf");
+    assert.equal(result.mode, "replacement_preview");
+    assert.equal(result.applied_replacements, 1);
     assert.equal(await result.blob.text(), "%PDF-output");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("simple mode always requests the final replacement export", () => {
+  assert.equal(resolvePdfExportMode(true, "diagnostic"), "replacement_preview");
+  assert.equal(resolvePdfExportMode(false, "diagnostic"), "diagnostic");
+  assert.equal(resolvePdfExportMode(false, "replacement_preview"), "replacement_preview");
+});
+
+test("a diagnostic response never completes the final translated export", () => {
+  assert.equal(validatePdfExportDownload(
+    { mode: "diagnostic", applied_replacements: 0 },
+    "diagnostic",
+    43,
+  ), false);
+});
+
+test("a missing or mismatched replacement result cannot keep PDF downloaded success", () => {
+  assert.throws(() => validatePdfExportDownload(
+    { mode: "diagnostic", applied_replacements: 0 },
+    "replacement_preview",
+    43,
+  ), /napačen način/i);
+  assert.throws(() => validatePdfExportDownload(
+    { mode: "replacement_preview", applied_replacements: 0 },
+    "replacement_preview",
+    43,
+  ), /pričakovanega števila/i);
+  assert.throws(() => validatePdfExportDownload(
+    { mode: "replacement_preview", applied_replacements: 0 },
+    "replacement_preview",
+    0,
+  ), /nobene potrjene varne zamenjave/i);
+});
+
+test("a 200 response still requires PDF content and a safe server filename", async () => {
+  const originalFetch = globalThis.fetch;
+  const file = new File(["%PDF-"], "source.pdf", { type: "application/pdf" });
+  try {
+    globalThis.fetch = (async () => new Response("not a PDF", {
+      status: 200,
+      headers: {
+        "content-type": "text/plain",
+        "content-disposition": "attachment; filename*=UTF-8''source-sl.pdf",
+        "x-pdf-export-mode": "replacement_preview",
+        "x-pdf-replacements-applied": "1",
+      },
+    })) as typeof fetch;
+    await assert.rejects(() => downloadPdfExport(file, job(), "replacement_preview"), /veljavnega PDF odgovora/i);
+
+    globalThis.fetch = (async () => new Response(new Blob(["%PDF-output"], { type: "application/pdf" }), {
+      status: 200,
+      headers: {
+        "x-pdf-export-mode": "replacement_preview",
+        "x-pdf-replacements-applied": "1",
+      },
+    })) as typeof fetch;
+    await assert.rejects(() => downloadPdfExport(file, job(), "replacement_preview"), /varnega imena PDF datoteke/i);
+
+    globalThis.fetch = (async () => new Response(new Blob(["%PDF-output"], { type: "application/pdf" }), {
+      status: 200,
+      headers: {
+        "content-disposition": "attachment; filename*=UTF-8''..%2Funsafe.pdf",
+        "x-pdf-export-mode": "replacement_preview",
+        "x-pdf-replacements-applied": "1",
+      },
+    })) as typeof fetch;
+    await assert.rejects(() => downloadPdfExport(file, job(), "replacement_preview"), /neveljavno ime PDF datoteke/i);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -144,6 +226,23 @@ test("reports a fully scanned document without inventing a completion percentage
   assert.deepEqual(coverage.states, ["text_missing", "ocr_review_required"]);
   assert.equal(coverage.text.acquired_pages, 0);
   assert.equal(coverage.unresolved_ocr_candidates, 1);
+});
+
+test("digital decorative and export-safety images do not create an OCR requirement", () => {
+  const currentAnalysis = analysis(["digital"]);
+  const currentJob = job();
+  currentJob.segments = [segment()];
+  currentAnalysis.document!.pages[0].images = [
+    { bbox: { x0: 0, y0: 0, x1: 20, y1: 20 }, width: 20, height: 20, xref: 1, needs_ocr_check: false, ocr_relevance: "decorative", ocr_text: null, ocr_confidence: null },
+    { bbox: { x0: 20, y0: 20, x1: 80, y1: 80 }, width: 60, height: 60, xref: 2, needs_ocr_check: false, ocr_relevance: "export_safety_only", ocr_text: null, ocr_confidence: null },
+  ];
+  const coverage = calculateDocumentCoverage({
+    analysis: currentAnalysis, ocrItems: [], job: currentJob, plan: null, downloadCompleted: false,
+  });
+  assert.equal(coverage.unreviewed_image_areas, 0);
+  assert.equal(coverage.pages[0].decorative_image_areas, 1);
+  assert.equal(coverage.pages[0].export_safety_image_areas, 1);
+  assert.ok(!coverage.states.includes("ocr_review_required"));
 });
 
 test("requires current server OCR provenance and reports expired revisions", () => {

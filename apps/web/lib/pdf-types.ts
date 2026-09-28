@@ -184,6 +184,7 @@ export type StructuredImage = {
   height: number | null;
   xref: number | null;
   needs_ocr_check: boolean;
+  ocr_relevance?: "text_candidate" | "decorative" | "export_safety_only";
   ocr_text: string | null;
   ocr_confidence: number | null;
 };

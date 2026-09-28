@@ -15,6 +15,8 @@ export function useLocalTranslation(
   const [progress, setProgress] = useState({ completed: 0, total: 0 });
   const [message, setMessage] = useState<string | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
+  const generationRef = useRef(0);
+  const runningRef = useRef(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -26,11 +28,21 @@ export function useLocalTranslation(
     return () => controller.abort();
   }, []);
 
-  async function translate() {
-    if (!job || !status?.available || running) return;
+  useEffect(() => () => {
+    generationRef.current += 1;
+    runningRef.current = false;
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+  }, []);
+
+  async function translate(jobOverride?: TranslationJob) {
+    const jobToTranslate = jobOverride ?? job;
+    if (!jobToTranslate || !status?.available || runningRef.current) return;
+    runningRef.current = true;
+    const generation = ++generationRef.current;
     const controller = new AbortController();
     controllerRef.current = controller;
-    const original = job;
+    const original = jobToTranslate;
     const selected = original.segments.filter((segment) => ["pending", "failed"].includes(segment.status) && !segment.skip_reason);
     setProgress({ completed: 0, total: selected.length });
     setRunning(true);
@@ -48,22 +60,42 @@ export function useLocalTranslation(
         controller.signal,
         (completed, total) => setProgress({ completed, total }),
       );
+      if (generation !== generationRef.current) return;
       setJob(translated);
       if (controller.signal.aborted) setMessage("Prevajanje je bilo preklicano.");
       else if (translated.segments.some((segment) => segment.status === "failed")) setMessage("Nekateri segmenti niso bili prevedeni. Poskusite jih lahko znova.");
       else setMessage("Lokalni prevod je pripravljen za ročni pregled.");
-      setStatus(await getLocalTranslationStatus());
+      const nextStatus = await getLocalTranslationStatus();
+      if (generation === generationRef.current) setStatus(nextStatus);
     } catch (error) {
+      if (generation !== generationRef.current) return;
       setJob(original);
       setMessage(error instanceof Error ? error.message : "Lokalno prevajanje ni uspelo.");
     } finally {
-      controllerRef.current = null;
-      setRunning(false);
+      if (generation === generationRef.current) {
+        controllerRef.current = null;
+        runningRef.current = false;
+        setRunning(false);
+      }
     }
   }
 
   function cancel() {
+    const wasRunning = runningRef.current;
+    generationRef.current += 1;
     controllerRef.current?.abort();
+    controllerRef.current = null;
+    runningRef.current = false;
+    setRunning(false);
+    if (wasRunning) {
+      setJob((current) => current ? {
+        ...current,
+        segments: current.segments.map((segment) => segment.status === "translating"
+          ? { ...segment, status: "pending" }
+          : segment),
+      } : current);
+      setMessage("Prevajanje je bilo preklicano.");
+    }
   }
 
   return { status, statusError, running, progress, message, translate, cancel };

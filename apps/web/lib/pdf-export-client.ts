@@ -4,6 +4,7 @@ import type { TranslationJob } from "./translation-types";
 import { isTranslationUnitSegment } from "./translation-units";
 
 export type PdfExportMode = "diagnostic" | "replacement_preview";
+export const FINAL_PDF_EXPORT_MODE: PdfExportMode = "replacement_preview";
 export type ImageOverlapKind = "none" | "simple_background" | "complex_background" | "image_only_text" | "uncertain";
 
 export type PdfExportReplacement = {
@@ -127,12 +128,70 @@ export async function preparePdfExport(file: File, job: TranslationJob, mode: Pd
   return response.json() as Promise<PdfExportPlan>;
 }
 
-export async function downloadPdfExport(file: File, job: TranslationJob, mode: PdfExportMode): Promise<{ blob: Blob; filename: string }> {
+export type PdfExportDownload = {
+  blob: Blob;
+  filename: string;
+  mode: PdfExportMode;
+  applied_replacements: number;
+};
+
+export function resolvePdfExportMode(simpleMode: boolean, selectedMode: PdfExportMode): PdfExportMode {
+  return simpleMode ? FINAL_PDF_EXPORT_MODE : selectedMode;
+}
+
+export function validatePdfExportDownload(
+  result: Pick<PdfExportDownload, "mode" | "applied_replacements">,
+  requestedMode: PdfExportMode,
+  expectedReplacements: number,
+): boolean {
+  if (result.mode !== requestedMode) {
+    throw new Error("Strežnik je vrnil napačen način PDF izvoza.");
+  }
+  if (requestedMode !== FINAL_PDF_EXPORT_MODE) return false;
+  if (expectedReplacements <= 0) {
+    throw new Error("Končni PDF nima nobene potrjene varne zamenjave.");
+  }
+  if (result.applied_replacements !== expectedReplacements) {
+    throw new Error("Končni PDF ne vsebuje pričakovanega števila varnih zamenjav.");
+  }
+  return true;
+}
+
+export async function downloadPdfExport(file: File, job: TranslationJob, mode: PdfExportMode): Promise<PdfExportDownload> {
   const response = await postExportRequest("/api/pdf/export-translated", file, job, mode);
   if (!response.ok) throw new Error(await exportError(response));
   const disposition = response.headers.get("content-disposition") ?? "";
   const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
-  return { blob: await response.blob(), filename: encoded ? decodeURIComponent(encoded) : "document-sl-preview.pdf" };
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  const responseMode = response.headers.get("x-pdf-export-mode");
+  const applied = response.headers.get("x-pdf-replacements-applied");
+  if (contentType !== "application/pdf") {
+    throw new Error("Strežnik ni vrnil veljavnega PDF odgovora.");
+  }
+  if (!encoded) {
+    throw new Error("Strežnik ni potrdil varnega imena PDF datoteke.");
+  }
+  let filename: string;
+  try {
+    filename = decodeURIComponent(encoded);
+  } catch {
+    throw new Error("Strežnik je vrnil neveljavno ime PDF datoteke.");
+  }
+  if (!filename.toLowerCase().endsWith(".pdf") || /[\\/\u0000-\u001f\u007f]/.test(filename)) {
+    throw new Error("Strežnik je vrnil neveljavno ime PDF datoteke.");
+  }
+  if (responseMode !== "diagnostic" && responseMode !== "replacement_preview") {
+    throw new Error("Strežnik ni potrdil načina PDF izvoza.");
+  }
+  if (applied === null || !/^\d+$/.test(applied)) {
+    throw new Error("Strežnik ni potrdil števila zapisanih PDF zamenjav.");
+  }
+  return {
+    blob: await response.blob(),
+    filename,
+    mode: responseMode,
+    applied_replacements: Number(applied),
+  };
 }
 
 function postExportRequest(path: string, file: File, job: TranslationJob, mode: PdfExportMode): Promise<Response> {

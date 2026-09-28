@@ -30,8 +30,9 @@ export type GlossaryProposal = {
   domain: string;
 };
 
-export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntriesChange }: {
+export function GlossaryManager({ proposal, reloadRequest = 0, onProposalConsumed, onApprovedEntriesChange }: {
   proposal: GlossaryProposal | null;
+  reloadRequest?: number;
   onProposalConsumed: () => void;
   onApprovedEntriesChange: (state: PersistentGlossaryLoadState) => void;
 }) {
@@ -72,7 +73,7 @@ export function GlossaryManager({ proposal, onProposalConsumed, onApprovedEntrie
     const coordinator = loadCoordinator.current;
     void refresh();
     return () => coordinator.invalidate();
-  }, [filters]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [filters, reloadRequest]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!proposal) return;
     let active = true;

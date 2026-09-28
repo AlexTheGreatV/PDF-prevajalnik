@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
-import { PdfExportPanel } from "./pdf-export-panel";
+import { PdfExportPanel, type PdfExportUiState } from "./pdf-export-panel";
 import {
   bindTranslationJobToAnalysis,
   createTranslationJob,
@@ -39,6 +39,8 @@ import {
 } from "../lib/translation-memory";
 import { TranslationMemoryManager, type TranslationMemoryProposal } from "./translation-memory-manager";
 import { isTranslationUnitSegment } from "../lib/translation-units";
+import { determineGuidedStep, type WorkspaceMode } from "../lib/guided-workflow";
+import { GuidedTranslationReview } from "./guided-translation-review";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -46,7 +48,13 @@ const FILTER_LABELS: Record<(typeof FILTERS)[number], string> = {
   all: "Vsi", pending: "Čakajo", translated: "Prevedeni", reviewed: "Potrjeni", failed: "Napake", skipped: "Preskočeni",
 };
 
-export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analysis: PdfAnalysis; ocrItems: OcrReviewItem[]; sourceFile: File }) {
+export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, missingTextPages }: {
+  analysis: PdfAnalysis;
+  ocrItems: OcrReviewItem[];
+  sourceFile: File;
+  mode: WorkspaceMode;
+  missingTextPages: number;
+}) {
   const importRef = useRef<HTMLInputElement | null>(null);
   const recordedGlossaryUsage = useRef(new Map<string, Set<string>>());
   const recordedTranslationMemoryUsage = useRef(new Map<string, Set<string>>());
@@ -55,12 +63,15 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   const [translationDomain, setTranslationDomain] = useState("");
   const [documentGlossary, setDocumentGlossary] = useState<GlossaryEntry[]>([]);
   const [persistentGlossary, setPersistentGlossary] = useState<PersistentGlossaryLoadState>({ status: "loading" });
+  const [glossaryReloadRequest, setGlossaryReloadRequest] = useState(0);
   const [glossaryProposal, setGlossaryProposal] = useState<GlossaryProposal | null>(null);
   const [translationMemory, setTranslationMemory] = useState<TranslationMemoryLoadState>({ status: "loading" });
   const [translationMemoryReloadRequest, setTranslationMemoryReloadRequest] = useState(0);
   const [translationMemoryProposal, setTranslationMemoryProposal] = useState<TranslationMemoryProposal | null>(null);
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
+  const [guidedReviewIndex, setGuidedReviewIndex] = useState(0);
+  const [exportState, setExportState] = useState<PdfExportUiState>({ plan: null, downloadCompleted: false });
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
   const local = useLocalTranslation(job, setJob);
   const glossary = useMemo(
@@ -114,10 +125,27 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   );
   const completed = job?.segments.filter((segment) => isTranslationUnitSegment(segment) && segment.status === "reviewed").length ?? 0;
   const actionable = job?.segments.filter((segment) => isTranslationUnitSegment(segment) && segment.status !== "skipped").length ?? 0;
+  const reviewableSegments = job?.segments.filter((segment) =>
+    isTranslationUnitSegment(segment) && segment.status === "translated" && Boolean(segment.edited_translation.trim()),
+  ) ?? [];
+  const guidedSegment = reviewableSegments.length ? reviewableSegments[guidedReviewIndex % reviewableSegments.length] : null;
+  const guidedState = determineGuidedStep({
+    hasFile: true,
+    analysisReady: true,
+    missingTextPages,
+    ocrItems,
+    glossaryStatus: persistentGlossary.status,
+    translationMemoryStatus: translationMemory.status,
+    translatorAvailable: Boolean(local.status?.available),
+    translationRunning: local.running,
+    job,
+    exportPlan: exportState.plan,
+    exportDownloaded: exportState.downloadCompleted,
+  });
 
-  function prepare() {
-    if (!glossaryReady || !translationMemoryReady) return;
-    setJob(createTranslationJob(analysis, ocrItems, {
+  function createPreparedJob(): TranslationJob | null {
+    if (!glossaryReady || !translationMemoryReady) return null;
+    return createTranslationJob(analysis, ocrItems, {
       source_language: sourceLanguage,
       target_language: targetLanguage,
       glossary: glossary!,
@@ -125,10 +153,28 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       translation_memory: translationMemory.status === "ready" ? translationMemory.entries : [],
       translation_memory_set_hash: translationMemory.status === "ready" ? translationMemory.active_set_hash : null,
       domain: translationDomain,
-    }));
+    });
+  }
+
+  function prepare() {
+    const prepared = createPreparedJob();
+    if (!prepared) return;
+    local.cancel();
+    setExportState({ plan: null, downloadCompleted: false });
+    setJob(prepared);
     setMessage(persistentGlossary.status === "explicitly_skipped"
       ? "Segmenti so pripravljeni brez trajnega glosarja. Prevod zahteva posebej pozoren pregled."
       : "Segmenti so pripravljeni. Prevod lahko vnesete ročno.");
+  }
+
+  async function prepareAndTranslate() {
+    const prepared = createPreparedJob();
+    if (!prepared) return;
+    local.cancel();
+    setExportState({ plan: null, downloadCompleted: false });
+    setJob(prepared);
+    setMessage("Segmenti so pripravljeni iz preverjenih lokalnih virov.");
+    if (local.status?.available) await local.translate(prepared);
   }
 
   function updateSegment(segmentId: string, update: (segment: TranslationSegment) => TranslationSegment) {
@@ -200,10 +246,10 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
   const updateTranslationMemory = useCallback((state: TranslationMemoryLoadState) => setTranslationMemory(state), []);
 
   return (
-    <section className="translation-workspace">
-      <div className="translation-header">
+    <section className={`translation-workspace ${mode === "simple" ? "simple-translation-workspace" : "advanced-translation-workspace"}`}>
+      <div className={`translation-header${mode === "simple" ? " advanced-only" : ""}`}>
         <div>
-          <span>Mejnik 7A</span>
+          <span>Prevajalski pregled</span>
           <h2>Pregled prevodov</h2>
           <p>{message}</p>
         </div>
@@ -224,11 +270,15 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
         </div>
       </div>
 
-      <GlossaryManager proposal={glossaryProposal} onProposalConsumed={() => setGlossaryProposal(null)} onApprovedEntriesChange={updatePersistentGlossary} />
+      <div className="advanced-only">
+        <GlossaryManager proposal={glossaryProposal} reloadRequest={glossaryReloadRequest} onProposalConsumed={() => setGlossaryProposal(null)} onApprovedEntriesChange={updatePersistentGlossary} />
+      </div>
 
-      <TranslationMemoryManager proposal={translationMemoryProposal} reloadRequest={translationMemoryReloadRequest} onProposalConsumed={() => setTranslationMemoryProposal(null)} onApprovedEntriesChange={updateTranslationMemory} />
+      <div className="advanced-only">
+        <TranslationMemoryManager proposal={translationMemoryProposal} reloadRequest={translationMemoryReloadRequest} onProposalConsumed={() => setTranslationMemoryProposal(null)} onApprovedEntriesChange={updateTranslationMemory} />
+      </div>
 
-      <GlossaryEditor entries={documentGlossary} onChange={changeDocumentGlossary} onAdd={addGlossaryEntry} />
+      <div className="advanced-only"><GlossaryEditor entries={documentGlossary} onChange={changeDocumentGlossary} onAdd={addGlossaryEntry} /></div>
 
       <div className={`translation-provider-status ${local.status?.available ? "available" : "unavailable"}`}>
         <strong>{local.status?.available ? "Lokalni prevajalnik je pripravljen" : "Lokalni prevajalnik ni nameščen"}</strong>
@@ -236,7 +286,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
         <span>{local.statusError ?? local.status?.message ?? (!local.status ? "Preverjam stanje lokalnega prevajalnika …" : "Model je naložen samo lokalno.")}</span>
       </div>
 
-      <div className="translation-actions">
+      <div className="translation-actions advanced-only">
         <button className="button" disabled={!glossaryReady || !translationMemoryReady} onClick={prepare}>{job ? "Znova pripravi prevod" : "Pripravi prevod"}</button>
         <button className="button secondary" disabled={!job || !local.status?.available || local.running} onClick={() => void local.translate()}>Prevedi čakajoče</button>
         <button className="button secondary" disabled={!local.running} onClick={local.cancel}>Prekliči</button>
@@ -247,6 +297,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       {persistentGlossary.status === "loading" && <p className="translation-provider-message">Nalaganje trajnega glosarja …</p>}
       {persistentGlossary.status === "error" && <div className="translation-error">
         <p>{persistentGlossary.message} Prevajalsko opravilo ni bilo pripravljeno brez trajnega glosarja.</p>
+        <button className="button secondary" onClick={() => setGlossaryReloadRequest((value) => value + 1)}>Poskusi znova</button>
         <button className="button secondary" onClick={() => setPersistentGlossary({ status: "explicitly_skipped" })}>Nadaljuj brez trajnega glosarja</button>
       </div>}
       {persistentGlossary.status === "explicitly_skipped" && <p className="translation-warning">Nadaljujete brez trajnega glosarja. Uporabljena bodo samo dokumentna navodila in vgrajeni izrazi.</p>}
@@ -258,6 +309,17 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
       </div>}
       {translationMemory.status === "explicitly_skipped" && <p className="translation-warning">Nadaljujete brez lokalnega prevajalskega spomina.</p>}
 
+      {mode === "simple" && !["review_translations", "prepare_pdf", "download_pdf", "complete"].includes(guidedState.step) && (
+        <section className="guided-next-step" aria-live="polite">
+          <span>Naslednji korak</span>
+          <h2>{guidedState.label}</h2>
+          <p>{guidedState.explanation}</p>
+          {guidedState.step === "prepare_translation" && <button className="button" disabled={guidedState.blocked || !local.status?.available} onClick={() => void prepareAndTranslate()}>Pripravi in prevedi</button>}
+          {guidedState.step === "translate" && <button className="button" disabled={guidedState.blocked} onClick={() => void local.translate()}>{guidedState.label}</button>}
+          {guidedState.step === "review_text_issues" && <a className="button" href="#ocr-review">Preglej OCR območja</a>}
+        </section>
+      )}
+
       {job && (
         <>
           {local.message && <p className="translation-provider-message">{local.message}</p>}
@@ -266,17 +328,32 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile }: { analy
             <span>{completed} od {actionable} prevodov potrjenih</span>
             <progress value={completed} max={actionable || 1} />
           </div>
-          <TranslationProfileSummary
-            job={job}
-            onTerminologySourcesChange={(sources) => setJob((current) => current ? updateTerminologySources(current, sources) : current)}
-          />
+          <div className="advanced-only"><TranslationProfileSummary
+              job={job}
+              onTerminologySourcesChange={(sources) => setJob((current) => current ? updateTerminologySources(current, sources) : current)}
+            /></div>
           {isGlossarySnapshotStale(job, persistentGlossaryHash) && <p className="translation-warning">Glosar je bil po prevodu spremenjen. Obstoječi prevodi ostajajo nespremenjeni; za uporabo novega nabora izrecno znova pripravite prevod.</p>}
           {isTranslationMemorySnapshotStale(job, translationMemoryHash) && <p className="translation-warning">Prevajalski spomin je bil po pripravi opravila spremenjen. Odprti prevodi ostajajo nespremenjeni; nov posnetek se uporabi šele ob izrecni ponovni pripravi.</p>}
-          <PdfExportPanel sourceFile={sourceFile} job={job} analysis={analysis} ocrItems={ocrItems} />
-          <div className="translation-filters" aria-label="Filtri prevodov">
+          {mode === "simple" && guidedSegment && <GuidedTranslationReview
+            segment={guidedSegment}
+            position={guidedReviewIndex % reviewableSegments.length + 1}
+            total={reviewableSegments.length}
+            onEdit={(text) => updateSegment(guidedSegment.segment_id, (current) => editTranslation(current, text))}
+            onReview={() => updateSegment(guidedSegment.segment_id, reviewTranslation)}
+            onNext={() => setGuidedReviewIndex((value) => value + 1)}
+          />}
+          {(mode === "advanced" || (["prepare_pdf", "download_pdf", "complete"].includes(guidedState.step) && !guidedSegment)) && <PdfExportPanel
+            sourceFile={sourceFile}
+            job={job}
+            analysis={analysis}
+            ocrItems={ocrItems}
+            simpleMode={mode === "simple"}
+            onStateChange={setExportState}
+          />}
+          <div className="translation-filters advanced-only" aria-label="Filtri prevodov">
             {FILTERS.map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{FILTER_LABELS[value]}</button>)}
           </div>
-          <div className="translation-segments">
+          <div className="translation-segments advanced-only">
             {visibleSegments.map((segment) => (
               <TranslationSegmentRow key={segment.segment_id} segment={segment}
                 onEdit={(text) => updateSegment(segment.segment_id, (current) => editTranslation(current, text))}

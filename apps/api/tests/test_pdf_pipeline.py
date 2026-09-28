@@ -38,6 +38,13 @@ def test_api_allows_known_local_frontend_origins(origin: str) -> None:
     assert response.headers["access-control-allow-origin"] == origin
 
 
+def test_cors_exposes_pdf_export_attestation_headers() -> None:
+    response = client.get("/health", headers={"Origin": "http://127.0.0.1:3001"})
+
+    exposed = {item.strip().lower() for item in response.headers["access-control-expose-headers"].split(",")}
+    assert {"content-disposition", "x-pdf-export-mode", "x-pdf-replacements-applied"} <= exposed
+
+
 def test_analyzes_digital_pdf(tmp_path: Path) -> None:
     pdf_path = tmp_path / "digital.pdf"
     _make_digital_pdf(pdf_path)

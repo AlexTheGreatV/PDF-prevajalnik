@@ -105,6 +105,8 @@ def segment_pdf(path: Path) -> DocumentModel:
 
             extracted_pages.append((rect, page.rotation, lines, tables, images, page_kind))
 
+        _classify_image_relevance(extracted_pages)
+
         header_texts = _repeated_texts(repeated_headers, len(extracted_pages))
         footer_texts = _repeated_texts(repeated_footers, len(extracted_pages))
 
@@ -284,19 +286,50 @@ def _extract_tables(page: fitz.Page) -> list[RawTable]:
 
 def _extract_images(page: fitz.Page) -> list[DocumentImage]:
     images: list[DocumentImage] = []
+    seen_xrefs: set[int] = set()
     for image in page.get_images(full=True):
         xref = int(image[0])
+        if xref in seen_xrefs:
+            continue
+        seen_xrefs.add(xref)
         rects = page.get_image_rects(xref)
-        bbox = _bbox(rects[0]) if rects else None
-        images.append(
-            DocumentImage(
-                bbox=bbox,
-                width=int(image[2]) if len(image) > 2 else None,
-                height=int(image[3]) if len(image) > 3 else None,
-                xref=xref,
+        placements = rects or [None]
+        for rect in placements:
+            images.append(
+                DocumentImage(
+                    bbox=_bbox(rect) if rect is not None else None,
+                    width=int(image[2]) if len(image) > 2 else None,
+                    height=int(image[3]) if len(image) > 3 else None,
+                    xref=xref,
+                )
             )
-        )
     return images
+
+
+def _classify_image_relevance(
+    pages: list[tuple[fitz.Rect, int, list[RawLine], list[RawTable], list[DocumentImage], PdfKind]],
+) -> None:
+    repeated_xrefs = Counter(
+        image.xref
+        for _rect, _rotation, _lines, _tables, images, _page_kind in pages
+        for image in images
+        if image.xref is not None
+    )
+    for page_rect, _rotation, _lines, _tables, images, page_kind in pages:
+        for image in images:
+            if page_kind in {"scanned", "mixed"}:
+                image.ocr_relevance = "text_candidate"
+                image.needs_ocr_check = True
+                continue
+            bbox = image.bbox
+            repeated_decoration = (
+                image.xref is not None
+                and repeated_xrefs[image.xref] > 1
+                and bbox is not None
+                and (bbox.y1 <= page_rect.height * 0.25 or bbox.y0 >= page_rect.height * 0.75)
+            )
+            image.ocr_relevance = "decorative" if repeated_decoration else "export_safety_only"
+            image.needs_ocr_check = False
 
 
 def _build_page(

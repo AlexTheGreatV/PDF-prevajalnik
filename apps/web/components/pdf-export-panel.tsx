@@ -1,10 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { createCoverageRevisionKey } from "../lib/document-coverage";
 import type { OcrReviewItem } from "../lib/ocr-review";
-import { downloadPdfExport, preparePdfExport, type PdfExportMode, type PdfExportPlan } from "../lib/pdf-export-client";
+import {
+  downloadPdfExport,
+  preparePdfExport,
+  resolvePdfExportMode,
+  validatePdfExportDownload,
+  type PdfExportMode,
+  type PdfExportPlan,
+} from "../lib/pdf-export-client";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import type { TranslationJob } from "../lib/translation-types";
 import { DocumentCoverageSummary } from "./document-coverage-summary";
@@ -40,70 +47,95 @@ const REASON_LABELS: Record<string, string> = {
   overflow: "prevod se ne prilega",
 };
 
-export function PdfExportPanel({ sourceFile, job, analysis, ocrItems }: {
+export type PdfExportUiState = { plan: PdfExportPlan | null; downloadCompleted: boolean };
+
+export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode = false, onStateChange }: {
   sourceFile: File;
   job: TranslationJob;
   analysis: PdfAnalysis;
   ocrItems: OcrReviewItem[];
+  simpleMode?: boolean;
+  onStateChange?: (state: PdfExportUiState) => void;
 }) {
   const [mode, setMode] = useState<PdfExportMode>("diagnostic");
   const [planned, setPlanned] = useState<{ revisionKey: string; plan: PdfExportPlan } | null>(null);
   const [busy, setBusy] = useState<"plan" | "download" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [downloadedRevisionKey, setDownloadedRevisionKey] = useState<string | null>(null);
-  const revisionKey = createCoverageRevisionKey({ analysis, ocrItems, job, mode });
+  const [diagnosticDownloadedRevisionKey, setDiagnosticDownloadedRevisionKey] = useState<string | null>(null);
+  const busyRef = useRef(false);
+  const effectiveMode = resolvePdfExportMode(simpleMode, mode);
+  const revisionKey = createCoverageRevisionKey({ analysis, ocrItems, job, mode: effectiveMode });
   const plan = planned?.revisionKey === revisionKey ? planned.plan : null;
   const downloadCompleted = downloadedRevisionKey === revisionKey;
+  const diagnosticDownloadCompleted = diagnosticDownloadedRevisionKey === revisionKey;
+
+  useEffect(() => {
+    onStateChange?.({ plan, downloadCompleted });
+  }, [downloadCompleted, onStateChange, plan]);
 
   async function prepare() {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy("plan");
     setError(null);
+    setPlanned(null);
     setDownloadedRevisionKey(null);
+    setDiagnosticDownloadedRevisionKey(null);
     try {
-      setPlanned({ revisionKey, plan: await preparePdfExport(sourceFile, job, mode) });
+      setPlanned({ revisionKey, plan: await preparePdfExport(sourceFile, job, effectiveMode) });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Načrta izvoza ni bilo mogoče pripraviti.");
     } finally {
+      busyRef.current = false;
       setBusy(null);
     }
   }
 
   async function download() {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy("download");
     setError(null);
     setDownloadedRevisionKey(null);
+    setDiagnosticDownloadedRevisionKey(null);
     try {
-      const result = await downloadPdfExport(sourceFile, job, mode);
+      const result = await downloadPdfExport(sourceFile, job, effectiveMode);
+      const expectedReplacements = (plan?.summary.eligible ?? 0) + (plan?.ocr_summary.eligible_regions ?? 0);
+      const finalDownload = validatePdfExportDownload(result, effectiveMode, expectedReplacements);
       const url = URL.createObjectURL(result.blob);
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download = result.filename;
       anchor.click();
       URL.revokeObjectURL(url);
-      setDownloadedRevisionKey(revisionKey);
+      if (finalDownload) setDownloadedRevisionKey(revisionKey);
+      else setDiagnosticDownloadedRevisionKey(revisionKey);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Izvoz PDF ni uspel.");
     } finally {
+      busyRef.current = false;
       setBusy(null);
     }
   }
 
-  return <section className="pdf-export-panel">
+  return <section className={`pdf-export-panel${simpleMode ? " guided-export" : ""}`}>
     <div className="translation-subhead">
-      <div><h3>Izvoz prevedenega PDF-ja</h3><p>Izvozijo se samo ročno potrjeni in geometrijsko preverjeni prevodi.</p></div>
-      <div className="segmented" aria-label="Način izvoza PDF">
-        <button className={mode === "diagnostic" ? "active" : ""} onClick={() => { setMode("diagnostic"); setError(null); }}>Diagnostika</button>
-        <button className={mode === "replacement_preview" ? "active" : ""} onClick={() => { setMode("replacement_preview"); setError(null); }}>Nadomestni predogled</button>
+      <div><h3>{simpleMode ? (plan ? "Prenesi prevedeni PDF" : "Pripravi PDF") : effectiveMode === "diagnostic" ? "Diagnostični PDF" : "Končni prevedeni PDF"}</h3><p>{effectiveMode === "diagnostic" ? "Diagnostični PDF vsebuje označena območja in ni končni prevedeni dokument." : "Izvozijo se samo ročno potrjeni in geometrijsko preverjeni prevodi."}</p></div>
+      <div className={`segmented${simpleMode ? " advanced-only" : ""}`} aria-label="Način izvoza PDF">
+        <button className={mode === "diagnostic" ? "active" : ""} onClick={() => { setMode("diagnostic"); setError(null); }}>Diagnostični PDF</button>
+        <button className={mode === "replacement_preview" ? "active" : ""} onClick={() => { setMode("replacement_preview"); setError(null); }}>Končni prevedeni PDF</button>
       </div>
     </div>
     <div className="translation-actions">
-      <button className="button" disabled={busy !== null || !job.document_identity} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi izvoz PDF"}</button>
-      <button className="button secondary" disabled={!plan || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : "Prenesi novi PDF"}</button>
+      {!plan && <button className="button" disabled={busy !== null || !job.document_identity} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi PDF"}</button>}
+      {plan && <button className="button" disabled={downloadCompleted || diagnosticDownloadCompleted || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : downloadCompleted ? "PDF je prenesen" : diagnosticDownloadCompleted ? "Diagnostični PDF je prenesen" : effectiveMode === "diagnostic" ? "Prenesi diagnostični PDF" : "Prenesi prevedeni PDF"}</button>}
+      {!simpleMode && plan && <button className="button secondary" disabled={busy !== null} onClick={() => void prepare()}>Znova preveri izvoz</button>}
     </div>
     <DocumentCoverageSummary analysis={analysis} ocrItems={ocrItems} job={job} plan={plan} downloadCompleted={downloadCompleted} />
     {!job.document_identity && <p className="translation-warning">Opravilo nima preverjene identitete PDF-ja. Znova ga povežite s trenutno analizo.</p>}
     {error && <p className="translation-error">{error}</p>}
-    {plan && <>
+    {plan && <div className={simpleMode ? "guided-export-details" : ""}>
       <div className="export-summary">
         <ExportMetric label="Skupaj" value={plan.summary.total_segments} />
         <ExportMetric label="Potrjeni" value={plan.summary.reviewed} />
@@ -171,7 +203,7 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems }: {
         <summary>Razlogi za preskok</summary>
         {[...plan.replacements, ...plan.ocr_replacements].filter((item) => !item.eligible).map((item) => <p key={item.segment_id}><strong>{item.segment_id}</strong>: {REASON_LABELS[item.skip_reason ?? ""] ?? item.skip_reason ?? "ni upravičen"}</p>)}
       </details>}
-    </>}
+    </div>}
   </section>;
 }
 
