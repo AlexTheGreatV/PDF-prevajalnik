@@ -7,6 +7,7 @@ import {
   resolvePdfExportMode,
   validatePdfExportDownload,
   type PdfExportPlan,
+  parsePdfExportPlan,
 } from "../lib/pdf-export-client";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, PdfKind } from "../lib/pdf-types";
@@ -66,6 +67,8 @@ test("prepares a local multipart PDF export plan", async () => {
     assert.equal(result.tables[0].partial_export, true);
     assert.equal(result.ocr_summary.unsafe_regions, 1);
     assert.equal(result.ocr_replacements[0].skip_reason, "ocr_background_unsafe");
+    assert.equal(result.ocr_replacements[0].eligible, false);
+    assert.equal(result.ocr_replacements[0].resolution, "blocked_other");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -205,6 +208,7 @@ test("separates text acquisition translation review and PDF export", () => {
     job: currentJob,
     plan: plan([{ segment_id: "p1-r1-b1", page_number: 1, eligible: true, skip_reason: null }]),
     downloadCompleted: true,
+    appliedReplacements: 1,
   });
   assert.deepEqual(coverage.text, { acquired_pages: 1, total_pages: 2, missing_pages: [2] });
   assert.deepEqual(coverage.translation, { translated: 1, translatable: 1 });
@@ -274,6 +278,7 @@ test("claims complete export only when every known page and segment is covered",
     job: currentJob,
     plan: plan([{ segment_id: "p1-r1-b1", page_number: 1, eligible: true, skip_reason: null }]),
     downloadCompleted: true,
+    appliedReplacements: 1,
   });
   assert.deepEqual(coverage.states, ["known_text_export_complete"]);
   assert.equal(coverage.text.acquired_pages, 1);
@@ -295,10 +300,75 @@ test("reports partial table and overflow export without hiding safe output", () 
       { segment_id: "cell-2", page_number: 1, eligible: false, skip_reason: "cell_overflow" },
     ]),
     downloadCompleted: true,
+    appliedReplacements: 1,
   });
   assert.equal(coverage.pdf_export.exported, 1);
   assert.ok(coverage.states.includes("partially_exported"));
   assert.deepEqual(coverage.pages[0].skips, [{ reason: "cell_overflow", count: 1 }]);
+});
+
+test("separates actual replacements preserved identity non-units and blockers", () => {
+  const currentJob = job();
+  currentJob.segments = [
+    segment({ segment_id: "written", status: "reviewed", edited_translation: "Prevod" }),
+    segment({ segment_id: "preserved", status: "reviewed", edited_translation: "Source" }),
+    segment({ segment_id: "blocked", status: "reviewed", edited_translation: "Predolg prevod" }),
+  ];
+  const exportPlan = plan([
+    { segment_id: "written", page_number: 1, eligible: true, skip_reason: null },
+    { segment_id: "preserved", page_number: 1, eligible: false, skip_reason: null, resolution: "preserved_identical" },
+    { segment_id: "blocked", page_number: 1, eligible: false, skip_reason: "overflow", resolution: "blocked_overflow" },
+    { segment_id: "container", page_number: 1, eligible: false, skip_reason: null, resolution: "not_applicable" },
+  ]);
+
+  const beforeDownload = calculateDocumentCoverage({
+    analysis: analysis(["digital"]), ocrItems: [], job: currentJob,
+    plan: exportPlan, downloadCompleted: false,
+  });
+  assert.equal(beforeDownload.pdf_export.actual_replaced, 0);
+  assert.equal(beforeDownload.pdf_export.preserved_identical, 1);
+  assert.equal(beforeDownload.pdf_export.not_applicable, 1);
+  assert.equal(beforeDownload.pdf_export.blocked, 1);
+
+  const afterDownload = calculateDocumentCoverage({
+    analysis: analysis(["digital"]), ocrItems: [], job: currentJob,
+    plan: exportPlan, downloadCompleted: true, appliedReplacements: 1,
+  });
+  assert.equal(afterDownload.pdf_export.actual_replaced, 1);
+  assert.equal(afterDownload.pdf_export.resolved, 2);
+  assert.ok(afterDownload.states.includes("partially_exported"));
+});
+
+test("migrates a legacy export plan without inventing preserved identity", () => {
+  const legacy = plan([
+    { segment_id: "eligible", page_number: 1, eligible: true, skip_reason: null },
+    { segment_id: "unknown-skip", page_number: 1, eligible: false, skip_reason: "not_reviewed" },
+  ]) as unknown as Record<string, unknown>;
+  delete legacy.schema_version;
+  delete legacy.resolution_summary;
+  const migrated = parsePdfExportPlan(legacy);
+  assert.equal(migrated.schema_version, 2);
+  assert.equal(migrated.resolution_summary.replacement_planned, 1);
+  assert.equal(migrated.resolution_summary.preserved_identical, 0);
+  assert.equal(migrated.resolution_summary.blocked_other, 1);
+  assert.throws(() => parsePdfExportPlan({ ...legacy, schema_version: 99 }), /ni podprta/);
+});
+
+test("rejects incomplete or inconsistent version two export plans", () => {
+  const current = plan([
+    { segment_id: "eligible", page_number: 1, eligible: true, skip_reason: null },
+    { segment_id: "blocked", page_number: 1, eligible: false, skip_reason: "overflow", resolution: "blocked_overflow" },
+  ]);
+  assert.equal(parsePdfExportPlan(current).resolution_summary.total_segments, 2);
+  assert.throws(
+    () => parsePdfExportPlan({ ...current, resolution_summary: { ...current.resolution_summary, blocked_total: 0 } }),
+    /ne ujema/,
+  );
+  assert.throws(() => parsePdfExportPlan({ ...current, replacements: undefined }), /seznama zamenjav/);
+  assert.throws(
+    () => parsePdfExportPlan({ ...current, replacements: [{ ...current.replacements[0], eligible: false }] }),
+    /nedosledno zamenjavo/,
+  );
 });
 
 test("excludes legacy empty table cells from coverage counters and skips", () => {
@@ -311,6 +381,7 @@ test("excludes legacy empty table cells from coverage counters and skips", () =>
     analysis: analysis(["digital"]), ocrItems: [], job: currentJob,
     plan: plan([{ segment_id: "cell-visible", page_number: 1, eligible: true, skip_reason: null }]),
     downloadCompleted: true,
+    appliedReplacements: 1,
   });
 
   assert.equal(coverage.pages[0].digital_segments, 1);
@@ -410,13 +481,36 @@ function ocrItem(overrides: Partial<OcrReviewItem> = {}): OcrReviewItem {
   };
 }
 
-function plan(items: Array<{ segment_id: string; page_number: number; eligible: boolean; skip_reason: string | null }>): PdfExportPlan {
+function plan(items: Array<{ segment_id: string; page_number: number; eligible: boolean; skip_reason: string | null; resolution?: PdfExportPlan["replacements"][number]["resolution"] }>): PdfExportPlan {
+  const resolvedItems = items.map((item) => ({
+    ...item,
+    resolution: item.resolution ?? (item.eligible ? "replacement_planned" as const : "blocked_other" as const),
+  }));
+  const count = (resolution: PdfExportPlan["replacements"][number]["resolution"]) =>
+    resolvedItems.filter((item) => item.resolution === resolution).length;
+  const blockedTotal = resolvedItems.filter((item) => item.resolution.startsWith("blocked_")).length;
   return {
+    schema_version: 2,
     filename: "source-sl.pdf", mode: "replacement_preview", document_sha256: "a".repeat(64),
-    summary: { total_segments: items.length, reviewed: items.length, eligible: items.filter((item) => item.eligible).length, skipped: items.filter((item) => !item.eligible).length, overflow: 0, conflicts: 0, exact: 0, expanded: 0, scaled: 0, background_patches: 0, image_overlap_skipped: 0 },
-    replacements: items.map((item) => ({ ...item, source_bbox: null, original_bbox: null, fitted_bbox: null, translated_text: "Prevod", reviewed: true, fit_status: item.eligible ? "fits" : "overflow", warnings: [], requested_font_size: 10, fitted_font_size: item.eligible ? 10 : null, scale: item.eligible ? 1 : null, original_line_count: 1, fitted_line_count: item.eligible ? 1 : null, font_family: "FiraGO", font_weight: "regular", font_style: "normal", color: "#000000", fit_strategy: item.eligible ? "exact" : "overflow", typography_warnings: [], image_overlap_kind: "none", overlapping_image_xrefs: [], overlap_ratio: 0, background_patch_used: false, background_color: null, patch_rects: [], overlap_confidence: 1, background_metrics: null, image_overlap_warnings: [] })),
+    summary: { total_segments: resolvedItems.length, reviewed: resolvedItems.length, eligible: resolvedItems.filter((item) => item.eligible).length, skipped: resolvedItems.filter((item) => !item.eligible).length, overflow: 0, conflicts: 0, exact: 0, expanded: 0, scaled: 0, background_patches: 0, image_overlap_skipped: 0 },
+    replacements: resolvedItems.map((item) => ({ ...item, source_bbox: null, original_bbox: null, fitted_bbox: null, translated_text: "Prevod", reviewed: true, fit_status: item.eligible ? "fits" : "overflow", warnings: [], requested_font_size: 10, fitted_font_size: item.eligible ? 10 : null, scale: item.eligible ? 1 : null, original_line_count: 1, fitted_line_count: item.eligible ? 1 : null, font_family: "FiraGO", font_weight: "regular", font_style: "normal", color: "#000000", fit_strategy: item.eligible ? "exact" : "overflow", typography_warnings: [], image_overlap_kind: "none", overlapping_image_xrefs: [], overlap_ratio: 0, background_patch_used: false, background_color: null, patch_rects: [], list_marker_preserved: false, overlap_confidence: 1, background_metrics: null, image_overlap_warnings: [] })),
     table_summary: { detected_tables: 0, reviewed_cells: 0, eligible_cells: 0, exported_cells: 0, technical_cells: 0, overflow_cells: 0, ambiguous_cells: 0, image_only_cells: 0, conflicting_cells: 0, partial_tables: 0 }, tables: [],
     ocr_summary: { reviewed_regions: 0, eligible_regions: 0, exported_regions: 0, unsafe_regions: 0, stale_regions: 0 }, ocr_replacements: [],
+    resolution_summary: {
+      total_segments: resolvedItems.length,
+      replacement_planned: count("replacement_planned"),
+      preserved_identical: count("preserved_identical"),
+      not_applicable: count("not_applicable"),
+      blocked_overflow: count("blocked_overflow"),
+      blocked_image_safety: count("blocked_image_safety"),
+      blocked_vector_safety: count("blocked_vector_safety"),
+      blocked_overlap_conflict: count("blocked_overlap_conflict"),
+      blocked_table_structure: count("blocked_table_structure"),
+      blocked_ocr_safety: count("blocked_ocr_safety"),
+      blocked_other: count("blocked_other"),
+      blocked_total: blockedTotal,
+      resolved_if_exported: count("replacement_planned") + count("preserved_identical"),
+    },
   };
 }
 

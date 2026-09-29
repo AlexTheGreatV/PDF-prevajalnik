@@ -60,7 +60,18 @@ export type DocumentCoverage = {
   text: { acquired_pages: number; total_pages: number; missing_pages: number[] };
   translation: { translated: number; translatable: number };
   review: { reviewed: number; translated: number };
-  pdf_export: { ready: number; exported: number; reviewed: number; plan_available: boolean; download_completed: boolean };
+  pdf_export: {
+    ready: number;
+    exported: number;
+    actual_replaced: number;
+    preserved_identical: number;
+    not_applicable: number;
+    blocked: number;
+    resolved: number;
+    reviewed: number;
+    plan_available: boolean;
+    download_completed: boolean;
+  };
   unresolved_ocr_candidates: number;
   unreviewed_image_areas: number;
   warnings: string[];
@@ -72,8 +83,9 @@ export function calculateDocumentCoverage(input: {
   job: TranslationJob;
   plan: PdfExportPlan | null;
   downloadCompleted: boolean;
+  appliedReplacements?: number;
 }): DocumentCoverage {
-  const { analysis, ocrItems, job, plan, downloadCompleted } = input;
+  const { analysis, ocrItems, job, plan, downloadCompleted, appliedReplacements = 0 } = input;
   const exportItems = new Map(
     [...(plan?.replacements ?? []), ...(plan?.ocr_replacements ?? [])]
       .map((item) => [item.segment_id, item] as const),
@@ -114,7 +126,8 @@ export function calculateDocumentCoverage(input: {
     if (!hasAcquiredText) warnings.push("Na tej strani besedilo ni bilo pridobljeno.");
     if (unresolvedOcrCandidates > 0) warnings.push(`Nerešeni OCR kandidati: ${unresolvedOcrCandidates}.`);
     if (unreviewedImageAreas > 0) warnings.push(`Nepregledana slikovna območja: ${unreviewedImageAreas}.`);
-    if (plan && reviewed.length > exportReady) warnings.push(`Potrjeni segmenti, ki niso varno izvozljivi: ${reviewed.length - exportReady}.`);
+    const pageBlocked = segments.filter((segment) => exportItems.get(segment.segment_id)?.resolution?.startsWith("blocked_")).length;
+    if (plan && pageBlocked > 0) warnings.push(`Potrjeni segmenti, ki niso varno izvozljivi: ${pageBlocked}.`);
 
     return {
       page_number: pageNumber,
@@ -145,6 +158,11 @@ export function calculateDocumentCoverage(input: {
   const exported = pages.reduce((total, page) => total + page.exported_segments, 0);
   const unresolved = pages.reduce((total, page) => total + page.unresolved_ocr_candidates, 0);
   const imageGaps = pages.reduce((total, page) => total + page.unreviewed_image_areas, 0);
+  const preservedIdentical = plan?.resolution_summary.preserved_identical ?? 0;
+  const notApplicable = plan?.resolution_summary.not_applicable ?? 0;
+  const blocked = plan?.resolution_summary.blocked_total ?? 0;
+  const actualReplaced = downloadCompleted ? appliedReplacements : 0;
+  const resolved = actualReplaced + preservedIdentical;
   const hasUnknownGaps = missingPages.length > 0 || unresolved > 0 || imageGaps > 0;
   const states: DocumentCoverageState[] = [];
 
@@ -152,8 +170,8 @@ export function calculateDocumentCoverage(input: {
   if (hasUnknownGaps) states.push("ocr_review_required");
   if (translated > 0 && translated < translatable) states.push("partially_translated");
   if (translatable > 0 && translated === translatable && reviewed < translated) states.push("translated_not_reviewed");
-  if (downloadCompleted && reviewed > exported) states.push("partially_exported");
-  if (downloadCompleted && translatable > 0 && reviewed === translatable && exported === reviewed && !hasUnknownGaps) {
+  if (downloadCompleted && blocked > 0) states.push("partially_exported");
+  if (downloadCompleted && translatable > 0 && reviewed === translatable && blocked === 0 && !hasUnknownGaps) {
     states.push("known_text_export_complete");
   }
 
@@ -161,7 +179,7 @@ export function calculateDocumentCoverage(input: {
   if (missingPages.length > 0) warnings.push(`Besedilo ni pridobljeno na straneh: ${missingPages.join(", ")}.`);
   if (unresolved > 0) warnings.push(`Nerešeni ali neveljavni OCR kandidati: ${unresolved}.`);
   if (imageGaps > 0) warnings.push(`Nepregledana zaznana slikovna območja: ${imageGaps}.`);
-  if (plan && reviewed > ready) warnings.push("Načrt PDF izvoza je delen; preskočena območja ostanejo nespremenjena.");
+  if (plan && blocked > 0) warnings.push("Načrt PDF izvoza je delen; blokirana območja ostanejo nespremenjena.");
 
   return {
     pages,
@@ -169,7 +187,18 @@ export function calculateDocumentCoverage(input: {
     text: { acquired_pages: acquiredPages, total_pages: pages.length, missing_pages: missingPages },
     translation: { translated, translatable },
     review: { reviewed, translated },
-    pdf_export: { ready, exported, reviewed, plan_available: Boolean(plan), download_completed: downloadCompleted },
+    pdf_export: {
+      ready,
+      exported,
+      actual_replaced: actualReplaced,
+      preserved_identical: preservedIdentical,
+      not_applicable: notApplicable,
+      blocked,
+      resolved,
+      reviewed,
+      plan_available: Boolean(plan),
+      download_completed: downloadCompleted,
+    },
     unresolved_ocr_candidates: unresolved,
     unreviewed_image_areas: imageGaps,
     warnings,

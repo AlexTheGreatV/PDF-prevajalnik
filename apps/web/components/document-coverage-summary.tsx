@@ -20,14 +20,16 @@ export function DocumentCoverageSummary({
   job,
   plan,
   downloadCompleted,
+  appliedReplacements,
 }: {
   analysis: PdfAnalysis;
   ocrItems: OcrReviewItem[];
   job: TranslationJob;
   plan: PdfExportPlan | null;
   downloadCompleted: boolean;
+  appliedReplacements: number;
 }) {
-  const coverage = calculateDocumentCoverage({ analysis, ocrItems, job, plan, downloadCompleted });
+  const coverage = calculateDocumentCoverage({ analysis, ocrItems, job, plan, downloadCompleted, appliedReplacements });
 
   return <section className="document-coverage" aria-labelledby="document-coverage-title">
     <div className="translation-subhead">
@@ -48,9 +50,9 @@ export function DocumentCoverageSummary({
       <CoverageMetric
         label="PDF izvoz"
         value={coverage.pdf_export.download_completed
-          ? `${coverage.pdf_export.exported} od ${coverage.pdf_export.reviewed} potrjenih izvoženih`
+          ? `${coverage.pdf_export.actual_replaced} dejansko zamenjanih · ${coverage.pdf_export.preserved_identical} pravilno ohranjenih · ${coverage.pdf_export.blocked} blokiranih`
           : coverage.pdf_export.plan_available
-            ? `${coverage.pdf_export.ready} od ${coverage.pdf_export.reviewed} potrjenih varno pripravljenih`
+            ? `${coverage.pdf_export.ready} načrtovanih zamenjav · ${coverage.pdf_export.preserved_identical} pravilno ohranjenih · ${coverage.pdf_export.blocked} blokiranih`
             : "Načrt še ni pripravljen"}
       />
     </div>

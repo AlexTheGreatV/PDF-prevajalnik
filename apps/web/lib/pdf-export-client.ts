@@ -6,6 +6,17 @@ import { isTranslationUnitSegment } from "./translation-units";
 export type PdfExportMode = "diagnostic" | "replacement_preview";
 export const FINAL_PDF_EXPORT_MODE: PdfExportMode = "replacement_preview";
 export type ImageOverlapKind = "none" | "simple_background" | "complex_background" | "image_only_text" | "uncertain";
+export type PdfExportResolution =
+  | "replacement_planned"
+  | "preserved_identical"
+  | "not_applicable"
+  | "blocked_overflow"
+  | "blocked_image_safety"
+  | "blocked_vector_safety"
+  | "blocked_overlap_conflict"
+  | "blocked_table_structure"
+  | "blocked_ocr_safety"
+  | "blocked_other";
 
 export type PdfExportReplacement = {
   segment_id: string;
@@ -17,6 +28,7 @@ export type PdfExportReplacement = {
   reviewed: boolean;
   fit_status: "not_checked" | "fits" | "overflow" | "skipped";
   eligible: boolean;
+  resolution: PdfExportResolution;
   warnings: string[];
   skip_reason: string | null;
   requested_font_size: number;
@@ -36,6 +48,7 @@ export type PdfExportReplacement = {
   background_patch_used: boolean;
   background_color: string | null;
   patch_rects: BBox[];
+  list_marker_preserved: boolean;
   overlap_confidence: number;
   background_metrics: {
     dpi: number;
@@ -61,6 +74,7 @@ export type PdfTableCellReplacement = PdfExportReplacement & {
   source_match_status: "matched" | "mismatch" | "not_checked";
   background_fill: string | null;
   border_clearance: number;
+  technical_value: boolean;
 };
 
 export type PdfTableExportPlan = {
@@ -82,6 +96,7 @@ export type PdfOcrReplacement = PdfExportReplacement & {
 };
 
 export type PdfExportPlan = {
+  schema_version: 2;
   filename: string;
   mode: PdfExportMode;
   document_sha256: string;
@@ -120,12 +135,150 @@ export type PdfExportPlan = {
     stale_regions: number;
   };
   ocr_replacements: PdfOcrReplacement[];
+  resolution_summary: {
+    total_segments: number;
+    replacement_planned: number;
+    preserved_identical: number;
+    not_applicable: number;
+    blocked_overflow: number;
+    blocked_image_safety: number;
+    blocked_vector_safety: number;
+    blocked_overlap_conflict: number;
+    blocked_table_structure: number;
+    blocked_ocr_safety: number;
+    blocked_other: number;
+    blocked_total: number;
+    resolved_if_exported: number;
+  };
 };
 
 export async function preparePdfExport(file: File, job: TranslationJob, mode: PdfExportMode): Promise<PdfExportPlan> {
   const response = await postExportRequest("/api/pdf/export-translated/plan", file, job, mode);
   if (!response.ok) throw new Error(await exportError(response));
-  return response.json() as Promise<PdfExportPlan>;
+  return parsePdfExportPlan(await response.json());
+}
+
+export function parsePdfExportPlan(value: unknown): PdfExportPlan {
+  if (!isRecord(value)) throw new Error("Strežnik je vrnil neveljaven načrt PDF izvoza.");
+  validatePlanEnvelope(value);
+  const version = value.schema_version;
+  if (version === 2) {
+    const replacements = validateCurrentReplacements(value.replacements);
+    const ocrReplacements = validateCurrentReplacements(value.ocr_replacements);
+    validateResolutionSummary(value.resolution_summary, [...replacements, ...ocrReplacements]);
+    return value as PdfExportPlan;
+  }
+  if (version !== undefined && version !== 1) {
+    throw new Error("Različica načrta PDF izvoza ni podprta.");
+  }
+
+  const replacements = normalizeLegacyReplacements(value.replacements);
+  const ocrReplacements = normalizeLegacyReplacements(value.ocr_replacements);
+  const all = [...replacements, ...ocrReplacements];
+  const replacementPlanned = all.filter((item) => item.resolution === "replacement_planned").length;
+  const blockedOther = all.length - replacementPlanned;
+  return {
+    ...value,
+    schema_version: 2,
+    replacements,
+    ocr_replacements: ocrReplacements,
+    resolution_summary: {
+      total_segments: all.length,
+      replacement_planned: replacementPlanned,
+      preserved_identical: 0,
+      not_applicable: 0,
+      blocked_overflow: 0,
+      blocked_image_safety: 0,
+      blocked_vector_safety: 0,
+      blocked_overlap_conflict: 0,
+      blocked_table_structure: 0,
+      blocked_ocr_safety: 0,
+      blocked_other: blockedOther,
+      blocked_total: blockedOther,
+      resolved_if_exported: replacementPlanned,
+    },
+  } as PdfExportPlan;
+}
+
+function normalizeLegacyReplacements(value: unknown): PdfExportReplacement[] {
+  if (!Array.isArray(value)) throw new Error("Stari načrt PDF izvoza nima veljavnega seznama zamenjav.");
+  return value.map((item) => {
+    if (
+      !isRecord(item)
+      || typeof item.segment_id !== "string"
+      || (item.eligible !== undefined && typeof item.eligible !== "boolean")
+    ) {
+      throw new Error("Stari načrt PDF izvoza vsebuje neveljavno zamenjavo.");
+    }
+    const eligible = item.eligible === true;
+    return {
+      ...item,
+      eligible,
+      resolution: eligible ? "replacement_planned" : "blocked_other",
+      list_marker_preserved: false,
+    } as PdfExportReplacement;
+  });
+}
+
+const RESOLUTIONS: PdfExportResolution[] = [
+  "replacement_planned", "preserved_identical", "not_applicable", "blocked_overflow",
+  "blocked_image_safety", "blocked_vector_safety", "blocked_overlap_conflict",
+  "blocked_table_structure", "blocked_ocr_safety", "blocked_other",
+];
+
+function validatePlanEnvelope(value: Record<string, unknown>): void {
+  if (
+    typeof value.filename !== "string"
+    || (value.mode !== "diagnostic" && value.mode !== "replacement_preview")
+    || typeof value.document_sha256 !== "string"
+    || !isRecord(value.summary)
+    || !isRecord(value.table_summary)
+    || !Array.isArray(value.tables)
+    || !isRecord(value.ocr_summary)
+  ) {
+    throw new Error("Strežnik je vrnil nepopoln načrt PDF izvoza.");
+  }
+}
+
+function validateCurrentReplacements(value: unknown): PdfExportReplacement[] {
+  if (!Array.isArray(value)) throw new Error("Načrt PDF izvoza nima veljavnega seznama zamenjav.");
+  return value.map((item) => {
+    if (
+      !isRecord(item)
+      || typeof item.segment_id !== "string"
+      || typeof item.eligible !== "boolean"
+      || typeof item.resolution !== "string"
+      || !RESOLUTIONS.includes(item.resolution as PdfExportResolution)
+      || item.eligible !== (item.resolution === "replacement_planned")
+    ) {
+      throw new Error("Načrt PDF izvoza vsebuje nedosledno zamenjavo.");
+    }
+    return item as PdfExportReplacement;
+  });
+}
+
+function validateResolutionSummary(value: unknown, replacements: PdfExportReplacement[]): void {
+  if (!isRecord(value)) throw new Error("Načrt PDF izvoza nima povzetka rezultatov.");
+  const counts = Object.fromEntries(RESOLUTIONS.map((resolution) => [resolution, 0])) as Record<PdfExportResolution, number>;
+  for (const replacement of replacements) counts[replacement.resolution] += 1;
+  const blockedTotal = RESOLUTIONS
+    .filter((resolution) => resolution.startsWith("blocked_"))
+    .reduce((total, resolution) => total + counts[resolution], 0);
+  const expected: Record<string, number> = {
+    total_segments: replacements.length,
+    ...counts,
+    blocked_total: blockedTotal,
+    resolved_if_exported: counts.replacement_planned + counts.preserved_identical,
+  };
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    if (!Number.isInteger(value[key]) || value[key] !== expectedValue) {
+      throw new Error("Povzetek načrta PDF izvoza se ne ujema s posameznimi segmenti.");
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export type PdfExportDownload = {

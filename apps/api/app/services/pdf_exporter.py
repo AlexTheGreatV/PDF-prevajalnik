@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -15,6 +15,7 @@ from app.pdf_export_models import (
     FitStrategy,
     PdfExportJob,
     PdfExportPlan,
+    PdfExportResolutionSummary,
     PdfExportSegment,
     PdfExportSummary,
     PdfOcrExportSummary,
@@ -33,6 +34,7 @@ from app.services.ocr_review_registry import ocr_review_registry
 DOCUMENT_MODEL_VERSION = 1
 MIN_FONT_SIZE = 6.0
 GEOMETRY_TOLERANCE = 0.5
+OVERLAP_TOLERANCE = 0.1
 HEADING_MIN_SCALE = 0.85
 BODY_MIN_SCALE = 0.75
 TABLE_MIN_FONT_SIZE = 5.5
@@ -42,6 +44,9 @@ INVISIBLE_STRUCTURAL_TEXT = frozenset(
     "\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b\u200c\u200d\u200e\u200f"
     "\u2060\u2061\u2062\u2063\u2064\u2066\u2067\u2068\u2069\u3164\ufeff\uffa0"
 )
+EXTRACTION_LIGATURES = str.maketrans({
+    "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st",
+})
 
 
 class PdfExportValidationError(ValueError):
@@ -77,7 +82,7 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
         replacements.extend(table_replacements)
         _mark_overlap_conflicts([*replacements, *ocr_replacements])
         for replacement in replacements:
-            if replacement.skip_reason is not None:
+            if replacement.skip_reason is not None or replacement.resolution != "blocked_other":
                 continue
             if isinstance(replacement, PdfTableCellReplacement):
                 _fit_table_cell(document[replacement.page_number - 1], replacement, typography, overlap_analyzer)
@@ -87,7 +92,7 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
             if replacement.eligible and replacement.background_patch_used:
                 _validate_expanded_patch_area(page, replacement, overlap_analyzer)
         for replacement in ocr_replacements:
-            if replacement.skip_reason is None:
+            if replacement.skip_reason is None and replacement.resolution == "blocked_other":
                 _fit_ocr_replacement(document[replacement.page_number - 1], replacement, typography)
         _refresh_table_status(tables)
 
@@ -101,6 +106,7 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
         tables=tables,
         ocr_summary=_summarize_ocr(ocr_replacements),
         ocr_replacements=ocr_replacements,
+        resolution_summary=_summarize_resolutions([*replacements, *ocr_replacements]),
     )
 
 
@@ -152,6 +158,8 @@ def _plan_segment(
     overlap_analyzer: PdfImageOverlapAnalyzer,
 ) -> PdfReplacement:
     replacement = _new_replacement(segment)
+    if segment.status == "skipped":
+        return _not_applicable(replacement, "Segment ni prevajalska enota za PDF izvoz.")
     if segment.status != "reviewed":
         return _skip(replacement, "not_reviewed", "Izvozi se samo ročno potrjene prevode.")
     if not segment.edited_translation.strip():
@@ -175,6 +183,8 @@ def _plan_segment(
     extracted = page.get_text("text", clip=rect, sort=True)
     if not _text_matches(segment.source_text, extracted):
         return _skip(replacement, "source_text_mismatch", "Besedilo v navedenem območju se ne ujema z izvornim segmentom.")
+    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
+        return _preserve_identical(replacement)
     assessment = overlap_analyzer.analyze(page, rect, preserve_list_marker=segment.block_type == "list_item")
     _apply_overlap_assessment(replacement, assessment)
     if assessment.kind != "none" and not assessment.safe_for_background_patch:
@@ -237,6 +247,8 @@ def _plan_ocr_segment(
             "Strežniška OCR revizija ni sprejeta, je zastarela ali se ne ujema. Ponovno registrirajte in sprejmite aktualni vir ter potrdite prevod."
         )
         return _skip(replacement, reason, message)
+    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
+        return _preserve_identical(replacement)
     if segment.source_text != provenance.accepted_text or not _same_bbox(segment.source_bbox, provenance.bbox):
         return _skip(replacement, "ocr_provenance_mismatch", "Sprejeto OCR besedilo ali območje se je po potrditvi spremenilo.")
     if not 1 <= segment.page_number <= document.page_count:
@@ -342,8 +354,10 @@ def _plan_tables(
         if segment.block_type == "table_cell":
             cell_groups[(segment.page_number, segment.block_id)].append(segment)
         elif segment.block_type == "table":
-            reason: SkipReason = "duplicate_table_content" if (segment.page_number, segment.block_id) in cell_group_keys else "complex_table"
-            replacements.append(_skip(_new_replacement(segment), reason, "Vsebnik tabele se ne izvozi skupaj s posameznimi celicami."))
+            replacements.append(_not_applicable(
+                _new_replacement(segment),
+                "Vsebnik tabele je strukturna enota; izvozijo se njegove posamezne celice.",
+            ))
 
     assigned_tables: set[str] = set()
     for (page_number, block_id), segments in cell_groups.items():
@@ -453,11 +467,12 @@ def _plan_table_cell(
         row_span=geometry.row_span, column_span=geometry.column_span,
         cell_bbox=geometry.cell_bbox, content_bbox=geometry.content_bbox,
         background_fill=geometry.background_fill, border_clearance=geometry.border_clearance,
+        technical_value=is_technical_value(geometry.text),
     )
+    if segment.status == "skipped":
+        return _not_applicable(cell, "Celica ni prevajalska enota za PDF izvoz.")
     if not geometry.text:
-        return _skip(cell, "empty_cell", "Prazna celica ostane nespremenjena.")
-    if is_technical_value(geometry.text):
-        return _skip(cell, "technical_value", "Samostojna tehnična vrednost ostane nespremenjena.")
+        return _not_applicable(cell, "Prazna celica ostane samo del geometrije tabele.")
     if not table.reliable:
         return _skip(cell, "unsupported_table_structure", "Struktura tabele ni dovolj zanesljiva za celični izvoz.")
     if "missing_cell_bbox" in geometry.warnings:
@@ -474,6 +489,8 @@ def _plan_table_cell(
         return _skip(cell, "not_reviewed", "Celica ni ročno potrjena.")
     if not segment.edited_translation.strip():
         return _skip(cell, "empty_translation", "Potrjena celica nima prevoda.")
+    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
+        return _preserve_identical(cell)
     if page.rotation != 0 or segment.source_rotation not in {0, None}:
         return _skip(cell, "rotated_page", "Rotirana tabela ni podprta.")
     if segment.source_text_origin != "native":
@@ -530,6 +547,11 @@ def _apply_overlap_assessment(replacement: PdfReplacement, assessment: ImageOver
     replacement.overlap_confidence = assessment.confidence
     replacement.patch_rects = assessment.patch_rects
     replacement.redaction_rects = assessment.redaction_rects
+    replacement.list_marker_preserved = (
+        replacement.block_type == "list_item"
+        and assessment.safe_for_background_patch
+        and bool(assessment.redaction_rects)
+    )
     replacement.image_overlap_warnings.extend(assessment.warnings)
     replacement.background_patch_used = assessment.safe_for_background_patch
 
@@ -548,7 +570,7 @@ def _validate_expanded_patch_area(
     replacement: PdfReplacement,
     analyzer: PdfImageOverlapAnalyzer,
 ) -> None:
-    original = _rect(replacement.original_bbox)
+    original = _layout_rect(replacement)
     fitted = _rect(replacement.fitted_bbox)
     if fitted == original:
         return
@@ -569,7 +591,10 @@ def _validate_expanded_patch_area(
 
 
 def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> None:
-    candidates = [item for item in replacements if item.skip_reason is None and item.source_bbox is not None]
+    candidates = [
+        item for item in replacements
+        if item.skip_reason is None and item.source_bbox is not None and item.resolution == "blocked_other"
+    ]
     conflicting: set[str] = set()
     for index, first in enumerate(candidates):
         first_rect = _rect(first.source_bbox)
@@ -577,12 +602,21 @@ def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> None:
             if first.page_number != second.page_number:
                 continue
             intersection = first_rect & _rect(second.source_bbox)
-            if not intersection.is_empty and intersection.get_area() > GEOMETRY_TOLERANCE:
+            if _is_material_overlap(intersection):
                 conflicting.update((first.segment_id, second.segment_id))
     for replacement in candidates:
         if replacement.segment_id in conflicting:
             reason: SkipReason = "overlapping_table_replacement" if isinstance(replacement, PdfTableCellReplacement) else "overlap_conflict"
             _skip(replacement, reason, "Območje se prekriva z drugim replacementom.")
+
+
+def _is_material_overlap(intersection: pymupdf.Rect) -> bool:
+    """Ignore sub-point extraction noise, but retain real two-dimensional overlap."""
+    return (
+        not intersection.is_empty
+        and intersection.width > OVERLAP_TOLERANCE
+        and intersection.height > OVERLAP_TOLERANCE
+    )
 
 
 def _fit_replacement(
@@ -591,7 +625,7 @@ def _fit_replacement(
     replacements: list[PdfReplacement],
     typography: PdfTypographyResolver,
 ) -> None:
-    original = _rect(replacement.original_bbox)
+    original = _layout_rect(replacement)
     asset = _asset_for(replacement, typography)
     exact = _htmlbox_preflight(page.rect, original, replacement, typography, asset, 1.0)
     if exact[0] >= 0:
@@ -688,6 +722,7 @@ def _accept_fit(replacement: PdfReplacement, rect: pymupdf.Rect, result: tuple[f
     replacement.fit_strategy = strategy
     replacement.fit_status = "fits"
     replacement.eligible = True
+    replacement.resolution = "replacement_planned"
 
 
 def _htmlbox_preflight(
@@ -698,7 +733,7 @@ def _htmlbox_preflight(
     asset: FontAsset,
     scale_low: float,
 ) -> tuple[float, float, int]:
-    html_text, css = typography.html_and_css(replacement.translated_text, replacement.typography, asset)
+    html_text, css = typography.html_and_css(_rendered_translation(replacement), replacement.typography, asset)
     with pymupdf.open() as scratch:
         page = scratch.new_page(width=page_rect.width, height=page_rect.height)
         spare, scale = page.insert_htmlbox(rect, html_text, css=css, scale_low=scale_low, archive=typography.archive)
@@ -836,7 +871,7 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
                 for patch in item.patch_rects:
                     page.draw_rect(_rect(patch), color=None, fill=patch_color, fill_opacity=1, overlay=True)
             asset = _asset_for(item, typography)
-            html_text, css = typography.html_and_css(item.translated_text, item.typography, asset)
+            html_text, css = typography.html_and_css(_rendered_translation(item), item.typography, asset)
             spare, scale = page.insert_htmlbox(
                 _rect(item.fitted_bbox), html_text, css=css, scale_low=max(0.0, (item.scale or 1.0) - 0.000001), archive=typography.archive, overlay=True
             )
@@ -856,7 +891,7 @@ def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
             if item.fitted_bbox is not None and not _same_bbox(item.fitted_bbox, item.source_bbox):
                 verification_boxes.append(item.fitted_bbox)
             if not any(
-                _text_matches(item.translated_text, page.get_text("text", clip=_rect(bbox), sort=True))
+                    _written_text_matches(_rendered_translation(item), page.get_text("text", clip=_rect(bbox), sort=True))
                 for bbox in verification_boxes
             ):
                 raise PdfExportValidationError("output_verification_failed", f"Vstavljenega prevoda segmenta {item.segment_id} ni bilo mogoče preveriti.")
@@ -944,6 +979,32 @@ def _canonical_text(value: str) -> str:
     return " ".join(without_list_markers.casefold().split())
 
 
+def _written_text_matches(expected: str, extracted: str) -> bool:
+    """Verify written content exactly, allowing only layout whitespace and a preserved list marker."""
+    return _verification_text(expected) == _verification_text(extracted)
+
+
+def _verification_text(value: str) -> str:
+    without_list_marker = re.sub(r"^\s*[-–—•▪◦*]+\s*", "", value.translate(EXTRACTION_LIGATURES), count=1)
+    return re.sub(r"[\s\u00a0]+", " ", without_list_marker).strip()
+
+
+def _rendered_translation(replacement: PdfReplacement) -> str:
+    if replacement.list_marker_preserved:
+        return re.sub(r"^\s*[-–—•▪◦*]+\s*", "", replacement.translated_text, count=1)
+    return replacement.translated_text
+
+
+def _layout_rect(replacement: PdfReplacement) -> pymupdf.Rect:
+    if replacement.list_marker_preserved and replacement.redaction_rects:
+        rects = [_rect(item) for item in replacement.redaction_rects]
+        result = pymupdf.Rect(rects[0])
+        for rect in rects[1:]:
+            result |= rect
+        return result
+    return _rect(replacement.original_bbox)
+
+
 def _close(left: float, right: float) -> bool:
     return abs(left - right) <= GEOMETRY_TOLERANCE
 
@@ -963,7 +1024,50 @@ def _skip(replacement: PdfReplacement, reason: SkipReason, warning: str, fit_sta
     if replacement.fit_strategy == "not_checked":
         replacement.fit_strategy = "overflow" if reason == "overflow" else "skipped"
     replacement.warnings.append(warning)
+    replacement.resolution = _blocked_resolution(reason)
     return replacement
+
+
+def _preserve_identical(replacement: PdfReplacement) -> PdfReplacement:
+    replacement.fit_status = "skipped"
+    replacement.fit_strategy = "skipped"
+    replacement.eligible = False
+    replacement.resolution = "preserved_identical"
+    replacement.warnings.append("Prevod je po strogi prikazni primerjavi enak izvoru in ne zahteva zamenjave.")
+    return replacement
+
+
+def _not_applicable(replacement: PdfReplacement, warning: str) -> PdfReplacement:
+    replacement.fit_status = "skipped"
+    replacement.fit_strategy = "skipped"
+    replacement.eligible = False
+    replacement.resolution = "not_applicable"
+    replacement.warnings.append(warning)
+    return replacement
+
+
+def _blocked_resolution(reason: SkipReason) -> str:
+    if reason in {"overflow", "cell_overflow"}:
+        return "blocked_overflow"
+    if reason == "image_overlap":
+        return "blocked_image_safety"
+    if reason in {"overlap_conflict", "overlapping_table_replacement"}:
+        return "blocked_overlap_conflict"
+    if reason in {
+        "complex_table", "duplicate_table_content", "ambiguous_cell_membership",
+        "merged_cell_ambiguous", "missing_cell_bbox", "duplicate_cell_geometry",
+        "unsupported_table_structure",
+    }:
+        return "blocked_table_structure"
+    if reason.startswith("ocr_"):
+        return "blocked_ocr_safety"
+    return "blocked_other"
+
+
+def _strict_display_text(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"[\t \u00a0\u200b\ufeff]*\n[\t \u00a0\u200b\ufeff]*", " ", normalized)
+    return normalized.strip(" \t\n\u00a0\u200b\ufeff")
 
 
 def _summarize(replacements: list[PdfReplacement]) -> PdfExportSummary:
@@ -979,6 +1083,26 @@ def _summarize(replacements: list[PdfReplacement]) -> PdfExportSummary:
         scaled=sum(item.fit_strategy == "scaled" for item in replacements),
         background_patches=sum(item.background_patch_used for item in replacements),
         image_overlap_skipped=sum(item.skip_reason == "image_overlap" for item in replacements),
+    )
+
+
+def _summarize_resolutions(replacements: list[PdfReplacement]) -> PdfExportResolutionSummary:
+    counts = Counter(item.resolution for item in replacements)
+    blocked_total = sum(count for resolution, count in counts.items() if resolution.startswith("blocked_"))
+    return PdfExportResolutionSummary(
+        total_segments=len(replacements),
+        replacement_planned=counts["replacement_planned"],
+        preserved_identical=counts["preserved_identical"],
+        not_applicable=counts["not_applicable"],
+        blocked_overflow=counts["blocked_overflow"],
+        blocked_image_safety=counts["blocked_image_safety"],
+        blocked_vector_safety=counts["blocked_vector_safety"],
+        blocked_overlap_conflict=counts["blocked_overlap_conflict"],
+        blocked_table_structure=counts["blocked_table_structure"],
+        blocked_ocr_safety=counts["blocked_ocr_safety"],
+        blocked_other=counts["blocked_other"],
+        blocked_total=blocked_total,
+        resolved_if_exported=counts["replacement_planned"] + counts["preserved_identical"],
     )
 
 
@@ -998,7 +1122,11 @@ def _summarize_ocr(replacements: list[PdfOcrReplacement]) -> PdfOcrExportSummary
 def _refresh_table_status(tables: list[PdfTableExportPlan]) -> None:
     for table in tables:
         reviewed = [cell for cell in table.cells if cell.reviewed]
-        table.partial_export = bool(reviewed) and any(cell.eligible for cell in reviewed) and any(not cell.eligible for cell in reviewed)
+        table.partial_export = (
+            bool(reviewed)
+            and any(cell.resolution == "replacement_planned" for cell in reviewed)
+            and any(cell.resolution.startswith("blocked_") for cell in reviewed)
+        )
 
 
 def _summarize_tables(tables: list[PdfTableExportPlan]) -> PdfTableExportSummary:
@@ -1012,7 +1140,7 @@ def _summarize_tables(tables: list[PdfTableExportPlan]) -> PdfTableExportSummary
         reviewed_cells=sum(cell.reviewed for cell in cells),
         eligible_cells=sum(cell.eligible for cell in cells),
         exported_cells=sum(cell.eligible for cell in cells),
-        technical_cells=sum(cell.skip_reason == "technical_value" for cell in cells),
+        technical_cells=sum(cell.technical_value for cell in cells),
         overflow_cells=sum(cell.skip_reason == "cell_overflow" for cell in cells),
         ambiguous_cells=sum(cell.skip_reason in ambiguous_reasons for cell in cells),
         image_only_cells=sum(cell.skip_reason == "ocr_only_source" for cell in cells),

@@ -24,7 +24,8 @@ def test_regular_table_exports_cells_and_preserves_grid_and_fill(tmp_path: Path)
 
     assert _hash(source) == before_hash
     assert artifact.plan.table_summary.detected_tables == 1
-    assert artifact.plan.table_summary.exported_cells == 3
+    assert artifact.plan.table_summary.exported_cells == 2
+    assert artifact.plan.resolution_summary.preserved_identical == 1
     assert _drawing_signature(artifact.path) == before_drawings
     assert ImageChops.difference(before_neighbor, _render_clip(artifact.path, pymupdf.Rect(161, 81, 299, 129))).getbbox() is None
     with pymupdf.open(artifact.path) as document:
@@ -69,15 +70,26 @@ def test_translatable_or_damaged_values_are_not_classified_as_standalone_technic
     assert not is_technical_value(value)
 
 
-def test_technical_value_is_skipped_but_mixed_text_is_exportable(tmp_path: Path) -> None:
+def test_unchanged_technical_value_is_preserved_but_changed_value_is_exported(tmp_path: Path) -> None:
     source = tmp_path / "technical.pdf"
     _make_table(source, values=("Density", "2.5 MPa", "Temperature 20 °C", "Stable"))
-    job = _job(source, translations={(0, 0): "Gostota", (0, 1): "2.5 MPa", (1, 0): "Temperatura 20 °C"})
+    job = _job(source, translations={(0, 0): "Gostota", (0, 1): "2,5\u00a0MPa", (1, 0): "Temperatura 20 °C"})
     plan = plan_pdf_export(source, job, "replacement_preview", tmp_path / "work")
-    reasons = {(cell.row_index, cell.column_index): cell.skip_reason for cell in plan.tables[0].cells}
-    assert reasons[(0, 1)] == "technical_value"
-    assert reasons[(0, 0)] is None
-    assert reasons[(1, 0)] is None
+    cells = {(cell.row_index, cell.column_index): cell for cell in plan.tables[0].cells}
+    assert cells[(0, 1)].eligible is True
+    assert cells[(0, 1)].resolution == "replacement_planned"
+    assert cells[(0, 0)].eligible is True
+    assert cells[(1, 0)].eligible is True
+
+    unchanged = plan_pdf_export(
+        source,
+        _job(source, translations={(0, 1): "2.5 MPa"}),
+        "replacement_preview",
+        tmp_path / "unchanged",
+    ).tables[0].cells[1]
+    assert unchanged.eligible is False
+    assert unchanged.skip_reason is None
+    assert unchanged.resolution == "preserved_identical"
 
 
 def test_multiline_scale_and_cell_overflow_are_isolated(tmp_path: Path) -> None:
@@ -92,7 +104,8 @@ def test_multiline_scale_and_cell_overflow_are_isolated(tmp_path: Path) -> None:
     cells = {(cell.row_index, cell.column_index): cell for cell in artifact.plan.tables[0].cells}
     assert cells[(0, 0)].fit_strategy in {"exact", "scaled"}
     assert cells[(0, 1)].skip_reason == "cell_overflow"
-    assert cells[(1, 0)].eligible is True
+    assert cells[(1, 0)].eligible is False
+    assert cells[(1, 0)].resolution == "preserved_identical"
     assert artifact.plan.tables[0].partial_export is True
     with pymupdf.open(artifact.path) as document:
         assert "Values" in document[0].get_text()

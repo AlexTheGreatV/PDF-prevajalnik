@@ -47,7 +47,11 @@ const REASON_LABELS: Record<string, string> = {
   overflow: "prevod se ne prilega",
 };
 
-export type PdfExportUiState = { plan: PdfExportPlan | null; downloadCompleted: boolean };
+export type PdfExportUiState = {
+  plan: PdfExportPlan | null;
+  downloadCompleted: boolean;
+  appliedReplacements: number;
+};
 
 export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode = false, onStateChange }: {
   sourceFile: File;
@@ -62,6 +66,7 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
   const [busy, setBusy] = useState<"plan" | "download" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [downloadedRevisionKey, setDownloadedRevisionKey] = useState<string | null>(null);
+  const [appliedReplacements, setAppliedReplacements] = useState(0);
   const [diagnosticDownloadedRevisionKey, setDiagnosticDownloadedRevisionKey] = useState<string | null>(null);
   const busyRef = useRef(false);
   const effectiveMode = resolvePdfExportMode(simpleMode, mode);
@@ -71,8 +76,8 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
   const diagnosticDownloadCompleted = diagnosticDownloadedRevisionKey === revisionKey;
 
   useEffect(() => {
-    onStateChange?.({ plan, downloadCompleted });
-  }, [downloadCompleted, onStateChange, plan]);
+    onStateChange?.({ plan, downloadCompleted, appliedReplacements: downloadCompleted ? appliedReplacements : 0 });
+  }, [appliedReplacements, downloadCompleted, onStateChange, plan]);
 
   async function prepare() {
     if (busyRef.current) return;
@@ -81,6 +86,7 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
     setError(null);
     setPlanned(null);
     setDownloadedRevisionKey(null);
+    setAppliedReplacements(0);
     setDiagnosticDownloadedRevisionKey(null);
     try {
       setPlanned({ revisionKey, plan: await preparePdfExport(sourceFile, job, effectiveMode) });
@@ -98,6 +104,7 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
     setBusy("download");
     setError(null);
     setDownloadedRevisionKey(null);
+    setAppliedReplacements(0);
     setDiagnosticDownloadedRevisionKey(null);
     try {
       const result = await downloadPdfExport(sourceFile, job, effectiveMode);
@@ -109,7 +116,10 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
       anchor.download = result.filename;
       anchor.click();
       URL.revokeObjectURL(url);
-      if (finalDownload) setDownloadedRevisionKey(revisionKey);
+      if (finalDownload) {
+        setAppliedReplacements(result.applied_replacements);
+        setDownloadedRevisionKey(revisionKey);
+      }
       else setDiagnosticDownloadedRevisionKey(revisionKey);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Izvoz PDF ni uspel.");
@@ -132,15 +142,16 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
       {plan && <button className="button" disabled={downloadCompleted || diagnosticDownloadCompleted || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : downloadCompleted ? "PDF je prenesen" : diagnosticDownloadCompleted ? "Diagnostični PDF je prenesen" : effectiveMode === "diagnostic" ? "Prenesi diagnostični PDF" : "Prenesi prevedeni PDF"}</button>}
       {!simpleMode && plan && <button className="button secondary" disabled={busy !== null} onClick={() => void prepare()}>Znova preveri izvoz</button>}
     </div>
-    <DocumentCoverageSummary analysis={analysis} ocrItems={ocrItems} job={job} plan={plan} downloadCompleted={downloadCompleted} />
+    <DocumentCoverageSummary analysis={analysis} ocrItems={ocrItems} job={job} plan={plan} downloadCompleted={downloadCompleted} appliedReplacements={appliedReplacements} />
     {!job.document_identity && <p className="translation-warning">Opravilo nima preverjene identitete PDF-ja. Znova ga povežite s trenutno analizo.</p>}
     {error && <p className="translation-error">{error}</p>}
     {plan && <div className={simpleMode ? "guided-export-details" : ""}>
       <div className="export-summary">
-        <ExportMetric label="Skupaj" value={plan.summary.total_segments} />
-        <ExportMetric label="Potrjeni" value={plan.summary.reviewed} />
-        <ExportMetric label="Upravičeni" value={plan.summary.eligible} />
-        <ExportMetric label="Preskočeni" value={plan.summary.skipped} />
+        <ExportMetric label={downloadCompleted ? "Dejansko zamenjani" : "Načrtovane zamenjave"} value={downloadCompleted ? appliedReplacements : plan.resolution_summary.replacement_planned} />
+        <ExportMetric label="Pravilno ohranjeni" value={plan.resolution_summary.preserved_identical} />
+        <ExportMetric label="Niso prevajalske enote" value={plan.resolution_summary.not_applicable} />
+        <ExportMetric label="Potrjeni, vendar blokirani" value={plan.resolution_summary.blocked_total} />
+        <ExportMetric label="Skupaj razrešeni" value={(downloadCompleted ? appliedReplacements : 0) + plan.resolution_summary.preserved_identical} />
         <ExportMetric label="Overflow" value={plan.summary.overflow} />
         <ExportMetric label="Konflikti" value={plan.summary.conflicts} />
         <ExportMetric label="Exact" value={plan.summary.exact} />

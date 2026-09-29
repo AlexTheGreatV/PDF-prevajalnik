@@ -5,6 +5,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.models import BBox, PdfKind, SpanStyle
 
 ExportMode = Literal["diagnostic", "replacement_preview"]
+ExportResolution = Literal[
+    "replacement_planned",
+    "preserved_identical",
+    "not_applicable",
+    "blocked_overflow",
+    "blocked_image_safety",
+    "blocked_vector_safety",
+    "blocked_overlap_conflict",
+    "blocked_table_structure",
+    "blocked_ocr_safety",
+    "blocked_other",
+]
 FitStatus = Literal["not_checked", "fits", "overflow", "skipped"]
 FitStrategy = Literal["not_checked", "exact", "expanded_bbox", "scaled", "overflow", "unsupported_style", "missing_glyph", "skipped"]
 TextAlignment = Literal["left", "center", "right", "justify"]
@@ -180,12 +192,14 @@ class PdfReplacement(BaseModel):
     background_color: str | None = None
     patch_rects: list[BBox] = Field(default_factory=list)
     redaction_rects: list[BBox] = Field(default_factory=list)
+    list_marker_preserved: bool = False
     overlap_confidence: float = 1.0
     background_metrics: PdfBackgroundMetrics | None = None
     image_overlap_warnings: list[str] = Field(default_factory=list)
     fitted_font_size: float | None = None
     fit_status: FitStatus
     eligible: bool = False
+    resolution: ExportResolution = "blocked_other"
     warnings: list[str] = Field(default_factory=list)
     skip_reason: SkipReason | None = None
 
@@ -201,6 +215,7 @@ class PdfTableCellReplacement(PdfReplacement):
     source_match_status: Literal["matched", "mismatch", "not_checked"] = "not_checked"
     background_fill: str | None = None
     border_clearance: float = 0.0
+    technical_value: bool = False
 
 
 class PdfTableExportPlan(BaseModel):
@@ -256,7 +271,24 @@ class PdfExportSummary(BaseModel):
     image_overlap_skipped: int = 0
 
 
+class PdfExportResolutionSummary(BaseModel):
+    total_segments: int = 0
+    replacement_planned: int = 0
+    preserved_identical: int = 0
+    not_applicable: int = 0
+    blocked_overflow: int = 0
+    blocked_image_safety: int = 0
+    blocked_vector_safety: int = 0
+    blocked_overlap_conflict: int = 0
+    blocked_table_structure: int = 0
+    blocked_ocr_safety: int = 0
+    blocked_other: int = 0
+    blocked_total: int = 0
+    resolved_if_exported: int = 0
+
+
 class PdfExportPlan(BaseModel):
+    schema_version: Literal[2] = 2
     filename: str
     mode: ExportMode
     document_sha256: str
@@ -266,3 +298,24 @@ class PdfExportPlan(BaseModel):
     tables: list[PdfTableExportPlan] = Field(default_factory=list)
     ocr_summary: PdfOcrExportSummary = Field(default_factory=PdfOcrExportSummary)
     ocr_replacements: list[PdfOcrReplacement] = Field(default_factory=list)
+    resolution_summary: PdfExportResolutionSummary = Field(default_factory=PdfExportResolutionSummary)
+
+    @model_validator(mode="after")
+    def validate_resolution_summary(self) -> "PdfExportPlan":
+        items = [*self.replacements, *self.ocr_replacements]
+        counts = {name: 0 for name in ExportResolution.__args__}
+        for item in items:
+            counts[item.resolution] += 1
+            if item.eligible != (item.resolution == "replacement_planned"):
+                raise ValueError("Upravičenost zamenjave se ne ujema z rezultatom izvoza.")
+        blocked = sum(value for name, value in counts.items() if name.startswith("blocked_"))
+        expected = {
+            "total_segments": len(items),
+            **counts,
+            "blocked_total": blocked,
+            "resolved_if_exported": counts["replacement_planned"] + counts["preserved_identical"],
+        }
+        actual = self.resolution_summary.model_dump()
+        if actual != expected:
+            raise ValueError("Povzetek rezultatov PDF izvoza se ne ujema s posameznimi segmenti.")
+        return self

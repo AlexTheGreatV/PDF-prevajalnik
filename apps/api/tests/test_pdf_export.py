@@ -11,9 +11,23 @@ from PIL import Image
 
 from app.core.config import settings
 from app.main import app
-from app.pdf_export_models import PdfExportJob, PdfTextStyle
+from app.models import BBox
+from app.pdf_export_models import PdfExportJob, PdfExportSegment, PdfTextStyle
 from app.services.pdf_analyzer import analyze_pdf
-from app.services.pdf_exporter import PdfExportValidationError, _canonical_text, _text_matches, export_translated_pdf, plan_pdf_export
+from app.services.pdf_exporter import (
+    PdfExportValidationError,
+    _canonical_text,
+    _is_material_overlap,
+    _layout_rect,
+    _new_replacement,
+    _rendered_translation,
+    _strict_display_text,
+    _text_matches,
+    _write_replacements,
+    _written_text_matches,
+    export_translated_pdf,
+    plan_pdf_export,
+)
 from app.services.pdf_typography import PdfTypographyResolver
 
 SOURCE_TEXT = "Digital source text for a safe translated PDF preview."
@@ -25,6 +39,129 @@ def test_output_text_verification_tolerates_extracted_list_marker_semantics() ->
     assert _text_matches("- HPL", "HPL") is True
     assert _text_matches("• Varen prevod", "Varen prevod") is True
     assert _canonical_text("−40 °C") == "−40 °c"
+    assert _written_text_matches("- Varen prevod", "• Varen\nprevod") is True
+    assert _written_text_matches("Varen prevod", "varen prevod") is False
+    assert _written_text_matches("Varen prevod.", "Varen prevod") is False
+    assert _written_text_matches("2,5\u00a0MPa", "2,5 MPa") is True
+    assert _written_text_matches("fiksacijskega", "ﬁksacijskega") is True
+    assert _written_text_matches("CO₂", "CO2") is False
+
+
+def test_strict_display_identity_only_normalizes_outer_space_and_line_breaks() -> None:
+    assert _strict_display_text("  Same\r\ntext\u00a0") == _strict_display_text("Same text")
+    assert _strict_display_text("Same") != _strict_display_text("same")
+    assert _strict_display_text("1.59 MPa") != _strict_display_text("1,59\u00a0MPa")
+    assert _strict_display_text("-40 °C") != _strict_display_text("−40\u00a0°C")
+    assert _strict_display_text("20 L") != _strict_display_text("20\u00a0L")
+    assert _strict_display_text("one-component") != _strict_display_text("one component")
+    for literal in ("ACME-42", "https://example.test/a?b=1", "qa@example.test", "RAL 9001"):
+        assert _strict_display_text(literal) == literal
+    assert _strict_display_text("ACME-42") != _strict_display_text("acme-42")
+
+
+def test_overlap_tolerance_ignores_only_subpoint_boundary_noise() -> None:
+    assert _is_material_overlap(pymupdf.Rect(0, 0, 100, 0)) is False
+    assert _is_material_overlap(pymupdf.Rect(0, 0, 100, 0.024)) is False
+    assert _is_material_overlap(pymupdf.Rect(0, 0, 0.024, 0.024)) is False
+    assert _is_material_overlap(pymupdf.Rect(0, 0, 100, 0.1001)) is True
+    assert _is_material_overlap(pymupdf.Rect(1, 1, 9, 9)) is True
+
+
+def test_preserved_list_marker_is_not_inserted_twice(tmp_path: Path) -> None:
+    source = tmp_path / "list-marker.pdf"
+    _make_pdf(source)
+    segment = PdfExportSegment.model_validate(_job_payload(source)["segments"][0])
+    segment.block_type = "list_item"
+    segment.edited_translation = "- Prevedena alineja"
+    replacement = _new_replacement(segment)
+    replacement.list_marker_preserved = True
+    replacement.redaction_rects = [
+        BBox(x0=48, y0=36, x1=180, y1=52),
+    ]
+    assert _rendered_translation(replacement) == "Prevedena alineja"
+    assert _layout_rect(replacement).x0 == 48
+    assert _layout_rect(replacement).x0 > replacement.original_bbox.x0
+    replacement.translated_text = "1. Prevedena alineja"
+    assert _rendered_translation(replacement) == "1. Prevedena alineja"
+    replacement.translated_text = "Preveden odstavek brez alineje"
+    assert _rendered_translation(replacement) == "Preveden odstavek brez alineje"
+
+
+def test_subpoint_neighbor_contact_does_not_delete_untranslated_text(tmp_path: Path) -> None:
+    source = tmp_path / "adjacent-lines.pdf"
+    first_source = "First source line"
+    second_source = "Second source line"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=160)
+        page.insert_text((30, 50), first_source, fontsize=10)
+        page.insert_text((30, 63.5), second_source, fontsize=10)
+        document.save(source)
+    payload = _job_payload(source, first_source, "Prva prevedena vrstica")
+    with pymupdf.open(source) as document:
+        second_bbox = document[0].search_for(second_source)[0]
+    first_bbox = payload["segments"][0]["source_bbox"]
+    assert 0 < first_bbox["y1"] - second_bbox.y0 < 0.5
+    payload["segments"].append({
+        **payload["segments"][0],
+        "segment_id": "segment-2",
+        "block_id": "block-2",
+        "source_text": second_source,
+        "source_bbox": {
+            "x0": second_bbox.x0, "y0": second_bbox.y0,
+            "x1": second_bbox.x1, "y1": second_bbox.y1,
+        },
+        "edited_translation": "Druga vrstica ostane nepotrjena",
+        "status": "translated",
+    })
+
+    work = tmp_path / "work-adjacent"
+    work.mkdir()
+    job = PdfExportJob.model_validate(payload)
+    plan = plan_pdf_export(source, job, "replacement_preview", work)
+    output_path = work / "adjacent-lines-sl.pdf"
+    with pymupdf.open(source) as document:
+        applied = _write_replacements(document, plan, PdfTypographyResolver(work))
+        document.save(output_path)
+
+    assert applied == 1
+    with pymupdf.open(output_path) as output:
+        text = output[0].get_text()
+        assert "Prva prevedena vrstica" in text
+        assert second_source in text
+
+
+def test_resolution_summary_separates_preserved_non_units_and_blockers(tmp_path: Path) -> None:
+    source = tmp_path / "resolution-summary.pdf"
+    _make_pdf(source)
+    payload = _job_payload(source)
+    payload["segments"][0]["edited_translation"] = SOURCE_TEXT
+    payload["segments"].append({
+        **payload["segments"][0],
+        "segment_id": "not-applicable",
+        "status": "skipped",
+        "edited_translation": "",
+    })
+    plan = plan_pdf_export(
+        source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "resolution-summary")
+    )
+
+    assert plan.resolution_summary.total_segments == 2
+    assert plan.resolution_summary.preserved_identical == 1
+    assert plan.resolution_summary.not_applicable == 1
+    assert plan.resolution_summary.replacement_planned == 0
+    assert plan.resolution_summary.blocked_total == 0
+
+
+def test_export_plan_rejects_inconsistent_resolution_summary(tmp_path: Path) -> None:
+    source = tmp_path / "invalid-summary.pdf"
+    _make_pdf(source)
+    plan = plan_pdf_export(
+        source, PdfExportJob.model_validate(_job_payload(source)), "replacement_preview", _work(tmp_path, "invalid-summary")
+    )
+    payload = plan.model_dump()
+    payload["resolution_summary"]["replacement_planned"] += 1
+    with pytest.raises(ValueError, match="Povzetek rezultatov"):
+        type(plan).model_validate(payload)
 
 
 def test_replacement_preserves_original_file_images_vectors_background_and_unicode(tmp_path: Path) -> None:

@@ -71,7 +71,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [guidedReviewIndex, setGuidedReviewIndex] = useState(0);
-  const [exportState, setExportState] = useState<PdfExportUiState>({ plan: null, downloadCompleted: false });
+  const [exportState, setExportState] = useState<PdfExportUiState>({ plan: null, downloadCompleted: false, appliedReplacements: 0 });
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
   const local = useLocalTranslation(job, setJob);
   const glossary = useMemo(
@@ -160,7 +160,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
     const prepared = createPreparedJob();
     if (!prepared) return;
     local.cancel();
-    setExportState({ plan: null, downloadCompleted: false });
+    setExportState({ plan: null, downloadCompleted: false, appliedReplacements: 0 });
     setJob(prepared);
     setMessage(persistentGlossary.status === "explicitly_skipped"
       ? "Segmenti so pripravljeni brez trajnega glosarja. Prevod zahteva posebej pozoren pregled."
@@ -171,7 +171,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
     const prepared = createPreparedJob();
     if (!prepared) return;
     local.cancel();
-    setExportState({ plan: null, downloadCompleted: false });
+    setExportState({ plan: null, downloadCompleted: false, appliedReplacements: 0 });
     setJob(prepared);
     setMessage("Segmenti so pripravljeni iz preverjenih lokalnih virov.");
     if (local.status?.available) await local.translate(prepared);
