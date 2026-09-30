@@ -793,15 +793,22 @@ function applyExactSegmentGlossary(segment: TranslationSegment, glossary: Glossa
 export function validateTranslationTechnicalIntegrity(source: string, target: string): { valid: boolean; normalizedTarget: string } {
   const normalizedSource = source.replace(/−/g, "-");
   const normalizedInput = target.replace(/−/g, "-");
+  const validPercentageSpacing = !hasInvalidPercentageSpacing(normalizedSource) && !hasInvalidPercentageSpacing(normalizedInput);
   const sourceProtection = protectTechnicalTokens(normalizedSource);
   const targetProtection = protectTechnicalTokens(normalizedInput);
   const sourceValues = technicalSignatures(sourceProtection.tokens);
   const targetValues = technicalSignatures(targetProtection.tokens);
-  const valid = sourceValues.length === targetValues.length && sourceValues.every((value, index) => value === targetValues[index]);
+  const valid = validPercentageSpacing
+    && sourceValues.length === targetValues.length
+    && sourceValues.every((value, index) => value === targetValues[index]);
   return {
     valid,
     normalizedTarget: valid ? restoreTechnicalTokens(targetProtection.protected_text, targetProtection.tokens) : "",
   };
+}
+
+function hasInvalidPercentageSpacing(value: string): boolean {
+  return /[+-]?\d+(?:[.,]\d+)?(?:[ \u00a0]{2,}|[\t\r\n]+)%/u.test(value);
 }
 
 function applyExactTranslationMemory(segment: TranslationSegment, entries: TranslationMemoryEntry[], domain: string): TranslationSegment {
@@ -851,11 +858,14 @@ function technicalSignatures(tokens: ProtectedToken[]): string[] {
     }
     const start = range.unit_placement === "both" ? `${range.start_value} ${range.unit}` : range.start_value;
     return [start, `${range.end_value} ${range.unit}`].map(normalizeTechnicalSignature);
-  }).sort();
+  });
 }
 
 function normalizeTechnicalSignature(value: string): string {
-  return value.replace(/−/g, "-").replace(/\u00a0/g, " ").replace(/(?<=\d)\.(?=\d)/g, ",").replace(/\s+/g, " ").trim();
+  const normalized = value.replace(/−/g, "-").replace(/(?<=\d)\.(?=\d)/g, ",");
+  const percentage = normalized.match(/^([+-]?\d+(?:,\d+)?)(?: |\u00a0)?%$/u);
+  if (percentage) return `${percentage[1]}%`;
+  return normalized.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
 }
 
 export function exportTranslationJob(job: TranslationJob): string {

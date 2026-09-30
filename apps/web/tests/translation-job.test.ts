@@ -21,6 +21,7 @@ import {
   reviewTranslation,
   splitOversizedChunk,
   translateJobBatch,
+  validateTranslationTechnicalIntegrity,
   validateTranslationJobCompatibility,
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationProvider, TranslationProviderResult, TranslationRequest } from "../lib/translation-types";
@@ -335,6 +336,57 @@ test("rejects a technically invalid memory result and falls back to the provider
   assert.equal(segment.translation_memory_entry_id, null);
   assert.match(segment.warnings.join("\n"), new RegExp(`translation_memory_rejected:${entry.id}:rev:${entry.revision}:technical_integrity`));
   assert.equal(translated.translation_memory_usage.length, 0);
+});
+
+test("accepts only safe typographic percentage spacing in technical integrity checks", () => {
+  const accepted: Array<[string, string]> = [
+    ["72%", "72\u00a0%"],
+    ["100%", "100\u00a0%"],
+    ["76%", "76\u00a0%"],
+    ["72 %", "72%"],
+    ["72% 100% 76%", "72\u00a0% 100 % 76%"],
+    ["72% and 72%", "72\u00a0% in 72 %"],
+    ["72.5%", "72,5\u00a0%"],
+  ];
+  for (const [source, target] of accepted) {
+    const result = validateTranslationTechnicalIntegrity(source, target);
+    assert.equal(result.valid, true, `${source} -> ${target}`);
+  }
+  assert.equal(
+    validateTranslationTechnicalIntegrity("72% 100% 76%", "72\u00a0% 100\u00a0% 76\u00a0%").normalizedTarget,
+    "72\u00a0% 100\u00a0% 76\u00a0%",
+  );
+});
+
+test("rejects percentage changes and damage to other protected technical tokens", () => {
+  const rejected: Array<[string, string]> = [
+    ["72%", "73\u00a0%"],
+    ["-72%", "72\u00a0%"],
+    ["72%", "72"],
+    ["72%", "72 percent"],
+    ["72%", "72\u00a0°C"],
+    ["72%", "7 2%"],
+    ["72%", "72  %"],
+    ["72%", "72\t%"],
+    ["72.5%", "725\u00a0%"],
+    ["72% 100%", "72\u00a0%"],
+    ["72%", "72\u00a0% 72\u00a0%"],
+    ["72% and 72%", "72\u00a0%"],
+    ["72% 100%", "100\u00a0% 72\u00a0%"],
+    ["CO₂ 72%", "CO2 72\u00a0%"],
+    ["2.5 MPa 72%", "2,6\u00a0MPa 72\u00a0%"],
+    ["290 ml 20 L 72%", "291\u00a0ml 20\u00a0L 72\u00a0%"],
+    ["RAL 9001 72%", "RAL 9002 72\u00a0%"],
+    ["+25 °C 72%", "+26\u00a0°C 72\u00a0%"],
+    ["{{coverage}} 72%", "{{amount}} 72\u00a0%"],
+    ["https://example.test/72 72%", "https://example.test/73 72\u00a0%"],
+    ["quality72@example.test 72%", "quality73@example.test 72\u00a0%"],
+    ["batch-72 72%", "batch-73 72\u00a0%"],
+    ["ACME MS 72 Panel Bond 72%", "ACME MS 73 Panel Bond 72\u00a0%"],
+  ];
+  for (const [source, target] of rejected) {
+    assert.equal(validateTranslationTechnicalIntegrity(source, target).valid, false, `${source} -> ${target}`);
+  }
 });
 
 test("preserves mixed TM plus provider provenance for three deterministic sentence chunks", async () => {
