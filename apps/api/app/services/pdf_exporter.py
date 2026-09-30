@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canon
 from app.services.pdf_typography import FontAsset, PdfTypographyResolver
 from app.services.ocr_review_registry import ocr_review_registry
 
+LOGGER = logging.getLogger(__name__)
+
 DOCUMENT_MODEL_VERSION = 1
 MIN_FONT_SIZE = 6.0
 GEOMETRY_TOLERANCE = 0.5
@@ -47,6 +50,9 @@ INVISIBLE_STRUCTURAL_TEXT = frozenset(
 EXTRACTION_LIGATURES = str.maketrans({
     "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st",
 })
+MAX_HYPHEN_LINE_BREAK_VARIANTS = 1_024
+MAX_HYPHEN_LINE_BREAK_BOUNDARIES = 10
+HYPHEN_LINE_BREAK = re.compile(r"(?<=-)[ \t]*(?:\r\n|\r|\n)(?:[ \t]*(?:\r\n|\r|\n))*[ \t]*")
 
 
 class PdfExportValidationError(ValueError):
@@ -981,7 +987,35 @@ def _canonical_text(value: str) -> str:
 
 def _written_text_matches(expected: str, extracted: str) -> bool:
     """Verify written content exactly, allowing only layout whitespace and a preserved list marker."""
-    return _verification_text(expected) == _verification_text(extracted)
+    expected_text = _verification_text(expected)
+    return expected_text in _verification_text_candidates(extracted)
+
+
+def _verification_text_candidates(value: str) -> set[str]:
+    """Keep physical hyphen line breaks distinct until strict comparison."""
+    translated = value.translate(EXTRACTION_LIGATURES)
+    without_list_marker = re.sub(r"^\s*[-–—•▪◦*]+\s*", "", translated, count=1)
+    marker = "\u0000"
+    marked, boundary_count = HYPHEN_LINE_BREAK.subn(marker, without_list_marker)
+    standard = re.sub(r"[\s\u00a0]+", " ", marked).strip()
+    if boundary_count == 0:
+        return {standard}
+    if boundary_count > MAX_HYPHEN_LINE_BREAK_BOUNDARIES:
+        LOGGER.warning(
+            "PDF text verification rejected %s hyphen line-break boundaries; the safe limit is %s variants.",
+            boundary_count,
+            MAX_HYPHEN_LINE_BREAK_VARIANTS,
+        )
+        return set()
+    parts = standard.split(marker)
+    candidates = {parts[0]}
+    for part in parts[1:]:
+        candidates = {
+            candidate + separator + part
+            for candidate in candidates
+            for separator in ("", " ")
+        }
+    return candidates
 
 
 def _verification_text(value: str) -> str:

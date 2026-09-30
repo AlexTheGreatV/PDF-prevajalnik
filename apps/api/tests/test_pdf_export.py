@@ -47,6 +47,47 @@ def test_output_text_verification_tolerates_extracted_list_marker_semantics() ->
     assert _written_text_matches("CO₂", "CO2") is False
 
 
+def test_output_verification_accepts_only_exact_hyphen_line_break_interpretations() -> None:
+    assert _written_text_matches("UV-sevanju", "UV-\nsevanju") is True
+    assert _written_text_matches("eno- ali dvokomponentno", "eno-\nali dvokomponentno") is True
+    assert _written_text_matches("običajen prelom vrstice", "običajen\nprelom vrstice") is True
+    assert _written_text_matches("fiksacijskega", "ﬁksacijskega") is True
+
+    assert _written_text_matches("UV-sevanju", "UV- sevanju") is False
+    assert _written_text_matches("UV-sevanju", "UV-\nsevanjem") is False
+    assert _written_text_matches("UV sevanju", "UV-\nsevanju") is False
+    assert _written_text_matches("preskus oprijema in natezni preskus", "natezni preskus") is False
+    assert _written_text_matches("Prvi stavek. Drugi stavek.", "Prvi stavek.") is False
+    assert _written_text_matches("Prvi stavek. Drugi stavek.", "Prvi stavek. Drugi stavek. Drugi stavek.") is False
+    assert _written_text_matches("Prvi stavek. Drugi stavek.", "Drugi stavek. Prvi stavek.") is False
+    assert _written_text_matches("20 MPa", "21 MPa") is False
+    assert _written_text_matches("20 MPa", "20 kPa") is False
+    assert _written_text_matches("Zettex MS65 Panel Bond", "Zettex MS 65 Panel Bond") is False
+    assert _written_text_matches("one-component", "one component") is False
+
+
+def test_output_verification_handles_multiple_hyphen_boundaries_independently() -> None:
+    actual = "UV-\nsevanje ter eno-\nali dvokomponentno lepilo"
+    assert _written_text_matches("UV-sevanje ter eno- ali dvokomponentno lepilo", actual) is True
+    assert _written_text_matches("UV- sevanje ter eno-ali dvokomponentno lepilo", actual) is True
+    assert _written_text_matches("UV sevanje ter eno- ali dvokomponentno lepilo", actual) is False
+
+
+def test_output_verification_caps_hyphen_boundary_variants_safely() -> None:
+    actual_at_limit = " ".join(f"del{i}-\nnadaljevanje{i}" for i in range(10))
+    expected_at_limit = " ".join(f"del{i}-nadaljevanje{i}" for i in range(10))
+    mixed_spacing_at_limit = expected_at_limit.replace("del7-", "del7- ")
+    inconsistent_at_limit = expected_at_limit.replace("nadaljevanje7", "nadaljevanjeX")
+
+    assert _written_text_matches(expected_at_limit, actual_at_limit) is True
+    assert _written_text_matches(mixed_spacing_at_limit, actual_at_limit) is True
+    assert _written_text_matches(inconsistent_at_limit, actual_at_limit) is False
+
+    actual_over_limit = " ".join(f"del{i}-\nnadaljevanje{i}" for i in range(11))
+    expected_over_limit = " ".join(f"del{i}-nadaljevanje{i}" for i in range(11))
+    assert _written_text_matches(expected_over_limit, actual_over_limit) is False
+
+
 def test_strict_display_identity_only_normalizes_outer_space_and_line_breaks() -> None:
     assert _strict_display_text("  Same\r\ntext\u00a0") == _strict_display_text("Same text")
     assert _strict_display_text("Same") != _strict_display_text("same")
