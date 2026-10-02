@@ -1,7 +1,7 @@
 import type { PlaceholderStrategy, ProtectedToken } from "./translation-types";
 import { analyzeTechnicalRanges, TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
 
-const TOKEN_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\{\{[A-Za-z_][\w.-]*\}\}|\$\{[A-Za-z_][\w.-]*\}|\{[A-Za-z_][\w.-]*\}|%(?:s|d)|\[LINK\]|\bRAL\s+\d{3,5}\b|[+-]?\d+(?:[.,]\d+)?\s*(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%)(?=$|\s|[),.;:])|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|(?<!\p{L})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){2,}(?!\p{L})|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|[+-]?\d+(?:[.,]\d+)?/gu;
+const TOKEN_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\{\{[A-Za-z_][\w.-]*\}\}|\$\{[A-Za-z_][\w.-]*\}|\{[A-Za-z_][\w.-]*\}|%(?:s|d)|\[LINK\]|\bRAL\s+\d{3,5}\b|(?<![\p{L}\p{N}])[+-]\s*\/\s*[A-Z]\s+\d+(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\+\d(?:[\d -]{5,}\d)(?![\p{L}\p{N}])|[+-]?\d+(?:[.,]\d+)?\s*(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%)(?=$|\s|[),.;:])|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|(?<!\p{L})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){2,}(?!\p{L})|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|[+-]?\d+(?:[.,]\d+)?/gu;
 export function protectTechnicalTokens(text: string, strategy: PlaceholderStrategy = "primary_tk"): { protected_text: string; tokens: ProtectedToken[]; warnings: string[] } {
   const tokens: ProtectedToken[] = [];
   const analysis = analyzeTechnicalRanges(text);
@@ -151,8 +151,8 @@ function tokenKind(value: string, offset: number, source: string): ProtectedToke
     const before = source[offset - 1] ?? "";
     const after = source[offset + value.length] ?? "";
     const prefix = source.slice(Math.max(0, offset - 24), offset);
-    const beforeUnsafe = /[\p{L}\p{N}_\/-]/u.test(before) || (before === "." && /\d/.test(source[offset - 2] ?? ""));
-    const afterUnsafe = /[\p{L}\p{N}_\/-]/u.test(after) || (after === "." && /\d/.test(source[offset + value.length + 1] ?? ""));
+    const beforeUnsafe = /[\p{L}\p{N}_\/-]/u.test(before) || (before === "." && /[\p{L}\p{N}]/u.test(source[offset - 2] ?? ""));
+    const afterUnsafe = /[\p{L}\p{N}_\/-]/u.test(after) || (after === "." && /[\p{L}\p{N}]/u.test(source[offset + value.length + 1] ?? ""));
     const labeledMachineValue = /\b(?:version|ver|code|id|identifier|serial|s\/n|sn|ISO|EN|DIN)\s*$/i.test(prefix);
     return beforeUnsafe || afterUnsafe || labeledMachineValue ? "product_code" : "number";
   }

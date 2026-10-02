@@ -696,7 +696,7 @@ function placeholderAttempt(strategy: PlaceholderStrategy, provider_text: string
 
 export function createTranslationChunks(segment: TranslationSegment): TranslationChunk[] {
   const parts = ["paragraph", "list_item"].includes(segment.block_type)
-    ? sentenceRanges(segment.source_text)
+    ? structuralRanges(segment.source_text) ?? sentenceRanges(segment.source_text)
     : [{ source_text: segment.source_text, source_start: 0, source_end: segment.source_text.length, separator_after: "" }];
   return parts.map((part, index) => ({
     chunk_id: `${segment.segment_id}-c${index + 1}`,
@@ -714,6 +714,47 @@ export function createTranslationChunks(segment: TranslationSegment): Translatio
     translation_memory_match: null,
     translation_memory_domain: null,
   }));
+}
+
+function structuralRanges(text: string): Array<Pick<TranslationChunk, "source_text" | "source_start" | "source_end" | "separator_after">> | null {
+  const pipeRanges = delimiterRanges(text, /\s*\|\s*/g, false);
+  if (pipeRanges && pipeRanges.length >= 2) return pipeRanges;
+
+  const candidates = [...text.matchAll(/(?:^|\s)(\S)(?=\s+\p{Lu})/gu)]
+    .filter((match) => /[^\x00-\x7F]|[^\p{L}\p{N}]/u.test(match[1]));
+  const counts = new Map<string, number>();
+  for (const match of candidates) counts.set(match[1], (counts.get(match[1]) ?? 0) + 1);
+  const marker = [...counts.entries()].filter(([, count]) => count >= 3).sort((left, right) => right[1] - left[1])[0]?.[0];
+  if (!marker) return null;
+  const starts = candidates.filter((match) => match[1] === marker).map((match) => match.index! + (match[0].length - marker.length));
+  return rangesFromStarts(text, starts);
+}
+
+function delimiterRanges(
+  text: string,
+  delimiter: RegExp,
+  includeDelimiter: boolean,
+): Array<Pick<TranslationChunk, "source_text" | "source_start" | "source_end" | "separator_after">> | null {
+  const matches = [...text.matchAll(delimiter)];
+  if (!matches.length) return null;
+  const ranges: Array<Pick<TranslationChunk, "source_text" | "source_start" | "source_end" | "separator_after">> = [];
+  let start = 0;
+  for (const match of matches) {
+    const end = includeDelimiter ? match.index! + match[0].length : match.index!;
+    if (text.slice(start, end).trim()) ranges.push({ source_text: text.slice(start, end).trimEnd(), source_start: start, source_end: end, separator_after: match[0] });
+    start = match.index! + match[0].length;
+  }
+  if (text.slice(start).trim()) ranges.push({ source_text: text.slice(start), source_start: start, source_end: text.length, separator_after: "" });
+  return ranges;
+}
+
+function rangesFromStarts(text: string, starts: number[]): Array<Pick<TranslationChunk, "source_text" | "source_start" | "source_end" | "separator_after">> {
+  return starts.map((start, index) => {
+    const next = starts[index + 1] ?? text.length;
+    let end = next;
+    while (end > start && /\s/.test(text[end - 1])) end -= 1;
+    return { source_text: text.slice(start, end), source_start: start, source_end: end, separator_after: text.slice(end, next) };
+  });
 }
 
 function sentenceRanges(text: string): Array<Pick<TranslationChunk, "source_text" | "source_start" | "source_end" | "separator_after">> {
@@ -1271,6 +1312,8 @@ function isGlossaryUsage(value: unknown): boolean {
     (value.revision === null || (Number.isInteger(value.revision) && Number(value.revision) >= 1)) &&
     ["exact_segment", "do_not_translate", "preferred", "locked_inline"].includes(String(value.mode)) &&
     ["applied", "warned"].includes(String(value.outcome)) && typeof value.conflict === "boolean" &&
+    (value.start_offset === undefined || (Number.isInteger(value.start_offset) && Number(value.start_offset) >= 0)) &&
+    (value.end_offset === undefined || (Number.isInteger(value.end_offset) && Number(value.end_offset) >= 0)) &&
     ["document", "approved_user", "built_in"].includes(String(value.precedence));
 }
 
@@ -1359,7 +1402,7 @@ function finalizeTranslationJob(job: TranslationJob): TranslationJob {
 }
 
 function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usage"] {
-  return job.segments.flatMap((segment) => segment.glossary_matches.map((match) => {
+  const usage = job.segments.flatMap((segment) => segment.glossary_matches.map((match) => {
     const sameSource = job.glossary.filter((candidate) => candidate.enabled && candidate.source_term.toLocaleLowerCase() === match.source_term.toLocaleLowerCase());
     const warned = segment.warnings.includes(`preferred_glossary_term_missing:${match.glossary_id}`) ||
       segment.warnings.includes("glossary_technical_integrity") ||
@@ -1375,8 +1418,14 @@ function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usa
       domain: match.domain,
       external_source: match.external_source,
       external_record_id: match.external_record_id,
+      start_offset: match.start_offset,
+      end_offset: match.end_offset,
     };
   }));
+  return [...new Map(usage.map((item) => [
+    [item.glossary_id, item.revision, item.segment_id, item.mode, item.start_offset, item.end_offset].join(":"),
+    item,
+  ])).values()];
 }
 
 function containsTerm(text: string, term: string): boolean {

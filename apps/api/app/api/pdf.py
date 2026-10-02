@@ -1,16 +1,19 @@
 import shutil
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from typing import cast
 from urllib.parse import quote
 
 import pymupdf
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import ValidationError
+from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import settings
 from app.models import OcrResponse, PdfAnalysis, RenderResult
@@ -27,7 +30,6 @@ from app.services.ocr_review_registry import OCR_REVIEW_TTL_SECONDS, document_sh
 router = APIRouter()
 PDF_MAGIC = b"%PDF-"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
-MAX_TRANSLATION_JOB_BYTES = 5 * 1024 * 1024
 
 
 @router.post("/ocr-review/register", response_model=OcrReviewRegistrationResult)
@@ -130,39 +132,37 @@ async def ocr(file: UploadFile = File(...), language: str = Form("eng"), dpi: in
 
 @router.post("/export-translated/plan", response_model=PdfExportPlan)
 async def plan_translated_export(
-    file: UploadFile = File(...),
-    translation_job: str = Form(...),
-    mode: ExportMode = Form(...),
+    request: Request,
 ) -> PdfExportPlan:
-    job = _parse_export_job(translation_job)
-    with _processing_tempdir() as temp_dir:
-        temp_path = Path(temp_dir)
-        path = await _save_upload(file, temp_path)
-        try:
-            return plan_pdf_export(path, job, mode, temp_path)
-        except PdfExportValidationError as exc:
-            raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="Načrta izvoza PDF ni bilo mogoče pripraviti.") from exc
+    async with _export_form(request) as (file, translation_job, mode):
+        job = _parse_export_job(translation_job)
+        with _processing_tempdir() as temp_dir:
+            temp_path = Path(temp_dir)
+            path = await _save_upload(file, temp_path)
+            try:
+                return plan_pdf_export(path, job, mode, temp_path)
+            except PdfExportValidationError as exc:
+                raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="Načrta izvoza PDF ni bilo mogoče pripraviti.") from exc
 
 
 @router.post("/export-translated")
 async def translated_export(
-    file: UploadFile = File(...),
-    translation_job: str = Form(...),
-    mode: ExportMode = Form(...),
+    request: Request,
 ) -> Response:
-    job = _parse_export_job(translation_job)
-    with _processing_tempdir() as temp_dir:
-        temp_path = Path(temp_dir)
-        path = await _save_upload(file, temp_path)
-        try:
-            artifact = export_translated_pdf(path, job, mode, temp_path)
-            content = artifact.path.read_bytes()
-        except PdfExportValidationError as exc:
-            raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="Izvoza PDF ni bilo mogoče izdelati.") from exc
+    async with _export_form(request) as (file, translation_job, mode):
+        job = _parse_export_job(translation_job)
+        with _processing_tempdir() as temp_dir:
+            temp_path = Path(temp_dir)
+            path = await _save_upload(file, temp_path)
+            try:
+                artifact = export_translated_pdf(path, job, mode, temp_path)
+                content = artifact.path.read_bytes()
+            except PdfExportValidationError as exc:
+                raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="Izvoza PDF ni bilo mogoče izdelati.") from exc
     encoded_name = quote(artifact.plan.filename)
     return Response(
         content=content,
@@ -176,12 +176,40 @@ async def translated_export(
 
 
 def _parse_export_job(value: str) -> PdfExportJob:
-    if len(value.encode("utf-8")) > MAX_TRANSLATION_JOB_BYTES:
+    if len(value.encode("utf-8")) > settings.max_translation_job_bytes:
         raise HTTPException(status_code=413, detail="Prevajalsko opravilo je preveliko.")
     try:
         return PdfExportJob.model_validate_json(value)
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail="Prevajalsko opravilo ni veljavno za izvoz PDF.") from exc
+
+
+@asynccontextmanager
+async def _export_form(request: Request) -> AsyncIterator[tuple[StarletteUploadFile, str, ExportMode]]:
+    try:
+        form = await request.form(
+            max_files=1,
+            max_fields=2,
+            max_part_size=settings.max_translation_job_bytes,
+        )
+    except StarletteHTTPException as exc:
+        if exc.status_code == 400 and "exceeded maximum size" in str(exc.detail):
+            raise HTTPException(status_code=413, detail="Prevajalsko opravilo je preveliko.") from exc
+        raise HTTPException(status_code=400, detail="Multipart zahtevek za PDF izvoz ni veljaven.") from exc
+
+    try:
+        file = form.get("file")
+        translation_job = form.get("translation_job")
+        mode = form.get("mode")
+        if not isinstance(file, StarletteUploadFile):
+            raise HTTPException(status_code=422, detail="PDF datoteka manjka.")
+        if not isinstance(translation_job, str):
+            raise HTTPException(status_code=422, detail="Prevajalsko opravilo manjka.")
+        if mode not in {"diagnostic", "replacement_preview"}:
+            raise HTTPException(status_code=422, detail="Način PDF izvoza ni veljaven.")
+        yield file, translation_job, cast(ExportMode, mode)
+    finally:
+        await cast(FormData, form).close()
 
 
 async def _save_upload(file: UploadFile, upload_dir: Path) -> Path:

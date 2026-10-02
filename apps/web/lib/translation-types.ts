@@ -73,6 +73,8 @@ export type GlossaryMatch = {
   domain?: string;
   external_source?: string | null;
   external_record_id?: string | null;
+  start_offset?: number;
+  end_offset?: number;
 };
 
 export type GlossaryUsageRecord = {
@@ -84,6 +86,8 @@ export type GlossaryUsageRecord = {
   conflict: boolean;
   precedence: "document" | "approved_user" | "built_in";
   domain?: string;
+  start_offset?: number;
+  end_offset?: number;
   external_source?: string | null;
   external_record_id?: string | null;
 };

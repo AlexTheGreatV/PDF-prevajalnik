@@ -31,18 +31,25 @@ export function findGlossaryMatches(text: string, glossary: GlossaryEntry[]): Gl
   for (const entry of orderedGlossary(glossary)) {
     if (!entry.enabled || !entry.source_term.trim()) continue;
     if (entry.mode === "exact_segment") {
-      if (equals(text.trim(), entry.source_term.trim(), entry.case_sensitive)) matches.push(toMatch(entry, text.trim()));
+      const trimmed = text.trim();
+      if (equals(trimmed, entry.source_term.trim(), entry.case_sensitive)) {
+        const start = text.indexOf(trimmed);
+        matches.push(toMatch(entry, trimmed, start, start + trimmed.length));
+      }
       continue;
     }
     const flags = entry.case_sensitive ? "gu" : "giu";
     const escaped = escapeRegExp(entry.source_term.trim());
     const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, flags);
-    for (const match of text.matchAll(pattern)) matches.push(toMatch(entry, match[0]));
+    for (const match of text.matchAll(pattern)) {
+      const start = match.index!;
+      matches.push(toMatch(entry, match[0], start, start + match[0].length));
+    }
   }
   return matches;
 }
 
-function toMatch(entry: GlossaryEntry, matched_text: string): GlossaryMatch {
+function toMatch(entry: GlossaryEntry, matched_text: string, start_offset: number, end_offset: number): GlossaryMatch {
   return {
     glossary_id: entry.id,
     source_term: entry.source_term,
@@ -55,6 +62,8 @@ function toMatch(entry: GlossaryEntry, matched_text: string): GlossaryMatch {
     domain: entry.domain,
     external_source: entry.external_source,
     external_record_id: entry.external_record_id,
+    start_offset,
+    end_offset,
   };
 }
 

@@ -43,6 +43,7 @@ BODY_MIN_SCALE = 0.75
 TABLE_MIN_FONT_SIZE = 5.5
 TABLE_BODY_MIN_SCALE = 0.75
 TABLE_TITLE_MIN_SCALE = 0.85
+SCALE_NUMERIC_TOLERANCE = 1e-9
 INVISIBLE_STRUCTURAL_TEXT = frozenset(
     "\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b\u200c\u200d\u200e\u200f"
     "\u2060\u2061\u2062\u2063\u2064\u2066\u2067\u2068\u2069\u3164\ufeff\uffa0"
@@ -722,7 +723,7 @@ def _fit_table_cell(
 def _accept_fit(replacement: PdfReplacement, rect: pymupdf.Rect, result: tuple[float, float, int], strategy: FitStrategy) -> None:
     _, scale, line_count = result
     replacement.fitted_bbox = _bbox(rect)
-    replacement.scale = round(scale, 4)
+    replacement.scale = scale
     replacement.fitted_font_size = round(replacement.requested_font_size * scale, 2)
     replacement.fitted_line_count = line_count
     replacement.fit_strategy = strategy
@@ -879,12 +880,29 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
             asset = _asset_for(item, typography)
             html_text, css = typography.html_and_css(_rendered_translation(item), item.typography, asset)
             spare, scale = page.insert_htmlbox(
-                _rect(item.fitted_bbox), html_text, css=css, scale_low=max(0.0, (item.scale or 1.0) - 0.000001), archive=typography.archive, overlay=True
+                # PyMuPDF compares scale_low without tolerance and can return one ULP below
+                # the same input. Validate its computed scale ourselves before saving.
+                _rect(item.fitted_bbox), html_text, css=css, scale_low=0.0, archive=typography.archive, overlay=True
             )
-            if spare < 0 or scale + 0.0001 < (item.scale or 1.0):
-                raise PdfExportValidationError("insert_failed", f"Prevod segmenta {item.segment_id} se pri končnem zapisu ni prilegal.")
+            writer_floor = _accepted_writer_scale_floor(item)
+            if spare < 0 or not _scale_meets_floor(scale, writer_floor):
+                raise PdfExportValidationError(
+                    "insert_failed",
+                    f"Prevod segmenta {item.segment_id} se pri končnem zapisu ni prilegal "
+                    f"(writer={scale:.12g}, floor={writer_floor:.12g}, preflight={item.scale or 1.0:.12g}).",
+                )
             applied += 1
     return applied
+
+
+def _scale_meets_floor(actual_scale: float, accepted_scale: float) -> bool:
+    return actual_scale + SCALE_NUMERIC_TOLERANCE >= accepted_scale
+
+
+def _accepted_writer_scale_floor(replacement: PdfReplacement) -> float:
+    if replacement.fit_strategy in {"exact", "expanded_bbox"}:
+        return 1.0
+    return _minimum_text_scale(replacement)
 
 
 def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
@@ -896,11 +914,20 @@ def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
             verification_boxes = [item.source_bbox]
             if item.fitted_bbox is not None and not _same_bbox(item.fitted_bbox, item.source_bbox):
                 verification_boxes.append(item.fitted_bbox)
-            if not any(
-                    _written_text_matches(_rendered_translation(item), page.get_text("text", clip=_rect(bbox), sort=True))
-                for bbox in verification_boxes
-            ):
+            extracted_regions = [page.get_text("text", clip=_rect(bbox), sort=True) for bbox in verification_boxes]
+            if item.fitted_bbox is not None:
+                extracted_regions.extend(_text_blocks_in_rect(page, _rect(item.fitted_bbox)))
+            if not any(_written_text_matches(_rendered_translation(item), text) for text in extracted_regions):
                 raise PdfExportValidationError("output_verification_failed", f"Vstavljenega prevoda segmenta {item.segment_id} ni bilo mogoče preveriti.")
+
+
+def _text_blocks_in_rect(page: pymupdf.Page, rect: pymupdf.Rect) -> list[str]:
+    """Return complete text blocks that overlap an already-approved layout rectangle."""
+    return [
+        block[4]
+        for block in page.get_text("blocks", clip=rect, sort=True)
+        if len(block) > 6 and block[6] == 0 and block[4].strip()
+    ]
 
 
 def _rect(bbox) -> pymupdf.Rect:

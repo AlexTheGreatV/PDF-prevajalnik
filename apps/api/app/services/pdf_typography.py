@@ -99,10 +99,12 @@ class PdfTypographyResolver:
     def html_and_css(self, text: str, style: PdfTextStyle, asset: FontAsset) -> tuple[str, str]:
         weight = 700 if asset.bold else 400
         font_style = "italic" if asset.italic else "normal"
-        escaped = html.escape(text).replace("\n", "<br>")
+        css_family = f"{FAMILY_NAME}-{asset.code}"
+        escaped = _escape_without_font_ligatures(text)
         css = (
-            f"@font-face {{font-family:'{FAMILY_NAME}';src:url('{asset.path.name}');font-weight:{weight};font-style:{font_style};}}"
-            f"* {{font-family:'{FAMILY_NAME}';font-size:{style.font_size:.4f}pt;font-weight:{weight};font-style:{font_style};"
+            f"@font-face {{font-family:'{css_family}';src:url('{asset.path.name}');font-weight:{weight};font-style:{font_style};}}"
+            f"* {{font-family:'{css_family}';font-size:{style.font_size:.4f}pt;font-weight:{weight};font-style:{font_style};"
+            f"font-variant-ligatures:none;font-feature-settings:'liga' 0,'clig' 0;"
             f"color:{style.color};line-height:{style.line_height:.4f};text-align:{style.alignment};margin:0;padding:0;}}"
         )
         return f"<p>{escaped}</p>", css
@@ -181,3 +183,12 @@ def _integer_color(value: int | str | None) -> int:
 
 def _color_hex(value: int) -> str:
     return f"#{value & 0xFFFFFF:06x}"
+
+
+def _escape_without_font_ligatures(text: str) -> str:
+    # MuPDF's HTML shaper can emit incorrect ToUnicode mappings for FiraGO
+    # ligatures. A span boundary around f/F prevents shaping without adding text.
+    return "".join(
+        "<br>" if character == "\n" else f"<span>{html.escape(character)}</span>" if character in "fF" else html.escape(character)
+        for character in text
+    )

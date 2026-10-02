@@ -100,6 +100,57 @@ def test_segmenter_detects_basic_table(tmp_path: Path) -> None:
     assert any("4 MPa" in cell for row in (table_blocks[0].table_cells or []) for cell in row)
 
 
+def test_segmenter_detects_aligned_gridless_cells_without_joining_adjacent_codes(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "gridless-colors.pdf"
+    document = fitz.open()
+    page = document.new_page(width=400, height=300)
+    rows = [
+        ("Black", "20"),
+        ("RAL 9021", "22"),
+        ("", "24"),
+        ("Beige", "26"),
+        ("Grey", "28"),
+    ]
+    for index, (name, code) in enumerate(rows):
+        y = 90 + index * 20
+        page.draw_rect(fitz.Rect(45, y - 9, 55, y + 1), fill=(0.3, 0.3, 0.3), color=None)
+        if name:
+            page.insert_text((70, y), name, fontsize=9)
+        page.insert_text((220, y), code, fontsize=7)
+    page.insert_text((70, 210), "Following paragraph", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    result = segment_pdf(pdf_path)
+    table = next(block for block in _blocks(result.pages[0]) if block.kind == "table")
+    cells = table.table_cells or []
+
+    assert ["Black", "20"] in cells
+    assert ["RAL 9021", "22"] in cells
+    assert ["", "24"] in cells
+    assert ["Beige", "26"] in cells
+    assert ["Grey", "28"] in cells
+    assert all("Black 20" not in cell and "RAL 9021 22" not in cell for row in cells for cell in row)
+    following = next(block for block in _blocks(result.pages[0]) if block.original_text == "Following paragraph")
+    assert following.reading_order == 4
+
+
+def test_segmenter_does_not_treat_four_parallel_text_rows_as_a_gridless_table(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "two-column-copy.pdf"
+    document = fitz.open()
+    page = document.new_page(width=500, height=300)
+    for index in range(4):
+        y = 80 + index * 20
+        page.insert_text((45, y), f"Left paragraph {index + 1}", fontsize=9)
+        page.insert_text((280, y), f"Right paragraph {index + 1}", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    result = segment_pdf(pdf_path)
+
+    assert all(block.kind != "table" for block in _blocks(result.pages[0]))
+
+
 def test_image_relevance_separates_text_candidates_decorations_and_export_safety(tmp_path: Path) -> None:
     image_path = tmp_path / "image.png"
     from PIL import Image

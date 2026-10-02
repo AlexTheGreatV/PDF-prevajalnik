@@ -45,6 +45,59 @@ def test_cors_exposes_pdf_export_attestation_headers() -> None:
     assert {"content-disposition", "x-pdf-export-mode", "x-pdf-replacements-applied"} <= exposed
 
 
+def test_export_request_body_limit_counts_stream_when_content_length_is_missing_or_too_small(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "max_upload_bytes", 8)
+    monkeypatch.setattr(settings, "max_translation_job_bytes", 8)
+    monkeypatch.setattr(settings, "pdf_export_multipart_overhead_bytes", 0)
+    body = b"x" * 17
+
+    missing = client.post(
+        "/api/pdf/export-translated/plan",
+        content=iter([body]),
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert missing.status_code == 413
+
+    understated = client.post(
+        "/api/pdf/export-translated/plan",
+        content=body,
+        headers={"content-type": "application/octet-stream", "content-length": "1"},
+    )
+    assert understated.status_code == 413
+
+
+def test_upload_limits_are_path_specific_and_reject_invalid_content_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "max_upload_bytes", 8)
+    monkeypatch.setattr(settings, "max_translation_job_bytes", 8)
+    monkeypatch.setattr(settings, "pdf_export_multipart_overhead_bytes", 4)
+
+    invalid = client.post(
+        "/api/pdf/export-translated/plan",
+        content=b"x",
+        headers={"content-length": "invalid", "content-type": "application/octet-stream"},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "Content-Length ni veljaven."
+
+    export_at_general_limit = client.post(
+        "/api/pdf/export-translated/plan",
+        content=b"x" * 9,
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert export_at_general_limit.status_code != 413
+
+    regular_upload = client.post(
+        "/api/pdf/analyze",
+        content=b"x" * 9,
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert regular_upload.status_code == 413
+
+
 def test_analyzes_digital_pdf(tmp_path: Path) -> None:
     pdf_path = tmp_path / "digital.pdf"
     _make_digital_pdf(pdf_path)

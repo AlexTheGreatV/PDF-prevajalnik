@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     storage_dir: Path = Path("apps/api/storage")
     processing_tmp_dir: Path = Path(tempfile.gettempdir()) / "jub-koop-pdf-pipeline"
     max_upload_bytes: int = 50 * 1024 * 1024
+    max_translation_job_bytes: int = 5 * 1024 * 1024
+    pdf_export_multipart_overhead_bytes: int = 64 * 1024
     poppler_pdftoppm: str = "pdftoppm"
     local_translation_profile: Literal["hplt-en-sl-v2", "opus-en-sla"] = "hplt-en-sl-v2"
     local_translation_model_path: Path = Path("local-models/hplt-en-sl-v2-ct2-int8")
@@ -28,6 +30,10 @@ class Settings(BaseSettings):
     local_translation_compute_type: str = "int8"
     glossary_database_path: Path = Path("local-data/glossary.sqlite3")
     translation_memory_database_path: Path = Path("local-data/translation-memory.sqlite3")
+
+    @property
+    def max_pdf_export_request_bytes(self) -> int:
+        return self.max_upload_bytes + self.max_translation_job_bytes + self.pdf_export_multipart_overhead_bytes
 
     @field_validator("glossary_database_path", "translation_memory_database_path", mode="after")
     @classmethod

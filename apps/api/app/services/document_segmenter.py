@@ -67,6 +67,11 @@ class RawLine:
 class RawTable:
     bbox: BBox
     cells: list[list[str]]
+    order_span: int = 1
+    derived_from_aligned_rows: bool = False
+
+
+MIN_GRIDLESS_TABLE_ROWS = 5
 
 
 @dataclass
@@ -91,8 +96,10 @@ def segment_pdf(path: Path) -> DocumentModel:
         for page_index, page in enumerate(document):
             page_number = page_index + 1
             rect = page.rect
-            lines = _prepare_lines(_extract_lines(page, page_number))
+            extracted_lines = _extract_lines(page, page_number)
             tables = _extract_tables(page)
+            tables.extend(_extract_gridless_tables(extracted_lines, tables, float(rect.height)))
+            lines = _prepare_lines(extracted_lines)
             images = _extract_images(page)
             text_chars = sum(len(line.original_text.strip()) for line in lines)
             page_kind = _classify_page(text_chars=text_chars, image_count=len(images))
@@ -284,6 +291,129 @@ def _extract_tables(page: fitz.Page) -> list[RawTable]:
     return extracted
 
 
+def _extract_gridless_tables(lines: list[RawLine], existing: list[RawTable], page_height: float) -> list[RawTable]:
+    """Detect repeated aligned rows without relying on table ruling lines."""
+    if len(lines) < 6:
+        return []
+    rows = _cluster_visual_rows(lines)
+    anchors = _repeated_column_anchors(rows)
+    if len(anchors) < 2:
+        return []
+    candidate_rows = [
+        row for row in rows
+        if len(_row_anchor_indexes(row, anchors)) >= 2
+        and min(line.y0 for line in row) < page_height * 0.9
+    ]
+    groups = _contiguous_row_groups(candidate_rows)
+    tables: list[RawTable] = []
+    for group in groups:
+        first_center = median([(line.y0 + line.y1) / 2 for line in group[0]])
+        last_center = median([(line.y0 + line.y1) / 2 for line in group[-1]])
+        group = [
+            row for row in rows
+            if first_center <= median([(line.y0 + line.y1) / 2 for line in row]) <= last_center
+            and min(line.y0 for line in row) < page_height * 0.9
+        ]
+        if len(group) < MIN_GRIDLESS_TABLE_ROWS:
+            continue
+        group_anchors = [anchor for anchor in anchors if sum(
+            any(abs(line.x0 - anchor) <= 5.0 for line in row) for row in group
+        ) >= 2]
+        if len(group_anchors) < 2:
+            continue
+        if sum(len(_row_anchor_indexes(row, group_anchors)) >= 2 for row in group) < 3:
+            continue
+        bbox = _union_bbox([line.bbox for row in group for line in row])
+        if any(_bbox_overlap_ratio(bbox, table.bbox) > 0.5 for table in existing):
+            continue
+        body_sizes = [
+            _dominant_font_size(line) for row in group for line in row
+            if len(line.original_text.strip()) > 1
+        ]
+        body_size = median(body_sizes) if body_sizes else 0.0
+        cells: list[list[str]] = []
+        for row in group:
+            row_cells: list[list[str]] = [[] for _ in group_anchors]
+            for line in sorted(row, key=lambda item: item.x0):
+                column = min(range(len(group_anchors)), key=lambda index: abs(line.x0 - group_anchors[index]))
+                text = line.original_text.strip()
+                if len(text) <= 2 and body_size and _dominant_font_size(line) > body_size * 1.8:
+                    text = ""
+                if text:
+                    row_cells[column].append(text)
+            cells.append([_normalize_spaces(" ".join(parts)) for parts in row_cells])
+        if len(group_anchors) == 2 and any(not any(row[index] for row in cells) for index in range(2)):
+            continue
+        populated_columns = [index for index in range(len(group_anchors)) if any(row[index] for row in cells)]
+        if len(populated_columns) >= 2 and len(populated_columns) < len(group_anchors):
+            cells = [[row[index] for index in populated_columns] for row in cells]
+        occupancy = sum(bool(cell) for row in cells for cell in row) / max(1, len(cells) * len(cells[0]))
+        if occupancy < 2 / 3:
+            continue
+        tables.append(RawTable(bbox=bbox, cells=cells, derived_from_aligned_rows=True))
+    return tables
+
+
+def _cluster_visual_rows(lines: list[RawLine]) -> list[list[RawLine]]:
+    rows: list[list[RawLine]] = []
+    centers: list[float] = []
+    for line in sorted(lines, key=lambda item: ((item.y0 + item.y1) / 2, item.x0)):
+        center = (line.y0 + line.y1) / 2
+        candidates = [(abs(center - row_center), index) for index, row_center in enumerate(centers)]
+        distance, index = min(candidates, default=(float("inf"), -1))
+        if distance <= 4.0:
+            rows[index].append(line)
+            centers[index] = median([(item.y0 + item.y1) / 2 for item in rows[index]])
+        else:
+            rows.append([line])
+            centers.append(center)
+    return [row for _, row in sorted(zip(centers, rows), key=lambda item: item[0])]
+
+
+def _repeated_column_anchors(rows: list[list[RawLine]]) -> list[float]:
+    clusters: list[list[float]] = []
+    for value in sorted(line.x0 for row in rows for line in row):
+        cluster = next((item for item in clusters if abs(median(item) - value) <= 5.0), None)
+        if cluster is None:
+            clusters.append([value])
+        else:
+            cluster.append(value)
+    return [median(cluster) for cluster in clusters if len(cluster) >= 3]
+
+
+def _row_anchor_indexes(row: list[RawLine], anchors: list[float]) -> set[int]:
+    return {
+        min(range(len(anchors)), key=lambda index: abs(line.x0 - anchors[index]))
+        for line in row
+        if min(abs(line.x0 - anchor) for anchor in anchors) <= 5.0
+    }
+
+
+def _contiguous_row_groups(rows: list[list[RawLine]]) -> list[list[list[RawLine]]]:
+    groups: list[list[list[RawLine]]] = []
+    for row in rows:
+        center = median([(line.y0 + line.y1) / 2 for line in row])
+        if not groups:
+            groups.append([row])
+            continue
+        previous = groups[-1][-1]
+        previous_center = median([(line.y0 + line.y1) / 2 for line in previous])
+        # One visually empty cell can leave only the opposite column as text.
+        # Allow one normal table-row gap between proven multi-column rows.
+        if center - previous_center <= 40.0:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    return groups
+
+
+def _bbox_overlap_ratio(left: BBox, right: BBox) -> float:
+    width = max(0.0, min(left.x1, right.x1) - max(left.x0, right.x0))
+    height = max(0.0, min(left.y1, right.y1) - max(left.y0, right.y0))
+    area = max(1.0, (left.x1 - left.x0) * (left.y1 - left.y0))
+    return width * height / area
+
+
 def _extract_images(page: fitz.Page) -> list[DocumentImage]:
     images: list[DocumentImage] = []
     seen_xrefs: set[int] = set()
@@ -345,6 +475,7 @@ def _build_page(
 ) -> DocumentPage:
     height = float(rect.height)
     body_lines: list[RawLine] = []
+    baseline_body_lines: list[RawLine] = []
     header_lines: list[RawLine] = []
     footer_lines: list[RawLine] = []
 
@@ -356,10 +487,28 @@ def _build_page(
         elif line.y0 >= height * 0.92 or fingerprint in repeated_footers or PAGE_NUMBER_RE.match(line.original_text):
             line.region_kind = "footer"
             footer_lines.append(line)
-        elif _inside_any_table(line, tables):
-            continue
         else:
-            body_lines.append(line)
+            baseline_body_lines.append(line)
+            if not _inside_any_table(line, tables):
+                body_lines.append(line)
+
+    baseline_blocks: list[DocumentBlock] = []
+    for baseline_region in _segment_body_regions(baseline_body_lines, [], float(rect.width), height):
+        baseline_model, _ = _make_layout_region(baseline_region, 0)
+        baseline_blocks.extend(baseline_model.blocks)
+    for table in tables:
+        if not table.derived_from_aligned_rows:
+            continue
+        table.order_span = max(
+            1,
+            sum(
+                _inside_any_table(
+                    RawLine(page_number, block.bbox, block.original_text, [], "body"),
+                    [table],
+                )
+                for block in baseline_blocks
+            ),
+        )
 
     layout_regions = _segment_body_regions(body_lines, tables, float(rect.width), height)
     regions: list[DocumentRegion] = []
@@ -429,7 +578,7 @@ def _make_layout_region(layout_region: LayoutRegion, start_order: int) -> tuple[
         if kind == "table":
             flush_pending_lines()
             blocks.append(_make_table_block(payload, order))
-            order += 1
+            order += payload.order_span
         else:
             pending_lines.append(payload)
     flush_pending_lines()

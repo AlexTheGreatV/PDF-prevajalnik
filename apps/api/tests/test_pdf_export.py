@@ -22,6 +22,8 @@ from app.services.pdf_exporter import (
     _new_replacement,
     _rendered_translation,
     _strict_display_text,
+    _text_blocks_in_rect,
+    _scale_meets_floor,
     _text_matches,
     _write_replacements,
     _written_text_matches,
@@ -33,6 +35,18 @@ from app.services.pdf_typography import PdfTypographyResolver
 SOURCE_TEXT = "Digital source text for a safe translated PDF preview."
 TRANSLATED_TEXT = "Varen prevod čšžČŠŽ, CO₂ in +5 °C."
 client = TestClient(app)
+
+
+def test_writer_scale_floor_accepts_only_floating_point_noise() -> None:
+    accepted = 0.970299
+    assert _scale_meets_floor(accepted + 1e-10, accepted) is True
+    assert _scale_meets_floor(accepted, accepted) is True
+    assert _scale_meets_floor(0.9702989999999999, accepted) is True
+    assert _scale_meets_floor(accepted - 2e-9, accepted) is False
+    assert _scale_meets_floor(0.7500000001, 0.75) is True
+    assert _scale_meets_floor(0.75, 0.75) is True
+    assert _scale_meets_floor(0.7499999999999999, 0.75) is True
+    assert _scale_meets_floor(0.75 - 2e-9, 0.75) is False
 
 
 def test_output_text_verification_tolerates_extracted_list_marker_semantics() -> None:
@@ -486,6 +500,40 @@ def test_typography_preserves_color_and_extractable_unicode(tmp_path: Path) -> N
         assert TRANSLATED_TEXT in document[0].get_text()
 
 
+def test_firago_disables_ligatures_without_changing_extractable_text(tmp_path: Path) -> None:
+    typography = PdfTypographyResolver(tmp_path)
+    asset = typography.assets[(False, False)]
+    expected = "ift fi ffi FFI"
+    html_text, css = typography.html_and_css(expected, PdfTextStyle(font_size=12, line_height=1.2), asset)
+
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=100)
+        spare, _ = page.insert_htmlbox(
+            pymupdf.Rect(20, 20, 280, 80), html_text, css=css, archive=typography.archive,
+        )
+        assert spare >= 0
+        assert page.get_text().strip() == expected
+
+
+def test_output_verification_can_isolate_translation_from_neighboring_text(tmp_path: Path) -> None:
+    typography = PdfTypographyResolver(tmp_path)
+    asset = typography.assets[(False, False)]
+    expected = "Daljši prevedeni odstavek, ki sega v varno razširjeno območje."
+    html_text, css = typography.html_and_css(expected, PdfTextStyle(font_size=9, line_height=1.2), asset)
+
+    with pymupdf.open() as document:
+        page = document.new_page(width=400, height=200)
+        page.insert_text((20, 30), "Sosednji naslov", fontsize=10)
+        spare, _ = page.insert_htmlbox(
+            pymupdf.Rect(20, 35, 380, 100), html_text, css=css, archive=typography.archive,
+        )
+        assert spare >= 0
+        combined = page.get_text("text", clip=pymupdf.Rect(20, 20, 380, 100), sort=True)
+        assert _written_text_matches(expected, combined) is False
+        blocks = _text_blocks_in_rect(page, pymupdf.Rect(20, 20, 380, 100))
+        assert any(_written_text_matches(expected, block) for block in blocks)
+
+
 def test_firago_keeps_numbers_and_units_together_with_nonbreaking_spaces(tmp_path: Path) -> None:
     typography = PdfTypographyResolver(tmp_path)
     asset = typography.assets[(False, False)]
@@ -646,6 +694,35 @@ def test_export_endpoint_returns_new_pdf_and_cleans_temp_on_success_and_error(tm
     assert rejected.status_code == 400
     assert rejected.json()["detail"]["code"] == "pdf_hash_mismatch"
     assert list(processing.iterdir()) == []
+
+
+def test_export_endpoint_enforces_translation_job_part_limit_at_byte_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "part-limit.pdf"
+    _make_pdf(source)
+    compact = json.dumps(_job_payload(source), ensure_ascii=False, separators=(",", ":"))
+    limit = len(compact.encode("utf-8")) + 32
+    monkeypatch.setattr(settings, "max_translation_job_bytes", limit)
+
+    def padded(size: int) -> str:
+        return compact + (" " * (size - len(compact.encode("utf-8"))))
+
+    for size in (limit - 1, limit):
+        response = client.post(
+            "/api/pdf/export-translated/plan",
+            data={"translation_job": padded(size), "mode": "replacement_preview"},
+            files={"file": (source.name, source.read_bytes(), "application/pdf")},
+        )
+        assert response.status_code == 200
+
+    rejected = client.post(
+        "/api/pdf/export-translated/plan",
+        data={"translation_job": padded(limit + 1), "mode": "replacement_preview"},
+        files={"file": (source.name, source.read_bytes(), "application/pdf")},
+    )
+    assert rejected.status_code == 413
+    assert rejected.json()["detail"] == "Prevajalsko opravilo je preveliko."
 
 
 def _make_pdf(

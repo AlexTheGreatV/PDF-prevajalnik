@@ -483,7 +483,7 @@ test("normalizes only an unambiguous plain decimal and records the profile rule"
   assert.equal(restoreTechnicalTokens(plain.protected_text, plain.tokens), "Ratio 3,14.");
   assert.equal(plain.tokens.find((token) => token.value === "3.14")?.rule_id, "decimal_separator");
 
-  for (const source of ["version 1.2.3", "code AB-3.14", "identifier v1.2", "IP 192.168.1.59", "ISO 1.59", "DIN 3.14", "serial 1.59"]) {
+  for (const source of ["version 1.2.3", "code AB-3.14", "identifier v1.2", "en.9.9", "IP 192.168.1.59", "ISO 1.59", "DIN 3.14", "serial 1.59", "https://example.test/en.9.9"]) {
     const protectedValue = protectTechnicalTokens(source);
     assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), source);
     assert.equal(protectedValue.tokens.some((token) => token.rule_id === "decimal_separator"), false);
@@ -498,6 +498,42 @@ test("normalizes only an unambiguous plain decimal and records the profile rule"
   assert.equal(translated.segments[0].translated_text, "Razmerje 3,14.");
   assert.ok(translated.translation_profile?.applied_rule_ids.includes("SL-SSKJ-05-001"));
   assert.notEqual(translated.segments[0].status, "reviewed");
+});
+
+test("protects composite technical labels and rejects damaged structure", () => {
+  const protectedValue = protectTechnicalTokens("Classification + / T 1 remains valid.");
+  assert.ok(protectedValue.tokens.some((token) => token.value === "+ / T 1"));
+  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), "Classification + / T 1 remains valid.");
+  assert.throws(() => restoreTechnicalTokens(protectedValue.protected_text.replace("TK000TK", "+ / T1"), protectedValue.tokens), /placeholder/);
+  assert.equal(validateTranslationTechnicalIntegrity("Classification + / T 1", "Razvrstitev + / T1").valid, false);
+});
+
+test("splits repeated structural markers and pipe fields without losing order", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const template = job.segments.find((segment) => segment.block_type === "paragraph")!;
+  const bullets = createTranslationChunks({ ...template, source_text: "Ð First item Ð Second item Ð Third item" });
+  assert.deepEqual(bullets.map((chunk) => chunk.source_text), ["Ð First item", "Ð Second item", "Ð Third item"]);
+  assert.equal(bullets.map((chunk) => chunk.source_text + chunk.separator_after).join(""), "Ð First item Ð Second item Ð Third item");
+
+  const fields = createTranslationChunks({ ...template, source_text: "Address 14 | +49 8684 908-0 | info@example.test" });
+  assert.deepEqual(fields.map((chunk) => chunk.source_text), ["Address 14", "+49 8684 908-0", "info@example.test"]);
+  assert.equal(fields.map((chunk) => chunk.source_text + chunk.separator_after).join(""), "Address 14 | +49 8684 908-0 | info@example.test");
+});
+
+test("records distinct glossary occurrences by offsets and deduplicates only identical events", () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", "Use sealant, then inspect the sealant.")],
+  }];
+  const glossary: GlossaryEntry[] = [{
+    id: "sealant", source_term: "sealant", target_term: "tesnilna masa", case_sensitive: false,
+    mode: "preferred", enabled: true, origin: "user", scope: "persistent_user", status: "approved", revision: 2,
+  }];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl", glossary });
+  const matches = job.segments[0].glossary_matches;
+  assert.deepEqual(matches.map((match) => [match.start_offset, match.end_offset]), [[4, 11], [30, 37]]);
+  assert.deepEqual(job.glossary_usage.map((usage) => [usage.start_offset, usage.end_offset]), [[4, 11], [30, 37]]);
 });
 
 test("protects formulas codes URLs email and source placeholders", () => {
