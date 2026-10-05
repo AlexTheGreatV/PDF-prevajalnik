@@ -20,7 +20,7 @@ function test(name: string, run: () => void | Promise<void>) {
 
 function job(): TranslationJob {
   return {
-    schema_version: 8,
+    schema_version: 9,
     source_filename: "source.pdf",
     source_language: "en",
     target_language: "sl",
@@ -47,7 +47,7 @@ test("prepares a local multipart PDF export plan", async () => {
     assert.equal(init?.method, "POST");
     const form = init?.body as FormData;
     assert.equal(form.get("mode"), "diagnostic");
-    assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 8);
+    assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 9);
     return new Response(JSON.stringify({
       filename: "source-sl-diagnostic.pdf",
       mode: "diagnostic",

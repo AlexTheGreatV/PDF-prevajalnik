@@ -22,7 +22,7 @@ import type {
   TranslationSegment,
 } from "./translation-types";
 
-export const TRANSLATION_JOB_SCHEMA_VERSION = 8 as const;
+export const TRANSLATION_JOB_SCHEMA_VERSION = 9 as const;
 
 export function createTranslationJob(
   analysis: PdfAnalysis,
@@ -50,6 +50,9 @@ export function createTranslationJob(
         const blockId = `p${page.page_number}-r${region.reading_order}-b${block.reading_order}`;
         if (block.kind === "table" && block.table_cells) {
           block.table_cells.forEach((row, rowIndex) => row.forEach((cell, columnIndex) => {
+            const provenance = block.table_provenance?.cells.find((candidate) =>
+              candidate.row_index === rowIndex && candidate.column_index === columnIndex,
+            );
             const acceptedOcr = ocrItems.find((item) =>
               item.page_number === page.page_number &&
               item.linked_block_reading_order === block.reading_order &&
@@ -72,7 +75,14 @@ export function createTranslationJob(
               block,
               source_origin: acceptedOcr ? "accepted_ocr" : "native",
               accepted_ocr_source: acceptedOcr ? acceptedOcrSource(acceptedOcr) : null,
-              source_bbox: acceptedOcr?.pdf_bbox,
+              source_bbox: acceptedOcr?.pdf_bbox ?? provenance?.source_bbox ?? null,
+              table_cell_provenance: acceptedOcr || !provenance || !block.table_provenance ? null : {
+                ...structuredClone(provenance),
+                table_id: block.table_provenance.table_id,
+                table_bbox: { ...block.table_provenance.bbox },
+                table_geometry_evidence: block.table_provenance.geometry_evidence,
+                table_warnings: [...block.table_provenance.warnings],
+              },
               source_language: options.source_language,
               target_language: options.target_language,
               glossary,
@@ -215,6 +225,7 @@ type SegmentInput = {
   source_origin: TranslationSegment["source_text_origin"];
   accepted_ocr_source?: TranslationSegment["accepted_ocr_source"];
   source_bbox?: TranslationSegment["source_bbox"];
+  table_cell_provenance?: TranslationSegment["table_cell_provenance"];
   source_language: string;
   target_language: string;
   glossary: GlossaryEntry[];
@@ -236,11 +247,12 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     source_text,
     source_text_origin: input.source_origin,
     source_bbox: input.block_type === "table_cell" && input.source_origin === "native"
-      ? null
+      ? input.source_bbox ? { ...input.source_bbox } : null
       : { ...(input.source_bbox ?? input.block.bbox) },
     source_page_type: input.page_type,
     source_rotation: input.page_rotation,
     source_style: input.block_type === "table_cell" ? null : { ...input.block.style },
+    table_cell_provenance: input.table_cell_provenance ? structuredClone(input.table_cell_provenance) : null,
     accepted_ocr_source: input.accepted_ocr_source ?? null,
     translated_text: "",
     edited_translation: "",
@@ -930,7 +942,7 @@ export function importTranslationJob(value: string): TranslationJob {
           : parsed.schema_version === 5
             ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(parsed))
             : migrateSchemaSixMetadata(parsed);
-  const migrated = migrateSchemaEight(migrateSchemaSeven(migratedSix));
+  const migrated = migrateSchemaNine(migrateSchemaEight(migrateSchemaSeven(migratedSix)));
   if (!isRecord(migrated) || migrated.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
   validateJobShape(migrated);
   return finalizeTranslationJob(migrated as TranslationJob);
@@ -948,7 +960,8 @@ export function validateTranslationJobCompatibility(imported: TranslationJob, ex
       segment.block_type !== source.block_type ||
       segment.source_text !== source.source_text ||
       segment.source_text_origin !== source.source_text_origin ||
-      JSON.stringify(segment.accepted_ocr_source ?? null) !== JSON.stringify(source.accepted_ocr_source ?? null)) {
+      JSON.stringify(segment.accepted_ocr_source ?? null) !== JSON.stringify(source.accepted_ocr_source ?? null) ||
+      JSON.stringify(segment.table_cell_provenance ?? null) !== JSON.stringify(source.table_cell_provenance ?? null)) {
       throw new Error("Opravilo vsebuje spremenjene ali nezdružljive izvorne segmente.");
     }
   }
@@ -972,6 +985,7 @@ export function bindTranslationJobToAnalysis(imported: TranslationJob, expected:
         source_page_type: source.source_page_type,
         source_rotation: source.source_rotation,
         source_style: source.source_style,
+        table_cell_provenance: source.table_cell_provenance ?? null,
         accepted_ocr_source: source.accepted_ocr_source ?? null,
       };
     }),
@@ -1112,6 +1126,19 @@ function migrateSchemaEight(job: Record<string, unknown>): Record<string, unknow
   return { ...job, schema_version: 8, segments };
 }
 
+function migrateSchemaNine(job: Record<string, unknown>): Record<string, unknown> {
+  if (job.schema_version === 9) return job;
+  if (job.schema_version !== 8) return job;
+  return {
+    ...job,
+    schema_version: 9,
+    segments: Array.isArray(job.segments) ? job.segments.map((value) => isRecord(value) ? {
+      ...value,
+      table_cell_provenance: null,
+    } : value) : job.segments,
+  };
+}
+
 function migrateSchemaFiveProfileMetadata(job: Record<string, unknown>): Record<string, unknown> {
   if (job.schema_version !== 5 || !isRecord(job.translation_profile)) return job;
   const profile = job.translation_profile;
@@ -1178,6 +1205,7 @@ function validateJobShape(job: Record<string, unknown>): void {
       ![null, "digital", "scanned", "mixed", "empty"].includes(segment.source_page_type as null | string) ||
       !(segment.source_rotation === null || typeof segment.source_rotation === "number") ||
       !(segment.source_style === null || isRecord(segment.source_style)) ||
+      !(segment.table_cell_provenance === null || isTableCellProvenance(segment.table_cell_provenance)) ||
       !isAcceptedOcrSource(segment.accepted_ocr_source, segment.source_text_origin, segment.source_text, segment.source_bbox) ||
       typeof segment.translated_text !== "string" ||
       typeof segment.edited_translation !== "string" ||
@@ -1287,6 +1315,29 @@ function isDocumentIdentity(value: unknown): boolean {
 
 function isBBox(value: unknown): boolean {
   return isRecord(value) && [value.x0, value.y0, value.x1, value.y1].every((coordinate) => typeof coordinate === "number" && Number.isFinite(coordinate));
+}
+
+function isTableCellProvenance(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.table_id === "string" && value.table_id.length > 0 &&
+    typeof value.cell_id === "string" && value.cell_id.length > 0 &&
+    Number.isInteger(value.row_index) && Number(value.row_index) >= 0 &&
+    Number.isInteger(value.column_index) && Number(value.column_index) >= 0 &&
+    Number.isInteger(value.row_span) && Number(value.row_span) >= 1 &&
+    Number.isInteger(value.column_span) && Number(value.column_span) >= 1 &&
+    isBBox(value.table_bbox) &&
+    (value.cell_bbox === null || isBBox(value.cell_bbox)) &&
+    (value.source_bbox === null || isBBox(value.source_bbox)) &&
+    (value.content_bbox === null || isBBox(value.content_bbox)) &&
+    ["vector_grid", "aligned_grid", "partial_grid", "open_table", "merged_cell", "conflicting_graphics"].includes(String(value.geometry_evidence)) &&
+    ["vector_grid", "aligned_grid", "partial_grid", "open_table", "merged_cell", "conflicting_graphics"].includes(String(value.table_geometry_evidence)) &&
+    ["owned", "empty", "ambiguous", "unsupported"].includes(String(value.ownership)) &&
+    (value.block_reason === null || typeof value.block_reason === "string") &&
+    Array.isArray(value.source_span_ids) && value.source_span_ids.every((item) => typeof item === "string") &&
+    Array.isArray(value.proven_edges) && value.proven_edges.every((item) => ["top", "right", "bottom", "left"].includes(String(item))) &&
+    Array.isArray(value.table_warnings) && value.table_warnings.every((item) => typeof item === "string") &&
+    typeof value.has_graphic_overlap === "boolean" && typeof value.rotated_text === "boolean" &&
+    (value.background_fill === null || typeof value.background_fill === "string");
 }
 
 function validateGlossaryEntry(value: unknown): void {

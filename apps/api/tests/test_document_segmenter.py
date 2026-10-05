@@ -5,7 +5,13 @@ import pytest
 
 from app.api.pdf import _processing_tempdir, _safe_rmtree
 from app.core.config import settings
-from app.services.document_segmenter import normalize_lines, normalize_lines_with_boundaries, segment_pdf
+from app.services.document_segmenter import (
+    _cell_provenance,
+    _extract_lines,
+    normalize_lines,
+    normalize_lines_with_boundaries,
+    segment_pdf,
+)
 
 ZETTEX_FIXTURE = Path("local-fixtures/Zettex MS65 Panel Bond EN - TDS.pdf")
 
@@ -98,6 +104,175 @@ def test_segmenter_detects_basic_table(tmp_path: Path) -> None:
 
     assert table_blocks
     assert any("4 MPa" in cell for row in (table_blocks[0].table_cells or []) for cell in row)
+    provenance = table_blocks[0].table_provenance
+    assert provenance is not None
+    assert provenance.geometry_evidence == "vector_grid"
+    assert all(cell.ownership == "owned" for cell in provenance.cells)
+    assert all(cell.proven_edges == ["top", "right", "bottom", "left"] for cell in provenance.cells)
+
+
+def test_table_provenance_keeps_multiple_spans_unique_and_stable(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "multiple-spans.pdf"
+    document = fitz.open()
+    page = document.new_page(width=360, height=220)
+    _draw_grid(page, [40, 180, 320], [40, 100, 160])
+    page.insert_text((52, 72), "Multi", fontsize=9, fontname="helv")
+    page.insert_text((78, 72), "Span", fontsize=9, fontname="hebo")
+    page.insert_text((192, 72), "Value", fontsize=9)
+    page.insert_text((52, 132), "Second", fontsize=9)
+    page.insert_text((192, 132), "4 MPa", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    first = _first_table(segment_pdf(pdf_path))
+    second = _first_table(segment_pdf(pdf_path))
+    first_cell = first.table_provenance.cells[0]  # type: ignore[union-attr]
+    second_cell = second.table_provenance.cells[0]  # type: ignore[union-attr]
+
+    assert first_cell.ownership == "owned"
+    assert len(first_cell.source_span_ids) >= 2
+    assert len(set(first_cell.source_span_ids)) == len(first_cell.source_span_ids)
+    assert first_cell.source_span_ids == second_cell.source_span_ids
+    assert first_cell.cell_id == second_cell.cell_id
+
+
+def test_table_provenance_preserves_empty_structural_column(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "empty-column.pdf"
+    document = fitz.open()
+    page = document.new_page(width=380, height=220)
+    _draw_grid(page, [30, 140, 250, 350], [40, 100, 160])
+    page.insert_text((42, 72), "Left", fontsize=9)
+    page.insert_text((262, 72), "Right", fontsize=9)
+    page.insert_text((42, 132), "A", fontsize=9)
+    page.insert_text((262, 132), "B", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    table = _first_table(segment_pdf(pdf_path))
+    provenance = table.table_provenance
+    assert provenance is not None
+    assert provenance.column_count == 3
+    assert (table.table_cells or [])[0][1] == ""
+    empty_cells = [cell for cell in provenance.cells if cell.column_index == 1]
+    assert len(empty_cells) == 2
+    assert all(cell.ownership == "empty" and not cell.source_span_ids for cell in empty_cells)
+
+
+def test_span_crossing_cell_border_is_not_owned(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "crossing.pdf"
+    document = fitz.open()
+    page = document.new_page(width=320, height=180)
+    _draw_grid(page, [20, 160, 300], [30, 90, 150])
+    page.insert_text((138, 66), "CROSSING", fontsize=10)
+    page.insert_text((42, 126), "Left", fontsize=9)
+    page.insert_text((182, 126), "Right", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    table = _first_table(segment_pdf(pdf_path))
+    crossing = next(cell for cell in table.table_provenance.cells if cell.source_span_ids)  # type: ignore[union-attr]
+    assert crossing.ownership == "ambiguous"
+    assert crossing.block_reason == "span_crosses_cell_boundary"
+
+
+def test_missing_vector_edge_is_partial_and_blocked(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "missing-edge.pdf"
+    document = fitz.open()
+    page = document.new_page(width=220, height=160)
+    page.draw_line((20, 30), (180, 30), color=(0, 0, 0))
+    page.draw_line((20, 100), (180, 100), color=(0, 0, 0))
+    page.draw_line((20, 30), (20, 100), color=(0, 0, 0))
+    page.insert_text((32, 68), "Unclosed cell", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    with fitz.open(pdf_path) as reopened:
+        page = reopened[0]
+        provenance = _cell_provenance(
+            page, _extract_lines(page, 1), 1, 0, 0, "Unclosed cell",
+            fitz.Rect(20, 30, 180, 100), "vector_grid",
+        )
+
+    assert provenance.geometry_evidence == "partial_grid"
+    assert provenance.proven_edges == ["top", "bottom", "left"]
+    assert provenance.ownership == "ambiguous"
+    assert provenance.block_reason == "missing_cell_edge"
+
+
+def test_merged_cell_is_explicit_and_blocked(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "merged.pdf"
+    document = fitz.open()
+    page = document.new_page(width=320, height=180)
+    page.draw_rect((20, 30, 300, 150), color=(0, 0, 0))
+    page.draw_line((20, 90), (300, 90), color=(0, 0, 0))
+    page.draw_line((160, 90), (160, 150), color=(0, 0, 0))
+    page.insert_text((32, 66), "Merged heading", fontsize=9)
+    page.insert_text((32, 126), "Left", fontsize=9)
+    page.insert_text((172, 126), "Right", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    table = _first_table(segment_pdf(pdf_path))
+    merged = next(cell for cell in table.table_provenance.cells if cell.column_span > 1)  # type: ignore[union-attr]
+    assert merged.geometry_evidence == "merged_cell"
+    assert merged.ownership == "unsupported"
+    assert merged.block_reason == "merged_cell"
+
+
+def test_rotated_table_text_is_explicitly_unsupported(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "rotated.pdf"
+    document = fitz.open()
+    page = document.new_page(width=320, height=220)
+    _draw_grid(page, [20, 160, 300], [30, 110, 190])
+    page.insert_text((70, 96), "Rotated", fontsize=9, rotate=90)
+    page.insert_text((172, 72), "Value", fontsize=9)
+    page.insert_text((32, 152), "Normal", fontsize=9)
+    page.insert_text((172, 152), "Other", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    table = _first_table(segment_pdf(pdf_path))
+    rotated = [cell for cell in table.table_provenance.cells if cell.rotated_text]  # type: ignore[union-attr]
+    assert rotated
+    assert all(cell.ownership == "unsupported" and cell.block_reason == "rotated_text" for cell in rotated)
+
+
+def test_uniform_cell_fill_is_recorded_without_becoming_graphic_overlap(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "filled.pdf"
+    document = fitz.open()
+    page = document.new_page(width=320, height=180)
+    page.draw_rect((20, 30, 300, 90), color=None, fill=(0.8, 0.9, 1.0))
+    page.draw_rect((20, 90, 300, 150), color=None, fill=(1.0, 1.0, 1.0))
+    _draw_grid(page, [20, 160, 300], [30, 90, 150])
+    for x, y, text in ((32, 66, "Property"), (172, 66, "Value"), (32, 126, "Type"), (172, 126, "A")):
+        page.insert_text((x, y), text, fontsize=9)
+    document.save(pdf_path)
+    document.close()
+
+    table = _first_table(segment_pdf(pdf_path))
+    first = table.table_provenance.cells[0]  # type: ignore[union-attr]
+    assert first.background_fill == "#cce5ff"
+    assert first.has_graphic_overlap is False
+    assert first.ownership == "owned"
+
+
+def test_tiny_gap_between_gridless_cells_remains_ambiguous(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "tiny-gap.pdf"
+    document = fitz.open()
+    page = document.new_page(width=340, height=260)
+    for index in range(5):
+        y = 70 + index * 28
+        page.insert_text((40, y), f"Long property value {index}", fontsize=9)
+        page.insert_text((120, y), f"{index}A", fontsize=7)
+    document.save(pdf_path)
+    document.close()
+
+    table = _first_table(segment_pdf(pdf_path))
+    provenance = table.table_provenance
+    assert provenance is not None
+    assert provenance.geometry_evidence == "aligned_grid"
+    assert any(cell.block_reason == "ambiguous_cell_boundary" for cell in provenance.cells)
+    assert not any(cell.ownership == "owned" for cell in provenance.cells)
 
 
 def test_segmenter_detects_aligned_gridless_cells_without_joining_adjacent_codes(tmp_path: Path) -> None:
@@ -131,6 +306,15 @@ def test_segmenter_detects_aligned_gridless_cells_without_joining_adjacent_codes
     assert ["Beige", "26"] in cells
     assert ["Grey", "28"] in cells
     assert all("Black 20" not in cell and "RAL 9021 22" not in cell for row in cells for cell in row)
+    provenance = table.table_provenance
+    assert provenance is not None
+    ral = provenance.cells[2]
+    code = provenance.cells[3]
+    assert len(ral.source_span_ids) == 1 and ral.ownership == "owned"
+    assert len(code.source_span_ids) == 1 and code.ownership == "owned"
+    assert set(ral.source_span_ids).isdisjoint(code.source_span_ids)
+    names = [cell for cell in provenance.cells if cell.column_index == 0 and cell.source_span_ids]
+    assert all(not cell.has_graphic_overlap for cell in names)
     following = next(block for block in _blocks(result.pages[0]) if block.original_text == "Following paragraph")
     assert following.reading_order == 4
 
@@ -216,6 +400,17 @@ def test_safe_rmtree_refuses_paths_outside_root(tmp_path: Path) -> None:
         _safe_rmtree(outside, root)
 
     assert outside.exists()
+
+
+def _draw_grid(page: fitz.Page, xs: list[float], ys: list[float]) -> None:
+    for x in xs:
+        page.draw_line((x, ys[0]), (x, ys[-1]), color=(0, 0, 0), width=0.8)
+    for y in ys:
+        page.draw_line((xs[0], y), (xs[-1], y), color=(0, 0, 0), width=0.8)
+
+
+def _first_table(model):
+    return next(block for block in _blocks(model.pages[0]) if block.kind == "table")
 
 
 @pytest.mark.skipif(not ZETTEX_FIXTURE.exists(), reason="Private Zettex PDF fixture is not present in local-fixtures/.")

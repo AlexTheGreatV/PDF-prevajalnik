@@ -7,7 +7,7 @@ from app.models import PageAnalysis, PageDimensions, PdfAnalysis, PdfKind, TextB
 from app.services.document_segmenter import segment_pdf
 
 TEXT_PAGE_THRESHOLD = 25
-DOCUMENT_MODEL_VERSION = 1
+DOCUMENT_MODEL_VERSION = 2
 
 
 def analyze_pdf(path: Path, filename: str | None = None) -> PdfAnalysis:

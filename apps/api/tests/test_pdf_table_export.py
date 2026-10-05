@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import io
 import socket
@@ -9,6 +10,7 @@ from PIL import Image, ImageChops, ImageDraw
 
 from app.pdf_export_models import PdfExportJob
 from app.services.pdf_exporter import export_translated_pdf, plan_pdf_export
+from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_table_export import PdfTableAnalyzer, is_technical_value
 
 
@@ -149,7 +151,9 @@ def test_overlapping_table_replacements_are_rejected(tmp_path: Path) -> None:
     first = payload["segments"][0]
     payload["segments"].append({**first, "segment_id": "duplicate-c1-1"})
     plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "diagnostic", tmp_path / "work")
-    assert all(cell.skip_reason == "duplicate_table_content" for cell in plan.tables[-1].cells)
+    duplicate_cells = [cell for cell in plan.replacements if cell.segment_id in {first["segment_id"], "duplicate-c1-1"}]
+    assert len(duplicate_cells) == 2
+    assert all(cell.skip_reason == "duplicate_table_content" for cell in duplicate_cells)
 
 
 def test_wrong_source_text_is_rejected_per_cell(tmp_path: Path) -> None:
@@ -161,6 +165,121 @@ def test_wrong_source_text_is_rejected_per_cell(tmp_path: Path) -> None:
     assert plan.tables[0].cells[0].skip_reason == "source_text_mismatch"
 
 
+def test_legacy_table_cell_without_provenance_is_blocked(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.pdf"
+    _make_table(source)
+    payload = _job_payload(source)
+    payload["schema_version"] = 8
+    payload["segments"][0]["table_cell_provenance"] = None
+
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "work")
+
+    replacements = [item for item in plan.replacements if item.segment_id == payload["segments"][0]["segment_id"]]
+    assert any(item.skip_reason == "missing_table_provenance" for item in replacements)
+    assert any(item.resolution == "blocked_table_structure" for item in replacements)
+
+
+def test_changed_client_table_provenance_is_rejected_as_stale(tmp_path: Path) -> None:
+    source = tmp_path / "stale.pdf"
+    _make_table(source)
+    payload = _job_payload(source)
+    payload["segments"][0]["table_cell_provenance"]["content_bbox"]["x1"] -= 1
+
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "work")
+
+    replacement = next(item for item in plan.replacements if item.segment_id == payload["segments"][0]["segment_id"])
+    assert replacement.skip_reason == "stale_table_provenance"
+    assert replacement.resolution == "blocked_table_structure"
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    [
+        ("table_id", lambda value: "foreign-table"),
+        ("cell_id", lambda value: f"{value}-stale"),
+        ("row_index", lambda value: value + 1),
+        ("column_index", lambda value: value + 1),
+        ("row_span", lambda value: value + 1),
+        ("column_span", lambda value: value + 1),
+        ("table_bbox", lambda value: {**value, "x1": value["x1"] + 1}),
+        ("cell_bbox", lambda value: {**value, "x0": value["x0"] - 1}),
+        ("source_bbox", lambda value: {**value, "y1": value["y1"] + 1}),
+        ("content_bbox", lambda value: {**value, "x1": value["x1"] - 1}),
+        ("source_span_ids", lambda value: value[:-1]),
+        ("source_span_ids", lambda value: [*value, "foreign-span"]),
+        ("proven_edges", lambda value: value[:-1]),
+        ("ownership", lambda value: "ambiguous"),
+        ("geometry_evidence", lambda value: "merged_cell"),
+        ("rotated_text", lambda value: not value),
+    ],
+)
+def test_each_client_provenance_mutation_is_rejected(
+    tmp_path: Path,
+    field: str,
+    mutate,
+) -> None:
+    source = tmp_path / f"stale-{field}.pdf"
+    _make_table(source)
+    payload = _job_payload(source)
+    provenance = payload["segments"][0]["table_cell_provenance"]
+    provenance[field] = mutate(copy.deepcopy(provenance[field]))
+
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "work")
+
+    replacement = next(item for item in plan.replacements if item.segment_id == payload["segments"][0]["segment_id"])
+    assert replacement.skip_reason == "stale_table_provenance"
+    assert replacement.resolution == "blocked_table_structure"
+
+
+@pytest.mark.parametrize("coordinate", [float("nan"), float("inf"), -1_000_000.0, 1_000_000.0])
+def test_nonfinite_or_out_of_page_client_geometry_fails_closed(tmp_path: Path, coordinate: float) -> None:
+    source = tmp_path / "unsafe-geometry.pdf"
+    _make_table(source)
+    payload = _job_payload(source)
+    payload["segments"][0]["table_cell_provenance"]["source_bbox"]["x0"] = coordinate
+
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "work")
+
+    replacement = next(item for item in plan.replacements if item.segment_id == payload["segments"][0]["segment_id"])
+    assert replacement.skip_reason == "stale_table_provenance"
+    assert replacement.resolution == "blocked_table_structure"
+
+
+def test_reusing_one_cells_span_in_another_cell_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "duplicate-span.pdf"
+    _make_table(source)
+    payload = _job_payload(source)
+    first, second = payload["segments"][:2]
+    second["table_cell_provenance"]["source_span_ids"] = list(first["table_cell_provenance"]["source_span_ids"])
+
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "work")
+
+    first_result = next(item for item in plan.replacements if item.segment_id == first["segment_id"])
+    second_result = next(item for item in plan.replacements if item.segment_id == second["segment_id"])
+    assert first_result.skip_reason == "not_reviewed"
+    assert second_result.skip_reason == "stale_table_provenance"
+
+
+def test_provenance_from_another_pdf_cannot_be_exported(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    other = tmp_path / "other.pdf"
+    _make_table(source)
+    _make_table(other, values=("Other", "Values", "Material", "MS Polymer"))
+    payload = _job_payload(source)
+    payload["segments"][0]["table_cell_provenance"] = _job_payload(other)["segments"][0]["table_cell_provenance"]
+
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "work")
+
+    replacement = next(item for item in plan.replacements if item.segment_id == payload["segments"][0]["segment_id"])
+    assert replacement.skip_reason in {"source_text_mismatch", "stale_table_provenance"}
+    assert replacement.resolution == "blocked_table_structure"
+
+
+def test_future_export_schema_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        PdfExportJob.model_validate({"schema_version": 10})
+
+
 def test_graphic_table_with_internal_image_rows_is_unsupported(tmp_path: Path) -> None:
     source = tmp_path / "graphic.pdf"
     _make_graphic_table(source)
@@ -170,15 +289,13 @@ def test_graphic_table_with_internal_image_rows_is_unsupported(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("background", ["simple", "complex"])
-def test_image_backed_cell_uses_existing_overlap_safety(tmp_path: Path, background: str) -> None:
+def test_image_backed_cell_is_blocked_by_provenance(tmp_path: Path, background: str) -> None:
     source = tmp_path / f"image-{background}.pdf"
     _make_table(source, image_background=background)
     plan = plan_pdf_export(source, _job(source, translations={(0, 0): "Lastnost"}), "diagnostic", tmp_path / "work")
     cell = plan.tables[0].cells[0]
-    if background == "simple":
-        assert cell.image_overlap_kind == "simple_background"
-    else:
-        assert cell.skip_reason == "image_overlap"
+    assert cell.skip_reason == "graphic_cell"
+    assert cell.provenance_block_reason == "graphic_overlap"
 
 
 def test_opaque_cell_fill_above_image_allows_export_without_modifying_image(tmp_path: Path) -> None:
@@ -216,6 +333,30 @@ def test_two_tables_near_page_edges_are_matched_independently(tmp_path: Path) ->
     plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "diagnostic", tmp_path / "work")
     assert plan.table_summary.detected_tables == 2
     assert len([table for table in plan.tables if table.cells]) == 2
+
+
+def test_gridless_color_table_exports_safe_text_without_changing_swatch_or_code(tmp_path: Path) -> None:
+    source = tmp_path / "gridless-colors.pdf"
+    _make_gridless_color_table(source)
+    before_hash = _hash(source)
+    before_drawings = _drawing_signature(source)
+    before_swatch = _render_clip(source, pymupdf.Rect(40, 70, 60, 95))
+
+    artifact = export_translated_pdf(
+        source,
+        _job(source, translations={(0, 0): "Črna"}),
+        "replacement_preview",
+        tmp_path / "work",
+    )
+
+    assert _hash(source) == before_hash
+    assert _drawing_signature(artifact.path) == before_drawings
+    assert ImageChops.difference(before_swatch, _render_clip(artifact.path, pymupdf.Rect(40, 70, 60, 95))).getbbox() is None
+    with pymupdf.open(artifact.path) as document:
+        text = document[0].get_text()
+        assert "Črna" in text
+        assert "Black" not in text
+        assert "20" in text and "RAL 9021" in text and "22" in text
 
 
 def test_table_export_does_not_use_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -304,6 +445,17 @@ def _make_two_tables(path: Path) -> None:
         document.save(path, incremental=True, encryption=pymupdf.PDF_ENCRYPT_KEEP)
 
 
+def _make_gridless_color_table(path: Path) -> None:
+    with pymupdf.open() as document:
+        page = document.new_page(width=400, height=260)
+        for index, (name, code) in enumerate((("Black", "20"), ("RAL 9021", "22"), ("Beige", "26"), ("Grey", "28"), ("White", "30"))):
+            y = 88 + index * 24
+            page.draw_rect((45, y - 11, 55, y - 1), fill=(0.3, 0.3, 0.3), color=None)
+            page.insert_text((70, y), name, fontsize=9)
+            page.insert_text((220, y), code, fontsize=7)
+        document.save(path)
+
+
 def _detected(path: Path, table_index: int = 0):
     with pymupdf.open(path) as document:
         return PdfTableAnalyzer().detect(document[0], 1)[table_index]
@@ -319,26 +471,41 @@ def _job(path: Path, translations: dict[tuple[int, int], str]) -> PdfExportJob:
 
 
 def _job_payload(path: Path, table_index: int = 0, block_id: str = "p1-r1-b1") -> dict:
-    with pymupdf.open(path) as document:
-        page = document[0]
-        table = PdfTableAnalyzer().detect(page, 1)[table_index]
-        sha = _hash(path)
-        page_width, page_height, rotation = page.rect.width, page.rect.height, page.rotation
+    analysis = analyze_pdf(path)
+    table_blocks = [
+        block
+        for page in analysis.document.pages
+        for region in page.regions
+        for block in region.blocks
+        if block.kind == "table" and block.table_provenance is not None
+    ]
+    block = table_blocks[table_index]
+    table = block.table_provenance
+    provenance_by_position = {(cell.row_index, cell.column_index): cell for cell in table.cells}
+    page = analysis.pages[0]
     segments = []
-    for row in table.cells:
-        for cell in row:
+    for row_index, row in enumerate(block.table_cells or []):
+        for column_index, text in enumerate(row):
+            provenance = provenance_by_position[(row_index, column_index)]
             segments.append({
-                "segment_id": f"{block_id}-c{cell.row_index + 1}-{cell.column_index + 1}",
+                "segment_id": f"{block_id}-c{row_index + 1}-{column_index + 1}",
                 "page_number": 1, "block_id": block_id, "block_type": "table_cell",
-                "source_text": cell.text, "source_text_origin": "native", "source_bbox": None,
-                "source_page_type": "digital", "source_rotation": rotation, "source_style": None,
-                "edited_translation": "", "status": "skipped" if not cell.text else "pending",
+                "source_text": text, "source_text_origin": "native", "source_bbox": provenance.source_bbox.model_dump() if provenance.source_bbox else None,
+                "source_page_type": "digital", "source_rotation": page.rotation, "source_style": None,
+                "table_cell_provenance": {
+                    **provenance.model_dump(),
+                    "table_id": table.table_id,
+                    "table_bbox": table.bbox.model_dump(),
+                    "table_geometry_evidence": table.geometry_evidence,
+                    "table_warnings": table.warnings,
+                },
+                "edited_translation": "", "status": "skipped" if not text else "pending",
                 "translation_origin": None,
             })
     return {
-        "schema_version": 4, "source_filename": path.name,
-        "document_identity": {"sha256": sha, "page_count": 1, "document_model_version": 1,
-                              "pages": [{"page_number": 1, "width": page_width, "height": page_height, "rotation": rotation}]},
+        "schema_version": 9, "source_filename": path.name,
+        "document_identity": {"sha256": analysis.sha256, "page_count": 1, "document_model_version": 2,
+                              "pages": [{"page_number": 1, "width": page.dimensions.width, "height": page.dimensions.height, "rotation": page.rotation}]},
         "segments": segments,
     }
 

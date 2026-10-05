@@ -59,6 +59,7 @@ export type BBox = {
 };
 
 export type StructuredSpan = {
+  span_id: string;
   text: string;
   bbox: BBox;
   font: string | null;
@@ -156,6 +157,39 @@ export type StructuredStyle = {
   italic: boolean;
 };
 
+export type TableGeometryEvidence = "vector_grid" | "aligned_grid" | "partial_grid" | "open_table" | "merged_cell" | "conflicting_graphics";
+export type TableEdge = "top" | "right" | "bottom" | "left";
+export type TableOwnership = "owned" | "empty" | "ambiguous" | "unsupported";
+
+export type StructuredTableCellProvenance = {
+  cell_id: string;
+  row_index: number;
+  column_index: number;
+  row_span: number;
+  column_span: number;
+  cell_bbox: BBox | null;
+  source_bbox: BBox | null;
+  content_bbox: BBox | null;
+  source_span_ids: string[];
+  geometry_evidence: TableGeometryEvidence;
+  proven_edges: TableEdge[];
+  ownership: TableOwnership;
+  block_reason: string | null;
+  has_graphic_overlap: boolean;
+  rotated_text: boolean;
+  background_fill: string | null;
+};
+
+export type StructuredTableProvenance = {
+  table_id: string;
+  bbox: BBox;
+  row_count: number;
+  column_count: number;
+  geometry_evidence: TableGeometryEvidence;
+  cells: StructuredTableCellProvenance[];
+  warnings: string[];
+};
+
 export type StructuredBlock = {
   kind: StructuredBlockKind;
   bbox: BBox;
@@ -169,6 +203,7 @@ export type StructuredBlock = {
   warnings: string[];
   needs_ocr_check: boolean;
   table_cells?: string[][] | null;
+  table_provenance?: StructuredTableProvenance | null;
 };
 
 export type StructuredRegion = {

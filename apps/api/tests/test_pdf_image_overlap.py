@@ -233,7 +233,7 @@ def _job_payload(path: Path, *, source_text: str = SOURCE, translated_text: str 
         "document_identity": {
             "sha256": _hash(path),
             "page_count": 1,
-            "document_model_version": 1,
+            "document_model_version": 2,
             "pages": [{"page_number": 1, "width": 300, "height": 200, "rotation": 0}],
         },
         "segments": [{

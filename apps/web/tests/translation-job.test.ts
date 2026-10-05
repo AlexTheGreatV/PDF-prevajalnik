@@ -105,6 +105,45 @@ test("creates stable document-order segments including table cells", () => {
   assert.deepEqual(first.segments.filter((segment) => segment.block_type === "table_cell").map((segment) => segment.source_text), ["Package", "290 ml", "Colour", "RAL 9001"]);
 });
 
+test("schema nine JSON round trip preserves complete table cell provenance", () => {
+  const analysis = fixture();
+  analysis.document_model_version = 2;
+  const table = analysis.document!.pages[0].regions[1].blocks.find((item) => item.kind === "table")!;
+  table.table_provenance = {
+    table_id: "p1-t1",
+    bbox: table.bbox,
+    row_count: 2,
+    column_count: 2,
+    geometry_evidence: "vector_grid",
+    warnings: [],
+    cells: [{
+      cell_id: "p1-t1-r1-c1",
+      row_index: 0,
+      column_index: 0,
+      row_span: 1,
+      column_span: 1,
+      cell_bbox: { x0: 0, y0: 40, x1: 50, y1: 50 },
+      source_bbox: { x0: 2, y0: 42, x1: 30, y1: 48 },
+      content_bbox: { x0: 0.5, y0: 40.5, x1: 49.5, y1: 49.5 },
+      source_span_ids: ["p1-s1"],
+      geometry_evidence: "vector_grid",
+      proven_edges: ["top", "right", "bottom", "left"],
+      ownership: "owned",
+      block_reason: null,
+      has_graphic_overlap: false,
+      rotated_text: false,
+      background_fill: "#ffffff",
+    }],
+  };
+
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  const before = job.segments.find((segment) => segment.segment_id === "p1-r2-b5-c1-1")!.table_cell_provenance;
+  const imported = importTranslationJob(exportTranslationJob(job));
+  const after = imported.segments.find((segment) => segment.segment_id === "p1-r2-b5-c1-1")!.table_cell_provenance;
+
+  assert.deepEqual(after, before);
+});
+
 test("keeps structural table geometry but omits cells without visible source text", () => {
   const analysis = fixture();
   const table = analysis.document!.pages[0].regions[1].blocks.find((item) => item.kind === "table")!;
@@ -836,7 +875,7 @@ test("JSON roundtrip retains work and rejects unsupported versions", () => {
   const job = { ...base, segments: base.segments.map((segment, index) => index === 0 ? reviewTranslation(editTranslation(segment, "UPORABA")) : segment) };
   assert.deepEqual(importTranslationJob(exportTranslationJob(job)), job);
   assert.throws(() => importTranslationJob("not-json"), /veljaven JSON/);
-  assert.throws(() => importTranslationJob('{"schema_version":9}'), /ni podprta/);
+  assert.throws(() => importTranslationJob('{"schema_version":10}'), /ni podprta/);
 });
 
 test("schema four import stays compatible without claiming the new profile", () => {
@@ -846,7 +885,7 @@ test("schema four import stays compatible without claiming the new profile", () 
   delete legacy.translation_profile;
   delete legacy.quality_checklist;
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 8);
+  assert.equal(migrated.schema_version, 9);
   assert.equal(migrated.translation_profile, null);
   assert.deepEqual(migrated.quality_checklist, []);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
@@ -1100,7 +1139,7 @@ test("schema one import migrates explicitly and retains immutable source identit
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 8);
+  assert.equal(migrated.schema_version, 9);
   assert.equal(migrated.glossary[0].mode, "do_not_translate");
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.glossary_snapshot, migrated.glossary);
@@ -1209,7 +1248,7 @@ test("schema two job migrates chunk fields without changing source identity", ()
     return legacySegment;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 8);
+  assert.equal(migrated.schema_version, 9);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.segments[0].chunks, []);
 });
@@ -1237,7 +1276,7 @@ test("schema seven mixed chunks migrate without inventing TM provenance", async 
     }),
   }));
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 8);
+  assert.equal(migrated.schema_version, 9);
   assert.equal(migrated.segments[0].translation_origin, "mixed");
   assert.deepEqual(migrated.segments[0].chunks.map((chunk) => chunk.translation_origin), ["translation_memory", "provider"]);
 });
@@ -1262,7 +1301,7 @@ test("schema three job migrates without inventing identity and can be safely reb
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 8);
+  assert.equal(migrated.schema_version, 9);
   assert.equal(migrated.document_identity, null);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   const rebound = bindTranslationJobToAnalysis(migrated, current);

@@ -39,6 +39,11 @@ const REASON_LABELS: Record<string, string> = {
   missing_cell_bbox: "manjkajoča geometrija celice",
   duplicate_cell_geometry: "podvojena geometrija celice",
   unsupported_table_structure: "nezanesljiva struktura tabele",
+  missing_table_provenance: "manjka dokazljiva povezava z izvorno celico",
+  stale_table_provenance: "tabelna provenance se ne ujema z izvornim PDF-jem",
+  span_crosses_cell_boundary: "izvorno besedilo prečka mejo celice",
+  graphic_cell: "celica vsebuje grafiko, polnilo ali barvni vzorec",
+  rotated_cell: "rotirano besedilo v celici ni podprto",
   cell_overflow: "prevod se ne prilega celici",
   rotated_page: "rotirana stran",
   source_text_mismatch: "izvorno besedilo se ne ujema",
@@ -178,6 +183,7 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
           <summary>Stran {table.page_number} · {table.table_id} · {table.row_count} × {table.column_count}{table.partial_export ? " · delni izvoz" : ""}</summary>
           {table.cells.filter((cell) => !cell.eligible).map((cell) => <p key={cell.segment_id}>
             <strong>r{cell.row_index + 1} c{cell.column_index + 1}</strong> · {cell.source_text || "prazna celica"}: {REASON_LABELS[cell.skip_reason ?? ""] ?? cell.skip_reason ?? "ni upravičena"}
+            <small> · {cell.cell_id ?? "brez cell ID"} · {cell.geometry_evidence ?? "brez dokaza"} · spani: {cell.source_span_ids.join(", ") || "brez"}{cell.provenance_block_reason ? ` · ${cell.provenance_block_reason}` : ""}</small>
           </p>)}
         </details>)}
       </section>}

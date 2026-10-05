@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pymupdf
 
-from app.models import BBox
+from app.models import BBox, DocumentModel, TableCellProvenance, TableProvenance
 from app.pdf_export_models import (
     ExportMode,
     FitStrategy,
@@ -23,18 +23,20 @@ from app.pdf_export_models import (
     PdfOcrReplacement,
     PdfReplacement,
     PdfTableCellReplacement,
+    PdfTableCellProvenance,
     PdfTableExportPlan,
     PdfTableExportSummary,
     SkipReason,
 )
 from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer
+from app.services.document_segmenter import segment_pdf
 from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canonical_text, is_technical_value, parse_cell_position
 from app.services.pdf_typography import FontAsset, PdfTypographyResolver
 from app.services.ocr_review_registry import ocr_review_registry
 
 LOGGER = logging.getLogger(__name__)
 
-DOCUMENT_MODEL_VERSION = 1
+DOCUMENT_MODEL_VERSION = 2
 MIN_FONT_SIZE = 6.0
 GEOMETRY_TOLERANCE = 0.5
 OVERLAP_TOLERANCE = 0.1
@@ -73,6 +75,7 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
     temp_dir.mkdir(parents=True, exist_ok=True)
     typography = PdfTypographyResolver(temp_dir)
     overlap_analyzer = PdfImageOverlapAnalyzer()
+    authoritative_model = segment_pdf(path)
     with pymupdf.open(path) as document:
         _validate_document_identity(path, document, job)
         regular_segments = [
@@ -85,7 +88,9 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
         ]
         replacements = [_plan_segment(document, segment, typography, overlap_analyzer) for segment in regular_segments]
         ocr_replacements = [_plan_ocr_segment(document, segment, typography, overlap_analyzer) for segment in ocr_segments]
-        tables, table_replacements = _plan_tables(document, job, typography, overlap_analyzer)
+        tables, table_replacements = _plan_tables(
+            document, job, typography, overlap_analyzer, authoritative_model,
+        )
         replacements.extend(table_replacements)
         _mark_overlap_conflicts([*replacements, *ocr_replacements])
         for replacement in replacements:
@@ -321,7 +326,12 @@ def _plan_tables(
     job: PdfExportJob,
     typography: PdfTypographyResolver,
     overlap_analyzer: PdfImageOverlapAnalyzer,
+    authoritative_model: DocumentModel,
 ) -> tuple[list[PdfTableExportPlan], list[PdfReplacement]]:
+    # Cell export always requires server-verified provenance. Older jobs may still
+    # be opened, but their table cells remain blocked until rebuilt from analysis.
+    if job.schema_version >= 9 or any(segment.block_type == "table_cell" for segment in job.segments):
+        return _plan_provenance_tables(document, job, typography, overlap_analyzer, authoritative_model)
     segments_for_export = [
         segment for segment in job.segments
         if not _is_empty_structural_table_cell(segment)
@@ -419,6 +429,236 @@ def _plan_tables(
             for cell in plan.cells:
                 _skip(cell, "duplicate_table_content", "Vsebina je podvojena s tabelnim vsebnikom.")
     return list(table_plans.values()), replacements
+
+
+def _plan_provenance_tables(
+    document: pymupdf.Document,
+    job: PdfExportJob,
+    typography: PdfTypographyResolver,
+    overlap_analyzer: PdfImageOverlapAnalyzer,
+    authoritative_model: DocumentModel,
+) -> tuple[list[PdfTableExportPlan], list[PdfReplacement]]:
+    authoritative: dict[str, tuple[TableProvenance, TableCellProvenance, str, int]] = {}
+    plans: dict[str, PdfTableExportPlan] = {}
+    for page in authoritative_model.pages:
+        for region in page.regions:
+            for block in region.blocks:
+                table = block.table_provenance
+                if table is None:
+                    continue
+                plans[table.table_id] = PdfTableExportPlan(
+                    table_id=table.table_id,
+                    page_number=page.page_number,
+                    bbox=table.bbox,
+                    row_count=table.row_count,
+                    column_count=table.column_count,
+                    reliable=not table.warnings,
+                    warnings=list(table.warnings),
+                )
+                for cell in table.cells:
+                    text = ""
+                    if block.table_cells and cell.row_index < len(block.table_cells):
+                        row = block.table_cells[cell.row_index]
+                        if cell.column_index < len(row):
+                            text = row[cell.column_index]
+                    if cell.cell_id in authoritative:
+                        plans[table.table_id].reliable = False
+                        plans[table.table_id].warnings.append("duplicate_cell_id")
+                        continue
+                    authoritative[cell.cell_id] = (table, cell, text, page.page_number)
+
+    container_blocks = {
+        (segment.page_number, segment.block_id)
+        for segment in job.segments
+        if segment.block_type == "table"
+    }
+    client_cell_counts = Counter(
+        segment.table_cell_provenance.cell_id
+        for segment in job.segments
+        if segment.block_type == "table_cell"
+        and segment.table_cell_provenance is not None
+        and not _is_empty_structural_table_cell(segment)
+    )
+
+    replacements: list[PdfReplacement] = []
+    for segment in job.segments:
+        if segment.block_type == "table":
+            replacements.append(_not_applicable(
+                _new_replacement(segment),
+                "Vsebnik tabele je strukturna enota; izvozijo se posamezne dokazane celice.",
+            ))
+            continue
+        if segment.block_type != "table_cell" or _is_empty_structural_table_cell(segment):
+            continue
+        client = segment.table_cell_provenance
+        table_id = client.table_id if client else segment.block_id
+        if (segment.page_number, segment.block_id) in container_blocks:
+            cell = _unresolved_table_cell(segment, table_id, "duplicate_table_content")
+            cell.provenance_block_reason = "table_container_and_cells_both_present"
+        elif client is not None and client_cell_counts[client.cell_id] > 1:
+            cell = _unresolved_table_cell(segment, table_id, "duplicate_table_content")
+            cell.provenance_block_reason = "duplicate_cell_id_in_request"
+        elif client is None:
+            cell = _unresolved_table_cell(segment, table_id, "missing_table_provenance")
+            cell.provenance_block_reason = "legacy_or_missing_provenance"
+        else:
+            registered = authoritative.get(client.cell_id)
+            if registered is None:
+                cell = _unresolved_table_cell(segment, table_id, "stale_table_provenance")
+                cell.provenance_block_reason = "cell_not_present_in_source_pdf"
+            else:
+                table, source_cell, source_text, page_number = registered
+                if page_number != segment.page_number or not _provenance_matches(client, table, source_cell):
+                    cell = _unresolved_table_cell(segment, table_id, "stale_table_provenance")
+                    cell.provenance_block_reason = "client_provenance_mismatch"
+                else:
+                    cell = _plan_provenance_cell(
+                        document[page_number - 1], table, source_cell, source_text,
+                        segment, typography, overlap_analyzer,
+                    )
+        replacements.append(cell)
+        plan = plans.setdefault(table_id, PdfTableExportPlan(
+            table_id=table_id,
+            page_number=segment.page_number,
+            reliable=False,
+            warnings=["missing_table_provenance"],
+        ))
+        plan.cells.append(cell)
+
+    for plan in plans.values():
+        plan.cells.sort(key=lambda item: (item.row_index, item.column_index))
+    return list(plans.values()), replacements
+
+
+def _provenance_matches(
+    client: PdfTableCellProvenance,
+    table: TableProvenance,
+    cell: TableCellProvenance,
+) -> bool:
+    return (
+        client.table_id == table.table_id
+        and client.cell_id == cell.cell_id
+        and client.row_index == cell.row_index
+        and client.column_index == cell.column_index
+        and client.row_span == cell.row_span
+        and client.column_span == cell.column_span
+        and client.table_geometry_evidence == table.geometry_evidence
+        and client.geometry_evidence == cell.geometry_evidence
+        and client.source_span_ids == cell.source_span_ids
+        and client.proven_edges == cell.proven_edges
+        and client.ownership == cell.ownership
+        and client.block_reason == cell.block_reason
+        and client.has_graphic_overlap == cell.has_graphic_overlap
+        and client.rotated_text == cell.rotated_text
+        and client.background_fill == cell.background_fill
+        and _optional_bbox_equal(client.table_bbox, table.bbox)
+        and _optional_bbox_equal(client.cell_bbox, cell.cell_bbox)
+        and _optional_bbox_equal(client.source_bbox, cell.source_bbox)
+        and _optional_bbox_equal(client.content_bbox, cell.content_bbox)
+    )
+
+
+def _optional_bbox_equal(left: BBox | None, right: BBox | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return _same_bbox(left, right)
+
+
+def _plan_provenance_cell(
+    page: pymupdf.Page,
+    table: TableProvenance,
+    provenance: TableCellProvenance,
+    source_text: str,
+    segment: PdfExportSegment,
+    typography: PdfTypographyResolver,
+    overlap_analyzer: PdfImageOverlapAnalyzer,
+) -> PdfTableCellReplacement:
+    base = _new_replacement(segment).model_dump()
+    base.update(
+        source_bbox=provenance.source_bbox,
+        original_bbox=provenance.source_bbox,
+        fitted_bbox=provenance.content_bbox,
+    )
+    cell = PdfTableCellReplacement(
+        **base,
+        table_id=table.table_id,
+        row_index=provenance.row_index,
+        column_index=provenance.column_index,
+        row_span=provenance.row_span,
+        column_span=provenance.column_span,
+        cell_bbox=provenance.cell_bbox,
+        content_bbox=provenance.content_bbox,
+        background_fill=provenance.background_fill,
+        border_clearance=0.5,
+        technical_value=is_technical_value(source_text),
+        cell_id=provenance.cell_id,
+        source_span_ids=list(provenance.source_span_ids),
+        geometry_evidence=provenance.geometry_evidence,
+        proven_edges=list(provenance.proven_edges),
+        ownership=provenance.ownership,
+        provenance_block_reason=provenance.block_reason,
+    )
+    if segment.status == "skipped":
+        return _not_applicable(cell, "Celica ni prevajalska enota za PDF izvoz.")
+    if provenance.ownership == "empty":
+        return _not_applicable(cell, "Prazna celica ostane del strukturnega modela.")
+    if provenance.row_span != 1 or provenance.column_span != 1:
+        return _skip(cell, "merged_cell_ambiguous", "Združena celica nima podprtega nedvoumnega razpona.")
+    if provenance.has_graphic_overlap:
+        return _skip(cell, "graphic_cell", "Celica vsebuje grafični element, polnilo ali swatch.")
+    if provenance.rotated_text:
+        return _skip(cell, "rotated_cell", "Rotirano besedilo v tabelni celici ni podprto.")
+    if provenance.ownership != "owned" or len(provenance.proven_edges) != 4:
+        reason: SkipReason = "span_crosses_cell_boundary" if provenance.block_reason == "span_crosses_cell_boundary" else "ambiguous_cell_membership"
+        return _skip(cell, reason, "Lastništvo besedila v celici ni dokazljivo enolično.")
+    if provenance.source_bbox is None or provenance.content_bbox is None or provenance.cell_bbox is None:
+        return _skip(cell, "missing_cell_bbox", "Celica nima vseh zahtevanih geometrijskih dokazov.")
+    if not provenance.source_span_ids:
+        return _skip(cell, "missing_table_provenance", "Celica nima dokazljive povezave z izvornimi spani.")
+    if canonical_text(source_text) != canonical_text(segment.source_text):
+        cell.source_match_status = "mismatch"
+        return _skip(cell, "source_text_mismatch", "Izvorno besedilo se ne ujema z dokazano vsebino celice.")
+    cell.source_match_status = "matched"
+    if segment.status != "reviewed":
+        return _skip(cell, "not_reviewed", "Celica ni ročno potrjena.")
+    if not segment.edited_translation.strip():
+        return _skip(cell, "empty_translation", "Potrjena celica nima prevoda.")
+    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
+        return _preserve_identical(cell)
+    if page.rotation != 0 or segment.source_rotation not in {0, None}:
+        return _skip(cell, "rotated_page", "Rotirana tabela ni podprta.")
+    if segment.source_text_origin != "native" or segment.source_page_type != "digital":
+        return _skip(cell, "ocr_only_source", "OCR oziroma nedigitalna celica zahteva ločen preverjeni potek.")
+    assessment = overlap_analyzer.analyze(
+        page,
+        _rect(provenance.source_bbox),
+        patch_clip=_rect(provenance.cell_bbox),
+        ignore_enclosing_drawings=True,
+        allow_opaque_vector_cover=True,
+    )
+    _apply_overlap_assessment(cell, assessment)
+    if assessment.kind != "none" and not assessment.safe_for_background_patch:
+        return _skip(cell, "image_overlap", _overlap_skip_message(assessment))
+    style, asset, warnings, line_count = typography.resolve(
+        page, _rect(provenance.source_bbox), segment, layout_rect=_rect(provenance.content_bbox),
+    )
+    cell.typography = style
+    cell.typography_warnings.extend(warnings)
+    cell.requested_font_size = style.font_size
+    cell.proposed_font_size = style.font_size
+    cell.text_color = _style_color(style.color)
+    cell.color = style.color
+    cell.alignment = style.alignment
+    cell.line_height = style.line_height
+    cell.original_line_count = line_count
+    cell.font_weight = "bold" if style.bold else "regular"
+    cell.font_style = "italic" if style.italic else "normal"
+    if asset is None:
+        cell.fit_strategy = "missing_glyph"
+        return _skip(cell, "missing_glyph", "Lokalni pisavi nimata vseh znakov prevoda.")
+    cell.font_family = asset.family
+    cell.proposed_font = asset.family
+    return cell
 
 
 def _is_empty_structural_table_cell(segment: PdfExportSegment) -> bool:
@@ -1117,7 +1357,8 @@ def _blocked_resolution(reason: SkipReason) -> str:
     if reason in {
         "complex_table", "duplicate_table_content", "ambiguous_cell_membership",
         "merged_cell_ambiguous", "missing_cell_bbox", "duplicate_cell_geometry",
-        "unsupported_table_structure",
+        "unsupported_table_structure", "missing_table_provenance", "stale_table_provenance",
+        "span_crosses_cell_boundary", "graphic_cell", "rotated_cell",
     }:
         return "blocked_table_structure"
     if reason.startswith("ocr_"):
@@ -1195,6 +1436,8 @@ def _summarize_tables(tables: list[PdfTableExportPlan]) -> PdfTableExportSummary
     ambiguous_reasons = {
         "ambiguous_cell_membership", "merged_cell_ambiguous", "missing_cell_bbox",
         "duplicate_cell_geometry", "unsupported_table_structure", "duplicate_table_content",
+        "missing_table_provenance", "stale_table_provenance", "span_crosses_cell_boundary",
+        "graphic_cell", "rotated_cell",
     }
     return PdfTableExportSummary(
         detected_tables=len([table for table in tables if table.bbox is not None]),

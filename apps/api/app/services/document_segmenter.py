@@ -23,6 +23,8 @@ from app.models import (
     PdfKind,
     RegionKind,
     SpanStyle,
+    TableCellProvenance,
+    TableProvenance,
 )
 
 TEXT_PAGE_THRESHOLD = 25
@@ -45,6 +47,7 @@ class RawLine:
     spans: list[DocumentSpan]
     region_kind: RegionKind
     column_index: int = 0
+    rotated: bool = False
 
     @property
     def x0(self) -> float:
@@ -65,8 +68,13 @@ class RawLine:
 
 @dataclass
 class RawTable:
+    page_number: int
     bbox: BBox
     cells: list[list[str]]
+    table_id: str = ""
+    cell_provenance: list[list[TableCellProvenance]] | None = None
+    geometry_evidence: str = "open_table"
+    warnings: list[str] | None = None
     order_span: int = 1
     derived_from_aligned_rows: bool = False
 
@@ -97,8 +105,10 @@ def segment_pdf(path: Path) -> DocumentModel:
             page_number = page_index + 1
             rect = page.rect
             extracted_lines = _extract_lines(page, page_number)
-            tables = _extract_tables(page)
-            tables.extend(_extract_gridless_tables(extracted_lines, tables, float(rect.height)))
+            tables = _extract_tables(page, extracted_lines, page_number)
+            tables.extend(_extract_gridless_tables(page, extracted_lines, tables, float(rect.height), page_number))
+            for table_index, table in enumerate(sorted(tables, key=lambda item: (item.bbox.y0, item.bbox.x0))):
+                table.table_id = f"p{page_number}-t{table_index + 1}"
             lines = _prepare_lines(extracted_lines)
             images = _extract_images(page)
             text_chars = sum(len(line.original_text.strip()) for line in lines)
@@ -178,11 +188,14 @@ def normalize_lines_with_boundaries(lines: list[str]) -> tuple[str, list[LineBou
 def _extract_lines(page: fitz.Page, page_number: int) -> list[RawLine]:
     payload = page.get_text("dict")
     lines: list[RawLine] = []
-    for block in payload.get("blocks", []):
+    for block_index, block in enumerate(payload.get("blocks", [])):
         if block.get("type") != 0:
             continue
-        for line in block.get("lines", []):
-            spans = [_span_from_payload(span) for span in line.get("spans", []) if span.get("text")]
+        for line_index, line in enumerate(block.get("lines", [])):
+            spans = [
+                _span_from_payload(span, f"p{page_number}-b{block_index + 1}-l{line_index + 1}-s{span_index + 1}")
+                for span_index, span in enumerate(line.get("spans", [])) if span.get("text")
+            ]
             original_text = "".join(span.text for span in spans)
             original_text = _normalize_spaces(original_text)
             if not original_text:
@@ -195,6 +208,7 @@ def _extract_lines(page: fitz.Page, page_number: int) -> list[RawLine]:
                     original_text=original_text,
                     spans=spans,
                     region_kind="body",
+                    rotated=tuple(round(float(value), 4) for value in line.get("dir", (1.0, 0.0))) != (1.0, 0.0),
                 )
             )
     return lines
@@ -266,7 +280,7 @@ def _merge_marker_lines(lines: list[RawLine]) -> list[RawLine]:
     return sorted(merged, key=lambda line: (line.y0, line.x0))
 
 
-def _extract_tables(page: fitz.Page) -> list[RawTable]:
+def _extract_tables(page: fitz.Page, lines: list[RawLine], page_number: int) -> list[RawTable]:
     if not hasattr(page, "find_tables"):
         return []
     try:
@@ -284,14 +298,56 @@ def _extract_tables(page: fitz.Page) -> list[RawTable]:
             cells = table.extract()
         except Exception:
             cells = []
-        cleaned_cells = _trim_empty_table_cells(
+        normalized_cells = _preserve_table_cells(
             [[_normalize_spaces(str(cell or "")) for cell in row] for row in cells]
         )
-        extracted.append(RawTable(bbox=_bbox(bbox), cells=cleaned_cells))
+        table_rect = fitz.Rect(bbox)
+        rows = list(getattr(table, "rows", []) or [])
+        cleaned_cells, source_row_indexes, source_column_indexes = _logical_table_cells(normalized_cells, rows)
+        x_edges = _logical_column_edges(rows, source_row_indexes, source_column_indexes)
+        y_edges = _logical_row_edges(rows, source_row_indexes)
+        provenance: list[list[TableCellProvenance]] = []
+        for row_index, row in enumerate(cleaned_cells):
+            source_row_index = source_row_indexes[row_index]
+            geometry_row = list(getattr(rows[source_row_index], "cells", []) or []) if source_row_index < len(rows) else []
+            provenance_row: list[TableCellProvenance] = []
+            for column_index, text in enumerate(row):
+                source_column_index = source_column_indexes[column_index]
+                value = geometry_row[source_column_index] if source_column_index < len(geometry_row) else None
+                cell_rect = fitz.Rect(value) if value else None
+                row_span = _covered_intervals(cell_rect.y0, cell_rect.y1, y_edges) if cell_rect else 1
+                column_span = _covered_intervals(cell_rect.x0, cell_rect.x1, x_edges) if cell_rect else 1
+                provenance_row.append(_cell_provenance(
+                    page,
+                    lines,
+                    page_number,
+                    row_index,
+                    column_index,
+                    text,
+                    cell_rect,
+                    "merged_cell" if row_span > 1 or column_span > 1 else "vector_grid",
+                    row_span=row_span,
+                    column_span=column_span,
+                ))
+            provenance.append(provenance_row)
+        extracted.append(RawTable(
+            page_number=page_number,
+            bbox=_bbox(table_rect),
+            cells=cleaned_cells,
+            cell_provenance=provenance,
+            geometry_evidence="vector_grid",
+            warnings=[],
+        ))
     return extracted
 
 
-def _extract_gridless_tables(lines: list[RawLine], existing: list[RawTable], page_height: float) -> list[RawTable]:
+def _extract_gridless_tables(
+    page: fitz.Page,
+    lines: list[RawLine],
+    existing: list[RawTable],
+    page_height: float,
+    page_number: int,
+) -> list[RawTable]:
     """Detect repeated aligned rows without relying on table ruling lines."""
     if len(lines) < 6:
         return []
@@ -332,8 +388,10 @@ def _extract_gridless_tables(lines: list[RawLine], existing: list[RawTable], pag
         ]
         body_size = median(body_sizes) if body_sizes else 0.0
         cells: list[list[str]] = []
+        assigned_rows: list[list[list[RawLine]]] = []
         for row in group:
             row_cells: list[list[str]] = [[] for _ in group_anchors]
+            row_lines: list[list[RawLine]] = [[] for _ in group_anchors]
             for line in sorted(row, key=lambda item: item.x0):
                 column = min(range(len(group_anchors)), key=lambda index: abs(line.x0 - group_anchors[index]))
                 text = line.original_text.strip()
@@ -341,17 +399,332 @@ def _extract_gridless_tables(lines: list[RawLine], existing: list[RawTable], pag
                     text = ""
                 if text:
                     row_cells[column].append(text)
+                    row_lines[column].append(line)
             cells.append([_normalize_spaces(" ".join(parts)) for parts in row_cells])
+            assigned_rows.append(row_lines)
         if len(group_anchors) == 2 and any(not any(row[index] for row in cells) for index in range(2)):
             continue
         populated_columns = [index for index in range(len(group_anchors)) if any(row[index] for row in cells)]
         if len(populated_columns) >= 2 and len(populated_columns) < len(group_anchors):
             cells = [[row[index] for index in populated_columns] for row in cells]
+            assigned_rows = [[row[index] for index in populated_columns] for row in assigned_rows]
+            group_anchors = [group_anchors[index] for index in populated_columns]
         occupancy = sum(bool(cell) for row in cells for cell in row) / max(1, len(cells) * len(cells[0]))
         if occupancy < 2 / 3:
             continue
-        tables.append(RawTable(bbox=bbox, cells=cells, derived_from_aligned_rows=True))
+        provenance = _aligned_grid_provenance(page, page_number, bbox, group_anchors, assigned_rows, cells)
+        tables.append(RawTable(
+            page_number=page_number,
+            bbox=bbox,
+            cells=cells,
+            cell_provenance=provenance,
+            geometry_evidence="aligned_grid",
+            warnings=[],
+            derived_from_aligned_rows=True,
+        ))
     return tables
+
+
+def _aligned_grid_provenance(
+    page: fitz.Page,
+    page_number: int,
+    table_bbox: BBox,
+    anchors: list[float],
+    assigned_rows: list[list[list[RawLine]]],
+    cells: list[list[str]],
+) -> list[list[TableCellProvenance]]:
+    all_lines = [line for row in assigned_rows for column in row for line in column]
+    if not assigned_rows or not anchors or not all_lines:
+        return []
+
+    left_edges = [min(line.x0 for line in all_lines) - 1.0]
+    column_boundaries_valid: list[bool] = []
+    for column in range(len(anchors) - 1):
+        left = [line.x1 for row in assigned_rows for line in row[column]]
+        right = [line.x0 for row in assigned_rows for line in row[column + 1]]
+        gap_left = max(left, default=anchors[column])
+        gap_right = min(right, default=anchors[column + 1])
+        column_boundaries_valid.append(gap_right - gap_left > 0.5)
+        left_edges.append((gap_left + gap_right) / 2 if gap_right > gap_left else (anchors[column] + anchors[column + 1]) / 2)
+    left_edges.append(max(line.x1 for line in all_lines) + 1.0)
+
+    row_lines = [[line for column in row for line in column] for row in assigned_rows]
+    top_edges = [min(line.y0 for line in all_lines) - 1.0]
+    row_boundaries_valid: list[bool] = []
+    for row_index in range(len(row_lines) - 1):
+        upper_bottom = max((line.y1 for line in row_lines[row_index]), default=top_edges[-1])
+        lower_top = min((line.y0 for line in row_lines[row_index + 1]), default=upper_bottom)
+        row_boundaries_valid.append(lower_top - upper_bottom > 0.25)
+        top_edges.append((upper_bottom + lower_top) / 2)
+    top_edges.append(max(line.y1 for line in all_lines) + 1.0)
+
+    output: list[list[TableCellProvenance]] = []
+    for row_index, row in enumerate(cells):
+        output_row: list[TableCellProvenance] = []
+        for column_index, text in enumerate(row):
+            rect = fitz.Rect(
+                left_edges[column_index],
+                top_edges[row_index],
+                left_edges[column_index + 1],
+                top_edges[row_index + 1],
+            )
+            lines = assigned_rows[row_index][column_index]
+            source_spans = [span for line in lines for span in line.spans]
+            crosses_boundary = any(not _rect_contains_bbox(rect, span.bbox, 0.15) for span in source_spans)
+            boundary_valid = (
+                (column_index == 0 or column_boundaries_valid[column_index - 1])
+                and (column_index == len(row) - 1 or column_boundaries_valid[column_index])
+                and (row_index == 0 or row_boundaries_valid[row_index - 1])
+                and (row_index == len(cells) - 1 or row_boundaries_valid[row_index])
+            )
+            graphic_overlap = _has_cell_graphic_overlap(page, rect)
+            rotated = any(line.rotated for line in lines)
+            if not text and not source_spans:
+                ownership = "empty"
+                block_reason = None
+            elif not boundary_valid:
+                ownership = "ambiguous"
+                block_reason = "ambiguous_cell_boundary"
+            elif crosses_boundary:
+                ownership = "ambiguous"
+                block_reason = "span_crosses_cell_boundary"
+            elif rotated:
+                ownership = "unsupported"
+                block_reason = "rotated_text"
+            elif graphic_overlap:
+                ownership = "unsupported"
+                block_reason = "graphic_overlap"
+            elif source_spans:
+                ownership = "owned"
+                block_reason = None
+            else:
+                ownership = "ambiguous"
+                block_reason = "missing_source_spans"
+            content = _inset_bbox(rect, 0.5)
+            source_bbox = _union_bbox([span.bbox for span in source_spans]) if source_spans else None
+            output_row.append(TableCellProvenance(
+                cell_id=f"p{page_number}-pending-r{row_index + 1}-c{column_index + 1}",
+                row_index=row_index,
+                column_index=column_index,
+                cell_bbox=_bbox(rect),
+                source_bbox=source_bbox,
+                content_bbox=_bbox(content) if content else None,
+                source_span_ids=[span.span_id for span in source_spans],
+                geometry_evidence="aligned_grid",
+                proven_edges=["top", "right", "bottom", "left"] if boundary_valid else [],
+                ownership=ownership,
+                block_reason=block_reason,
+                has_graphic_overlap=graphic_overlap,
+                rotated_text=rotated,
+                background_fill=_cell_background_fill(page, rect),
+            ))
+        output.append(output_row)
+    return output
+
+
+def _cell_provenance(
+    page: fitz.Page,
+    lines: list[RawLine],
+    page_number: int,
+    row_index: int,
+    column_index: int,
+    text: str,
+    cell_rect: fitz.Rect | None,
+    evidence: str,
+    *,
+    row_span: int = 1,
+    column_span: int = 1,
+) -> TableCellProvenance:
+    if cell_rect is None:
+        return TableCellProvenance(
+            cell_id=f"p{page_number}-pending-r{row_index + 1}-c{column_index + 1}",
+            row_index=row_index,
+            column_index=column_index,
+            row_span=row_span,
+            column_span=column_span,
+            geometry_evidence="partial_grid",
+            ownership="empty" if not text else "unsupported",
+            block_reason=None if not text else "missing_cell_bbox",
+        )
+    owned_lines = [
+        line for line in lines
+        if cell_rect.contains(((line.x0 + line.x1) / 2, (line.y0 + line.y1) / 2))
+    ]
+    spans = [span for line in owned_lines for span in line.spans]
+    span_bbox = _union_bbox([span.bbox for span in spans]) if spans else None
+    refined_rect = _text_enclosing_fill_rect(page, cell_rect, span_bbox)
+    proof_rect = refined_rect or cell_rect
+    proven_edges = _proven_vector_edges(page, proof_rect)
+    crosses_boundary = any(not _rect_contains_bbox(cell_rect, span.bbox, 0.15) for span in spans)
+    rotated = any(line.rotated for line in owned_lines)
+    graphic_overlap = _has_cell_graphic_overlap(page, cell_rect)
+    if row_span > 1 or column_span > 1:
+        ownership = "unsupported"
+        block_reason = "merged_cell"
+    elif len(proven_edges) != 4:
+        ownership = "ambiguous"
+        block_reason = "missing_cell_edge"
+    elif not text and not spans:
+        ownership = "empty"
+        block_reason = None
+    elif crosses_boundary:
+        ownership = "ambiguous"
+        block_reason = "span_crosses_cell_boundary"
+    elif rotated:
+        ownership = "unsupported"
+        block_reason = "rotated_text"
+    elif graphic_overlap:
+        ownership = "unsupported"
+        block_reason = "graphic_overlap"
+    elif spans:
+        ownership = "owned"
+        block_reason = None
+    else:
+        ownership = "ambiguous"
+        block_reason = "missing_source_spans"
+    content = _inset_bbox(cell_rect, 0.5)
+    source_bbox = span_bbox
+    return TableCellProvenance(
+        cell_id=f"p{page_number}-pending-r{row_index + 1}-c{column_index + 1}",
+        row_index=row_index,
+        column_index=column_index,
+        row_span=row_span,
+        column_span=column_span,
+        cell_bbox=_bbox(cell_rect),
+        source_bbox=source_bbox,
+        content_bbox=_bbox(content) if content else None,
+        source_span_ids=[span.span_id for span in spans],
+        geometry_evidence="partial_grid" if len(proven_edges) != 4 and evidence == "vector_grid" else evidence,
+        proven_edges=proven_edges,
+        ownership=ownership,
+        block_reason=block_reason,
+        has_graphic_overlap=graphic_overlap,
+        rotated_text=rotated,
+        background_fill=_cell_background_fill(page, cell_rect),
+    )
+
+
+def _rect_contains_bbox(rect: fitz.Rect, bbox: BBox, tolerance: float) -> bool:
+    return (
+        bbox.x0 >= rect.x0 - tolerance
+        and bbox.y0 >= rect.y0 - tolerance
+        and bbox.x1 <= rect.x1 + tolerance
+        and bbox.y1 <= rect.y1 + tolerance
+    )
+
+
+def _inset_bbox(rect: fitz.Rect, amount: float) -> fitz.Rect | None:
+    inset = fitz.Rect(rect.x0 + amount, rect.y0 + amount, rect.x1 - amount, rect.y1 - amount)
+    return inset if not inset.is_empty else None
+
+
+def _has_cell_graphic_overlap(page: fitz.Page, rect: fitz.Rect) -> bool:
+    inner = _inset_bbox(rect, 0.75) or rect
+    drawings = page.get_drawings()
+    for image in page.get_image_info(xrefs=True):
+        if (fitz.Rect(image["bbox"]) & inner).is_empty:
+            continue
+        image_sequence = int(image.get("seqno", -1))
+        covered = any(
+            drawing.get("fill") is not None
+            and int(drawing.get("seqno", -1)) > image_sequence
+            and ((fitz.Rect(drawing["rect"]) & inner).get_area() / max(1.0, inner.get_area())) >= 0.9
+            for drawing in drawings
+        )
+        if not covered:
+            return True
+    for drawing in drawings:
+        fill = drawing.get("fill")
+        drawing_rect = fitz.Rect(drawing["rect"])
+        intersection = drawing_rect & inner
+        if fill is not None and not intersection.is_empty and intersection.get_area() > 1.0:
+            coverage = intersection.get_area() / max(1.0, inner.get_area())
+            if coverage < 0.9:
+                return True
+    return False
+
+
+def _cell_background_fill(page: fitz.Page, rect: fitz.Rect) -> str | None:
+    inner = _inset_bbox(rect, 0.75) or rect
+    candidates: list[tuple[float, tuple[float, ...]]] = []
+    for drawing in page.get_drawings():
+        fill = drawing.get("fill")
+        if fill is None:
+            continue
+        intersection = fitz.Rect(drawing["rect"]) & inner
+        coverage = intersection.get_area() / max(1.0, inner.get_area())
+        if coverage >= 0.9:
+            candidates.append((fitz.Rect(drawing["rect"]).get_area(), fill))
+    if not candidates:
+        return None
+    _area, fill = min(candidates, key=lambda item: item[0])
+    return "#" + "".join(f"{round(max(0, min(1, value)) * 255):02x}" for value in fill[:3])
+
+
+def _proven_vector_edges(page: fitz.Page, rect: fitz.Rect) -> list[str]:
+    segments: list[tuple[fitz.Point, fitz.Point]] = []
+    for drawing in page.get_drawings():
+        if drawing.get("color") is None and drawing.get("fill") is None:
+            continue
+        for item in drawing.get("items", []):
+            if item[0] == "l" and drawing.get("color") is not None:
+                segments.append((fitz.Point(item[1]), fitz.Point(item[2])))
+            elif item[0] == "re":
+                box = fitz.Rect(item[1])
+                segments.extend([
+                    (box.tl, box.tr), (box.tr, box.br),
+                    (box.br, box.bl), (box.bl, box.tl),
+                ])
+
+    tolerance = 0.75
+
+    def horizontal(y: float, start: float, end: float) -> bool:
+        return any(
+            abs(first.y - second.y) <= tolerance
+            and abs(first.y - y) <= tolerance
+            and min(first.x, second.x) <= start + tolerance
+            and max(first.x, second.x) >= end - tolerance
+            for first, second in segments
+        )
+
+    def vertical(x: float, start: float, end: float) -> bool:
+        return any(
+            abs(first.x - second.x) <= tolerance
+            and abs(first.x - x) <= tolerance
+            and min(first.y, second.y) <= start + tolerance
+            and max(first.y, second.y) >= end - tolerance
+            for first, second in segments
+        )
+
+    checks = [
+        ("top", horizontal(rect.y0, rect.x0, rect.x1)),
+        ("right", vertical(rect.x1, rect.y0, rect.y1)),
+        ("bottom", horizontal(rect.y1, rect.x0, rect.x1)),
+        ("left", vertical(rect.x0, rect.y0, rect.y1)),
+    ]
+    return [name for name, present in checks if present]
+
+
+def _text_enclosing_fill_rect(page: fitz.Page, cell_rect: fitz.Rect, source_bbox: BBox | None) -> fitz.Rect | None:
+    if source_bbox is None:
+        return None
+    source = _rect_from_bbox(source_bbox)
+    candidates: list[fitz.Rect] = []
+    for drawing in page.get_drawings():
+        if drawing.get("fill") is None:
+            continue
+        for item in drawing.get("items", []):
+            if item[0] != "re":
+                continue
+            rect = fitz.Rect(item[1])
+            ratio = rect.get_area() / max(1.0, cell_rect.get_area())
+            if 0.5 <= ratio <= 1.2 and rect.contains(source) and not (rect & cell_rect).is_empty:
+                candidates.append(rect)
+    return min(candidates, key=lambda rect: rect.get_area(), default=None)
+
+
+def _rect_from_bbox(bbox: BBox) -> fitz.Rect:
+    return fitz.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
 
 
 def _cluster_visual_rows(lines: list[RawLine]) -> list[list[RawLine]]:
@@ -753,6 +1126,7 @@ def _make_list_item_blocks(line: RawLine, body_size: float, start_order: int) ->
             spans=line.spans,
             region_kind=line.region_kind,
             column_index=line.column_index,
+            rotated=line.rotated,
         )
         blocks.append(_make_text_block([item_line], body_size, start_order + index, forced_kind="list_item"))
     return blocks
@@ -760,6 +1134,11 @@ def _make_list_item_blocks(line: RawLine, body_size: float, start_order: int) ->
 
 def _make_table_block(table: RawTable, reading_order: int) -> DocumentBlock:
     text = "\n".join("\t".join(cell for cell in row) for row in table.cells)
+    provenance_cells = [
+        cell.model_copy(update={"cell_id": f"{table.table_id}-r{cell.row_index + 1}-c{cell.column_index + 1}"})
+        for row in (table.cell_provenance or [])
+        for cell in row
+    ]
     return DocumentBlock(
         kind="table",
         bbox=table.bbox,
@@ -769,6 +1148,15 @@ def _make_table_block(table: RawTable, reading_order: int) -> DocumentBlock:
         style=SpanStyle(),
         reading_order=reading_order,
         table_cells=table.cells,
+        table_provenance=TableProvenance(
+            table_id=table.table_id,
+            bbox=table.bbox,
+            row_count=len(table.cells),
+            column_count=max((len(row) for row in table.cells), default=0),
+            geometry_evidence=table.geometry_evidence,
+            cells=provenance_cells,
+            warnings=list(table.warnings or []),
+        ),
     )
 
 
@@ -813,6 +1201,7 @@ def _merge_lines(lines: list[RawLine], separator: str = " ") -> RawLine:
         spans=spans,
         region_kind=ordered[0].region_kind,
         column_index=ordered[0].column_index,
+        rotated=any(line.rotated for line in ordered),
     )
 
 
@@ -858,19 +1247,73 @@ def _row_key(y: float) -> int:
     return int(round(y / 4.0))
 
 
-def _trim_empty_table_cells(rows: list[list[str]]) -> list[list[str]]:
-    non_empty_rows = [row for row in rows if any(cell.strip() for cell in row)]
-    if not non_empty_rows:
+def _preserve_table_cells(rows: list[list[str]]) -> list[list[str]]:
+    if not rows:
         return []
+    max_columns = max((len(row) for row in rows), default=0)
+    return [row + [""] * (max_columns - len(row)) for row in rows]
 
-    max_columns = max(len(row) for row in non_empty_rows)
-    padded = [row + [""] * (max_columns - len(row)) for row in non_empty_rows]
-    keep_columns = [
-        column_index
-        for column_index in range(max_columns)
-        if any(row[column_index].strip() for row in padded)
+
+def _logical_table_cells(rows: list[list[str]], geometry_rows: list[Any]) -> tuple[list[list[str]], list[int], list[int]]:
+    source_row_indexes = [index for index, row in enumerate(rows) if any(cell.strip() for cell in row)]
+    if not source_row_indexes:
+        source_row_indexes = list(range(len(rows)))
+    column_count = max((len(row) for row in rows), default=0)
+    source_column_indexes: list[int] = []
+    for column_index in range(column_count):
+        has_text = any(
+            column_index < len(rows[row_index]) and bool(rows[row_index][column_index].strip())
+            for row_index in source_row_indexes
+        )
+        widths = []
+        for row_index in source_row_indexes:
+            geometry_row = list(getattr(geometry_rows[row_index], "cells", []) or []) if row_index < len(geometry_rows) else []
+            value = geometry_row[column_index] if column_index < len(geometry_row) else None
+            if value:
+                widths.append(fitz.Rect(value).width)
+        if has_text or (widths and median(widths) >= 8.0):
+            source_column_indexes.append(column_index)
+    cleaned = [
+        [rows[row_index][column_index] for column_index in source_column_indexes]
+        for row_index in source_row_indexes
     ]
-    return [[row[column_index] for column_index in keep_columns] for row in padded]
+    return cleaned, source_row_indexes, source_column_indexes
+
+
+def _logical_column_edges(geometry_rows: list[Any], row_indexes: list[int], column_indexes: list[int]) -> list[float]:
+    columns: list[list[fitz.Rect]] = []
+    for column_index in column_indexes:
+        values: list[fitz.Rect] = []
+        for row_index in row_indexes:
+            row = list(getattr(geometry_rows[row_index], "cells", []) or []) if row_index < len(geometry_rows) else []
+            if column_index < len(row) and row[column_index]:
+                values.append(fitz.Rect(row[column_index]))
+        columns.append(values)
+    if not columns or any(not values for values in columns):
+        return []
+    edges = [min(rect.x0 for rect in columns[0])]
+    for left, right in zip(columns, columns[1:]):
+        edges.append((max(rect.x1 for rect in left) + min(rect.x0 for rect in right)) / 2)
+    edges.append(max(rect.x1 for rect in columns[-1]))
+    return edges
+
+
+def _logical_row_edges(geometry_rows: list[Any], row_indexes: list[int]) -> list[float]:
+    rows = [
+        [fitz.Rect(value) for value in (getattr(geometry_rows[index], "cells", []) or []) if value]
+        for index in row_indexes
+    ]
+    if not rows or any(not values for values in rows):
+        return []
+    edges = [min(rect.y0 for rect in rows[0])]
+    for upper, lower in zip(rows, rows[1:]):
+        edges.append((max(rect.y1 for rect in upper) + min(rect.y0 for rect in lower)) / 2)
+    edges.append(max(rect.y1 for rect in rows[-1]))
+    return edges
+
+
+def _covered_intervals(start: float, end: float, edges: list[float]) -> int:
+    return max(1, sum(start <= left + 0.25 and end >= right - 0.25 for left, right in zip(edges, edges[1:])))
 
 
 def _split_inline_list_items(text: str) -> list[str]:
@@ -954,10 +1397,11 @@ def _dominant_font_size(line: RawLine) -> float:
     return float(median(sizes)) if sizes else 12.0
 
 
-def _span_from_payload(span: dict[str, Any]) -> DocumentSpan:
+def _span_from_payload(span: dict[str, Any], span_id: str) -> DocumentSpan:
     font = span.get("font")
     flags = int(span.get("flags") or 0)
     return DocumentSpan(
+        span_id=span_id,
         text=str(span.get("text") or ""),
         bbox=_bbox(span.get("bbox")),
         font=str(font) if font is not None else None,

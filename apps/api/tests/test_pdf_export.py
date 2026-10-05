@@ -423,7 +423,7 @@ def test_bbox_touching_page_edge_remains_valid(tmp_path: Path) -> None:
     ("changes", "reason"),
     [
         ({"source_page_type": "scanned"}, "non_digital_source"),
-        ({"block_type": "table_cell", "source_bbox": None}, "ambiguous_cell_membership"),
+        ({"block_type": "table_cell", "source_bbox": None}, "missing_table_provenance"),
     ],
 )
 def test_ambiguous_sources_are_skipped(tmp_path: Path, changes: dict, reason: str) -> None:

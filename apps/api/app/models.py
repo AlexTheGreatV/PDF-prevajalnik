@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field
 PdfKind = Literal["digital", "scanned", "mixed", "empty"]
 RegionKind = Literal["header", "footer", "column", "table", "body", "unknown"]
 BlockKind = Literal["heading", "paragraph", "list", "list_item", "table", "caption", "unknown"]
+TableGeometryEvidence = Literal["vector_grid", "aligned_grid", "partial_grid", "open_table", "merged_cell", "conflicting_graphics"]
+TableEdge = Literal["top", "right", "bottom", "left"]
+TableOwnership = Literal["owned", "empty", "ambiguous", "unsupported"]
 OcrReason = Literal[
     "scanned_page",
     "low_native_text_coverage",
@@ -84,6 +87,7 @@ class SpanStyle(BaseModel):
 
 
 class DocumentSpan(BaseModel):
+    span_id: str
     text: str
     bbox: BBox
     font: str | None = None
@@ -107,6 +111,35 @@ class LineBoundary(BaseModel):
     warning: str | None = None
 
 
+class TableCellProvenance(BaseModel):
+    cell_id: str
+    row_index: int = Field(ge=0)
+    column_index: int = Field(ge=0)
+    row_span: int = Field(default=1, ge=1)
+    column_span: int = Field(default=1, ge=1)
+    cell_bbox: BBox | None = None
+    source_bbox: BBox | None = None
+    content_bbox: BBox | None = None
+    source_span_ids: list[str] = Field(default_factory=list)
+    geometry_evidence: TableGeometryEvidence
+    proven_edges: list[TableEdge] = Field(default_factory=list)
+    ownership: TableOwnership
+    block_reason: str | None = None
+    has_graphic_overlap: bool = False
+    rotated_text: bool = False
+    background_fill: str | None = None
+
+
+class TableProvenance(BaseModel):
+    table_id: str
+    bbox: BBox
+    row_count: int = Field(ge=0)
+    column_count: int = Field(ge=0)
+    geometry_evidence: TableGeometryEvidence
+    cells: list[TableCellProvenance] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class DocumentBlock(BaseModel):
     kind: BlockKind
     bbox: BBox
@@ -120,6 +153,7 @@ class DocumentBlock(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     needs_ocr_check: bool = False
     table_cells: list[list[str]] | None = None
+    table_provenance: TableProvenance | None = None
     ocr_candidates: list["OcrCandidate"] = Field(default_factory=list)
     selected_text_source: Literal["native", "ocr", "manual_review"] = "native"
     native_text: str | None = None

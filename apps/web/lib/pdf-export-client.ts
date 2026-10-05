@@ -1,5 +1,5 @@
 import { apiBaseUrl } from "./pdf-client";
-import type { BBox } from "./pdf-types";
+import type { BBox, TableGeometryEvidence, TableOwnership } from "./pdf-types";
 import type { TranslationJob } from "./translation-types";
 import { isTranslationUnitSegment } from "./translation-units";
 
@@ -75,6 +75,12 @@ export type PdfTableCellReplacement = PdfExportReplacement & {
   background_fill: string | null;
   border_clearance: number;
   technical_value: boolean;
+  cell_id: string | null;
+  source_span_ids: string[];
+  geometry_evidence: TableGeometryEvidence | null;
+  proven_edges: string[];
+  ownership: TableOwnership | null;
+  provenance_block_reason: string | null;
 };
 
 export type PdfTableExportPlan = {

@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.models import BBox, PdfKind, SpanStyle
+from app.models import BBox, PdfKind, SpanStyle, TableCellProvenance, TableGeometryEvidence
 
 ExportMode = Literal["diagnostic", "replacement_preview"]
 ExportResolution = Literal[
@@ -48,6 +48,11 @@ SkipReason = Literal[
     "missing_cell_bbox",
     "duplicate_cell_geometry",
     "unsupported_table_structure",
+    "missing_table_provenance",
+    "stale_table_provenance",
+    "span_crosses_cell_boundary",
+    "graphic_cell",
+    "rotated_cell",
     "cell_overflow",
     "rotated_page",
     "source_text_mismatch",
@@ -99,6 +104,13 @@ class OcrReviewAcceptance(BaseModel):
     revision_id: str = Field(min_length=1, max_length=100)
 
 
+class PdfTableCellProvenance(TableCellProvenance):
+    table_id: str = Field(min_length=1, max_length=200)
+    table_bbox: BBox
+    table_geometry_evidence: TableGeometryEvidence
+    table_warnings: list[str] = Field(default_factory=list)
+
+
 class PdfExportSegment(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -112,6 +124,7 @@ class PdfExportSegment(BaseModel):
     source_page_type: PdfKind | None = None
     source_rotation: int | None = None
     source_style: SpanStyle | None = None
+    table_cell_provenance: PdfTableCellProvenance | None = None
     accepted_ocr_source: AcceptedOcrSource | None = None
     edited_translation: str = Field(max_length=200_000)
     status: Literal["pending", "translating", "translated", "reviewed", "failed", "skipped"]
@@ -121,7 +134,7 @@ class PdfExportSegment(BaseModel):
 class PdfExportJob(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    schema_version: Literal[4, 5, 6, 7, 8]
+    schema_version: Literal[4, 5, 6, 7, 8, 9]
     source_filename: str
     document_identity: PdfDocumentIdentity
     segments: list[PdfExportSegment] = Field(max_length=10_000)
@@ -216,6 +229,12 @@ class PdfTableCellReplacement(PdfReplacement):
     background_fill: str | None = None
     border_clearance: float = 0.0
     technical_value: bool = False
+    cell_id: str | None = None
+    source_span_ids: list[str] = Field(default_factory=list)
+    geometry_evidence: TableGeometryEvidence | None = None
+    proven_edges: list[str] = Field(default_factory=list)
+    ownership: str | None = None
+    provenance_block_reason: str | None = None
 
 
 class PdfTableExportPlan(BaseModel):

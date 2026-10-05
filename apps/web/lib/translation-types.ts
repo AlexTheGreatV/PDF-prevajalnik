@@ -1,4 +1,7 @@
-import type { BBox, PdfKind, StructuredBlockKind, StructuredStyle } from "./pdf-types";
+import type {
+  BBox, PdfKind, StructuredBlockKind, StructuredStyle,
+  StructuredTableCellProvenance, TableGeometryEvidence,
+} from "./pdf-types";
 import type { TechnicalRange, TechnicalRangeKind } from "./technical-ranges";
 import type {
   TranslationProfileSnapshot,
@@ -16,6 +19,12 @@ export type AcceptedOcrSource = {
   reason: string;
 };
 export type TranslationOrigin = "glossary" | "translation_memory" | "provider" | "mixed" | "manual" | null;
+export type TableCellSourceProvenance = StructuredTableCellProvenance & {
+  table_id: string;
+  table_bbox: BBox;
+  table_geometry_evidence: TableGeometryEvidence;
+  table_warnings: string[];
+};
 export type GlossaryMode = "exact_segment" | "do_not_translate" | "preferred" | "locked_inline";
 export type GlossaryOrigin = "built_in" | "user";
 export type GlossaryScope = "document" | "persistent_user" | "built_in";
@@ -138,6 +147,7 @@ export type TranslationSegment = {
   source_page_type: PdfKind | null;
   source_rotation: number | null;
   source_style: StructuredStyle | null;
+  table_cell_provenance?: TableCellSourceProvenance | null;
   accepted_ocr_source?: AcceptedOcrSource | null;
   translated_text: string;
   edited_translation: string;
@@ -166,7 +176,7 @@ export type TranslationSegment = {
 };
 
 export type TranslationJob = {
-  schema_version: 8;
+  schema_version: 9;
   source_filename: string;
   source_language: string;
   target_language: string;
