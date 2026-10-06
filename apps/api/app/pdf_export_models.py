@@ -210,6 +210,7 @@ class PdfReplacement(BaseModel):
     background_metrics: PdfBackgroundMetrics | None = None
     image_overlap_warnings: list[str] = Field(default_factory=list)
     fitted_font_size: float | None = None
+    layout_text: str | None = None
     fit_status: FitStatus
     eligible: bool = False
     resolution: ExportResolution = "blocked_other"
@@ -228,6 +229,8 @@ class PdfTableCellReplacement(PdfReplacement):
     source_match_status: Literal["matched", "mismatch", "not_checked"] = "not_checked"
     background_fill: str | None = None
     border_clearance: float = 0.0
+    source_font_size: float | None = None
+    source_font_sizes: list[float] = Field(default_factory=list)
     technical_value: bool = False
     cell_id: str | None = None
     source_span_ids: list[str] = Field(default_factory=list)

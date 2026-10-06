@@ -9,9 +9,17 @@ import pytest
 from PIL import Image, ImageChops, ImageDraw
 
 from app.pdf_export_models import PdfExportJob
-from app.services.pdf_exporter import export_translated_pdf, plan_pdf_export
+from app.services.pdf_exporter import (
+    _balanced_table_layouts,
+    _protect_table_layout_text,
+    _table_minimum_scale,
+    _verified_table_source_font_size,
+    export_translated_pdf,
+    plan_pdf_export,
+)
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_table_export import PdfTableAnalyzer, is_technical_value
+from app.services.pdf_typography import PdfTypographyResolver
 
 
 def test_regular_table_exports_cells_and_preserves_grid_and_fill(tmp_path: Path) -> None:
@@ -111,6 +119,171 @@ def test_multiline_scale_and_cell_overflow_are_isolated(tmp_path: Path) -> None:
     assert artifact.plan.tables[0].partial_export is True
     with pymupdf.open(artifact.path) as document:
         assert "Values" in document[0].get_text()
+
+
+def test_source_proven_small_table_font_is_retained_but_never_reduced(tmp_path: Path) -> None:
+    source = tmp_path / "small-source-font.pdf"
+    _make_table(source, font_size=5.0, row_height=24)
+
+    retained = plan_pdf_export(
+        source, _job(source, translations={(0, 0): "Lastnost"}), "replacement_preview", tmp_path / "retained",
+    ).tables[0].cells[0]
+    assert retained.eligible is True
+    assert retained.source_font_size == pytest.approx(5.0)
+    assert retained.fitted_font_size == pytest.approx(5.0)
+    assert _table_minimum_scale(retained) == pytest.approx(1.0)
+    assert retained.source_font_size * 0.98 == pytest.approx(4.9)
+
+    blocked = plan_pdf_export(
+        source,
+        _job(source, translations={(0, 0): "X" * 80}),
+        "replacement_preview",
+        tmp_path / "blocked",
+    ).tables[0].cells[0]
+    assert blocked.eligible is False
+    assert blocked.skip_reason == "cell_overflow"
+
+
+def test_table_font_above_minimum_never_scales_below_5_5_points(tmp_path: Path) -> None:
+    source = tmp_path / "six-point-source.pdf"
+    _make_table(source, font_size=6.0, row_height=24)
+    cell = plan_pdf_export(
+        source,
+        _job(source, translations={(0, 0): "Daljši varen prevod lastnosti"}),
+        "replacement_preview",
+        tmp_path / "work",
+    ).tables[0].cells[0]
+    assert not cell.eligible or cell.fitted_font_size >= 5.5
+
+
+def test_table_minimum_scale_uses_server_verified_source_size(tmp_path: Path) -> None:
+    source = tmp_path / "verified-source-size.pdf"
+    _make_table(source, font_size=8.0)
+    cell = plan_pdf_export(
+        source, _job(source, translations={(0, 0): "Lastnost"}), "replacement_preview", tmp_path / "work",
+    ).tables[0].cells[0]
+    cell.requested_font_size = 10.0
+
+    assert cell.source_font_size == pytest.approx(8.0)
+    assert _table_minimum_scale(cell) == pytest.approx(0.6)
+
+
+@pytest.mark.parametrize("size", [-1.0, 0.0, float("nan"), float("inf"), 72.1])
+def test_invalid_server_observed_source_font_size_blocks_provenance(tmp_path: Path, size: float) -> None:
+    font_dir = tmp_path / "fonts"
+    font_dir.mkdir()
+    resolver = PdfTypographyResolver(font_dir)
+
+    class FakePage:
+        def get_text(self, *_args, **_kwargs):
+            return {"blocks": [{"lines": [{"spans": [{"text": "Source", "size": size}]}]}]}
+
+    assert resolver.source_font_sizes(FakePage(), pymupdf.Rect(0, 0, 100, 20)) == []
+
+
+def test_materially_mixed_source_font_sizes_are_not_collapsed_to_one_size() -> None:
+    assert _verified_table_source_font_size([9.0, 9.03]) == pytest.approx(9.03)
+    assert _verified_table_source_font_size([5.0, 9.0]) is None
+    assert _verified_table_source_font_size([float("inf")]) is None
+
+
+def test_materially_mixed_server_source_sizes_block_the_table_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "mixed-source-fonts.pdf"
+    _make_table(source)
+    monkeypatch.setattr(PdfTypographyResolver, "source_font_sizes", lambda *_args: [5.0, 9.0])
+
+    cell = plan_pdf_export(
+        source, _job(source, translations={(0, 0): "Lastnost"}), "replacement_preview", tmp_path / "work",
+    ).tables[0].cells[0]
+
+    assert cell.eligible is False
+    assert cell.skip_reason == "missing_table_provenance"
+    assert cell.source_font_sizes == [5.0, 9.0]
+    assert cell.source_font_size is None
+
+
+def test_table_wrap_uses_two_lines_and_preserves_unbreakable_technical_tokens(tmp_path: Path) -> None:
+    source = tmp_path / "safe-wrap.pdf"
+    _make_table(source, row_height=34)
+    translation = "Temperatura premaza RAL 9001 pri uporabi nad 20 °C"
+    artifact = export_translated_pdf(
+        source, _job(source, translations={(0, 0): translation}), "replacement_preview", tmp_path / "work",
+    )
+    cell = artifact.plan.tables[0].cells[0]
+    assert cell.eligible is True
+    assert cell.fitted_line_count is not None and cell.fitted_line_count >= 2
+    assert "RAL\u00a09001" in cell.layout_text
+    assert "20\u00a0°C" in cell.layout_text
+    assert "RAL\n9001" not in cell.layout_text
+    assert "20\n°C" not in cell.layout_text
+    with pymupdf.open(artifact.path) as document:
+        extracted = " ".join(document[0].get_text().split())
+        assert translation in extracted
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["5 mm", "10 %", "RAL 9001", "SIST EN 1234", "-40 °C do +90 °C", "ACME MS65 Panel Bond"],
+)
+def test_table_layout_protects_technical_units_codes_ranges_and_product_names(value: str) -> None:
+    protected = _protect_table_layout_text(value)
+    assert " " not in protected
+    assert "\u00a0" in protected
+
+
+def test_table_layout_does_not_split_an_unspaced_technical_code() -> None:
+    technical_code = "ABC-1234-X"
+
+    assert _protect_table_layout_text(technical_code) == technical_code
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["https://example.test/a-b", "user@example.test", "__PHX_12__", "ABC-1234-X"],
+)
+def test_table_layout_never_splits_urls_email_placeholders_or_codes(token: str) -> None:
+    layouts = _balanced_table_layouts(f"Predpona {token} pripona z dodatnim besedilom")
+
+    assert all(layout.count(token) == 1 for layout in layouts)
+    assert all(layout.replace("\n", " ") == layouts[0] for layout in layouts)
+
+
+def test_client_source_style_cannot_forge_source_font_size(tmp_path: Path) -> None:
+    source = tmp_path / "forged-source-style.pdf"
+    _make_table(source, font_size=9.0)
+    payload = _job_payload(source)
+    payload["segments"][0]["source_style"] = {"font_size": 4.0}
+    payload["segments"][0].update(status="reviewed", edited_translation="Lastnost")
+
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "work")
+
+    cell = plan.tables[0].cells[0]
+    assert cell.source_font_size == pytest.approx(9.0)
+    assert cell.requested_font_size == pytest.approx(9.0)
+
+
+def test_table_preflight_and_writer_share_layout_without_clipping_diacritics(tmp_path: Path) -> None:
+    source = tmp_path / "diacritics.pdf"
+    _make_table(source, row_height=34)
+    before_drawings = _drawing_signature(source)
+    translation = "Čvrsta zaščita ščiti žleb"
+
+    artifact = export_translated_pdf(
+        source, _job(source, translations={(0, 0): translation}), "replacement_preview", tmp_path / "work",
+    )
+
+    cell = artifact.plan.tables[0].cells[0]
+    assert cell.eligible is True
+    assert cell.line_height >= 1.0
+    assert cell.fitted_bbox.x0 >= cell.cell_bbox.x0
+    assert cell.fitted_bbox.x1 <= cell.cell_bbox.x1
+    assert cell.fitted_bbox.y0 >= cell.cell_bbox.y0
+    assert cell.fitted_bbox.y1 <= cell.cell_bbox.y1
+    assert _drawing_signature(artifact.path) == before_drawings
+    with pymupdf.open(artifact.path) as document:
+        assert translation in " ".join(document[0].get_text().split())
 
 
 def test_empty_and_none_cells_remain_in_grid_but_not_in_replacement_plan(tmp_path: Path) -> None:
@@ -372,6 +545,7 @@ def _make_table(
     *,
     values: tuple[str, str, str, str] = ("Properties", "Values", "Material", "MS Polymer"),
     row_height: float = 50,
+    font_size: float = 9,
     merged_header: bool = False,
     alignments: tuple[int, int, int] = (0, 1, 2),
     text_colors: tuple[tuple[float, float, float], tuple[float, float, float]] = ((0, 0, 0), (0, 0, 0)),
@@ -412,7 +586,7 @@ def _make_table(
             align = alignments[min(index, len(alignments) - 1)]
             color = text_colors[0] if index < 2 else text_colors[1]
             text_rect = (rect[0] + 4, rect[1] + 3, rect[2] - 4, rect[3] - 3)
-            page.insert_textbox(text_rect, text, fontsize=9, fontname="hebo" if index < 2 else "helv", color=color, align=align)
+            page.insert_textbox(text_rect, text, fontsize=font_size, fontname="hebo" if index < 2 else "helv", color=color, align=align)
         document.save(path)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ from app.pdf_export_models import (
 from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer
 from app.services.document_segmenter import segment_pdf
 from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canonical_text, is_technical_value, parse_cell_position
-from app.services.pdf_typography import FontAsset, PdfTypographyResolver
+from app.services.pdf_typography import FontAsset, MAX_SOURCE_FONT_SIZE, MIN_SOURCE_FONT_SIZE, PdfTypographyResolver
 from app.services.ocr_review_registry import ocr_review_registry
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,9 @@ BODY_MIN_SCALE = 0.75
 TABLE_MIN_FONT_SIZE = 5.5
 TABLE_BODY_MIN_SCALE = 0.75
 TABLE_TITLE_MIN_SCALE = 0.85
+TABLE_MIN_LINE_HEIGHT = 1.0
+TABLE_MAX_LAYOUT_LINES = 4
+TABLE_SOURCE_FONT_SIZE_TOLERANCE = 0.05
 SCALE_NUMERIC_TOLERANCE = 1e-9
 INVISIBLE_STRUCTURAL_TEXT = frozenset(
     "\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b\u200c\u200d\u200e\u200f"
@@ -56,6 +60,20 @@ EXTRACTION_LIGATURES = str.maketrans({
 MAX_HYPHEN_LINE_BREAK_VARIANTS = 1_024
 MAX_HYPHEN_LINE_BREAK_BOUNDARIES = 10
 HYPHEN_LINE_BREAK = re.compile(r"(?<=-)[ \t]*(?:\r\n|\r|\n)(?:[ \t]*(?:\r\n|\r|\n))*[ \t]*")
+TABLE_RANGE_PATTERN = re.compile(
+    r"(?<!\w)[+\-−]?\d+(?:[.,]\d+)?(?:[ \t]*(?:°[CFK]|%|mm|cm|m|MPa|kPa|Pa|ml|L|kg|g|W|kW))?"
+    r"[ \t]+(?:do|to|med|in|and|[-–—])[ \t]+"
+    r"[+\-−]?\d+(?:[.,]\d+)?(?:[ \t]*(?:°[CFK]|%|mm|cm|m|MPa|kPa|Pa|ml|L|kg|g|W|kW))?(?!\w)",
+    re.IGNORECASE,
+)
+TABLE_VALUE_UNIT_PATTERN = re.compile(
+    r"(?<!\w)[+\-−]?\d+(?:[.,]\d+)?[ \t]+(?:°[CFK]|%|mm|cm|m|MPa|kPa|Pa|ml|L|kg|g|W|kW)(?!\w)",
+    re.IGNORECASE,
+)
+TABLE_STANDARD_PATTERN = re.compile(r"\b(?:RAL|EN|ISO|DIN|SIST)[ \t]+[A-Z0-9][A-Z0-9./:+-]*\b", re.IGNORECASE)
+TABLE_PRODUCT_PATTERN = re.compile(
+    r"\b[A-Z][A-Za-z]+[ \t]+(?:[A-Z]{1,5}[ \t]*)?\d+[A-Za-z0-9-]*(?:[ \t]+[A-Z][A-Za-z]+){0,3}\b"
+)
 
 
 class PdfExportValidationError(ValueError):
@@ -642,6 +660,12 @@ def _plan_provenance_cell(
     style, asset, warnings, line_count = typography.resolve(
         page, _rect(provenance.source_bbox), segment, layout_rect=_rect(provenance.content_bbox),
     )
+    source_font_sizes = typography.source_font_sizes(page, _rect(provenance.source_bbox))
+    cell.source_font_sizes = [round(value, 4) for value in source_font_sizes]
+    source_font_size = _verified_table_source_font_size(source_font_sizes)
+    if source_font_size is None:
+        return _skip(cell, "missing_table_provenance", "Izvorne velikosti pisave v dokazani celici ni mogoče preveriti.")
+    cell.source_font_size = round(source_font_size, 4)
     cell.typography = style
     cell.typography_warnings.extend(warnings)
     cell.requested_font_size = style.font_size
@@ -766,6 +790,12 @@ def _plan_table_cell(
     style, asset, warnings, line_count = typography.resolve(
         page, source_style_rect, segment, layout_rect=_rect(geometry.content_bbox)
     )
+    source_font_sizes = typography.source_font_sizes(page, source_style_rect)
+    cell.source_font_sizes = [round(value, 4) for value in source_font_sizes]
+    source_font_size = _verified_table_source_font_size(source_font_sizes)
+    if source_font_size is None:
+        return _skip(cell, "missing_table_provenance", "Izvorne velikosti pisave v dokazani celici ni mogoče preveriti.")
+    cell.source_font_size = round(source_font_size, 4)
     cell.typography = style
     cell.typography_warnings.extend(warnings)
     cell.requested_font_size = style.font_size
@@ -918,6 +948,103 @@ def _minimum_text_scale(replacement: PdfReplacement) -> float:
     return max(MIN_FONT_SIZE / replacement.requested_font_size, relative_minimum)
 
 
+def _table_minimum_scale(replacement: PdfTableCellReplacement) -> float:
+    source_font_size = replacement.source_font_size
+    requested_font_size = replacement.requested_font_size
+    if source_font_size is None or not math.isfinite(source_font_size) or source_font_size <= 0:
+        return math.inf
+    if not math.isfinite(requested_font_size) or requested_font_size <= 0:
+        return math.inf
+    if source_font_size < TABLE_MIN_FONT_SIZE:
+        # A source-proven small table face may be retained, never reduced further.
+        minimum_font_size = source_font_size
+        return minimum_font_size / requested_font_size
+    relative_minimum = TABLE_TITLE_MIN_SCALE if replacement.column_span > 1 else TABLE_BODY_MIN_SCALE
+    minimum_font_size = max(TABLE_MIN_FONT_SIZE, relative_minimum * source_font_size)
+    return minimum_font_size / requested_font_size
+
+
+def _verified_table_source_font_size(source_font_sizes: list[float]) -> float | None:
+    if not source_font_sizes:
+        return None
+    if any(
+        not math.isfinite(size) or not MIN_SOURCE_FONT_SIZE <= size <= MAX_SOURCE_FONT_SIZE
+        for size in source_font_sizes
+    ):
+        return None
+    reference = source_font_sizes[0]
+    if any(not math.isclose(size, reference, rel_tol=0.0, abs_tol=TABLE_SOURCE_FONT_SIZE_TOLERANCE) for size in source_font_sizes[1:]):
+        # A single replacement cannot safely inherit two materially different
+        # source sizes without knowing which translated words map to each span.
+        return None
+    return max(source_font_sizes)
+
+
+def _table_line_height(replacement: PdfTableCellReplacement) -> float:
+    current = replacement.typography.line_height
+    if replacement.original_line_count != 1 or replacement.source_bbox is None or not replacement.source_font_size:
+        return max(TABLE_MIN_LINE_HEIGHT, current)
+    source_height = _rect(replacement.source_bbox).height
+    source_ratio = source_height / replacement.source_font_size
+    return max(TABLE_MIN_LINE_HEIGHT, min(current, source_ratio))
+
+
+def _protect_table_layout_text(value: str) -> str:
+    protected = value
+    for pattern in (TABLE_RANGE_PATTERN, TABLE_VALUE_UNIT_PATTERN, TABLE_STANDARD_PATTERN, TABLE_PRODUCT_PATTERN):
+        protected = pattern.sub(lambda match: re.sub(r"[ \t]+", "\u00a0", match.group(0)), protected)
+    return protected
+
+
+def _balanced_table_layouts(value: str) -> list[str]:
+    protected = _protect_table_layout_text(value)
+    words = [word for word in protected.split(" ") if word]
+    layouts = [protected]
+    for line_count in range(2, min(TABLE_MAX_LAYOUT_LINES, len(words)) + 1):
+        total = sum(len(word) for word in words) + len(words) - 1
+        targets = [total * index / line_count for index in range(1, line_count)]
+        breaks: list[int] = []
+        current = 0
+        for index, word in enumerate(words[:-1], start=1):
+            current += len(word) + 1
+            if len(breaks) < len(targets) and current >= targets[len(breaks)]:
+                breaks.append(index)
+        if len(breaks) != line_count - 1:
+            continue
+        lines: list[str] = []
+        start = 0
+        for end in [*breaks, len(words)]:
+            lines.append(" ".join(words[start:end]))
+            start = end
+        layout = "\n".join(lines)
+        if layout not in layouts:
+            layouts.append(layout)
+    return layouts
+
+
+def _try_table_layouts(
+    page: pymupdf.Page,
+    content: pymupdf.Rect,
+    replacement: PdfTableCellReplacement,
+    typography: PdfTypographyResolver,
+    asset: FontAsset,
+    layouts: list[str],
+    minimum_scale: float,
+    strategy: FitStrategy,
+) -> bool:
+    for layout in layouts:
+        replacement.layout_text = layout
+        measurement_floor = 1.0 if minimum_scale >= 1.0 else 0.0
+        result = _htmlbox_preflight(page.rect, content, replacement, typography, asset, measurement_floor)
+        if result[0] >= 0 and _scale_meets_floor(result[1], minimum_scale):
+            if "\n" in layout:
+                replacement.typography_warnings.append("safe_table_line_wrap")
+            _accept_fit(replacement, content, result, strategy)
+            return True
+    replacement.layout_text = None
+    return False
+
+
 def _fit_table_cell(
     page: pymupdf.Page,
     replacement: PdfTableCellReplacement,
@@ -926,18 +1053,25 @@ def _fit_table_cell(
 ) -> None:
     content = _rect(replacement.content_bbox)
     asset = _asset_for(replacement, typography)
+    layouts = _balanced_table_layouts(replacement.translated_text)
+    replacement.layout_text = layouts[0]
     exact = _htmlbox_preflight(page.rect, content, replacement, typography, asset, 1.0)
     if exact[0] >= 0:
         _accept_fit(replacement, content, exact, "exact")
     else:
-        minimum_ratio = TABLE_TITLE_MIN_SCALE if replacement.column_span > 1 else TABLE_BODY_MIN_SCALE
-        minimum_scale = max(TABLE_MIN_FONT_SIZE / replacement.requested_font_size, minimum_ratio)
-        scaled = _htmlbox_preflight(page.rect, content, replacement, typography, asset, minimum_scale)
-        if scaled[0] < 0 or scaled[1] + 0.0001 < minimum_scale:
-            replacement.fit_strategy = "overflow"
-            _skip(replacement, "cell_overflow", "Prevod se ne prilega varnemu območju celice.", "overflow")
-            return
-        _accept_fit(replacement, content, scaled, "scaled")
+        if not _try_table_layouts(page, content, replacement, typography, asset, layouts[1:], 1.0, "exact"):
+            readable_line_height = _table_line_height(replacement)
+            if readable_line_height < replacement.typography.line_height:
+                replacement.typography.line_height = readable_line_height
+                replacement.line_height = readable_line_height
+                replacement.typography_warnings.append("source_proven_table_line_height")
+            minimum_scale = _table_minimum_scale(replacement)
+            if not _try_table_layouts(
+                page, content, replacement, typography, asset, layouts, minimum_scale, "scaled",
+            ):
+                replacement.fit_strategy = "overflow"
+                _skip(replacement, "cell_overflow", "Prevod se ne prilega varnemu območju celice.", "overflow")
+                return
 
     if replacement.background_patch_used:
         assessment = overlap_analyzer.analyze(
@@ -980,7 +1114,10 @@ def _htmlbox_preflight(
     asset: FontAsset,
     scale_low: float,
 ) -> tuple[float, float, int]:
-    html_text, css = typography.html_and_css(_rendered_translation(replacement), replacement.typography, asset)
+    html_text, css = typography.html_and_css(
+        _rendered_translation(replacement), replacement.typography, asset,
+        use_full_table_interior=isinstance(replacement, PdfTableCellReplacement),
+    )
     with pymupdf.open() as scratch:
         page = scratch.new_page(width=page_rect.width, height=page_rect.height)
         spare, scale = page.insert_htmlbox(rect, html_text, css=css, scale_low=scale_low, archive=typography.archive)
@@ -1118,13 +1255,17 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
                 for patch in item.patch_rects:
                     page.draw_rect(_rect(patch), color=None, fill=patch_color, fill_opacity=1, overlay=True)
             asset = _asset_for(item, typography)
-            html_text, css = typography.html_and_css(_rendered_translation(item), item.typography, asset)
-            spare, scale = page.insert_htmlbox(
-                # PyMuPDF compares scale_low without tolerance and can return one ULP below
-                # the same input. Validate its computed scale ourselves before saving.
-                _rect(item.fitted_bbox), html_text, css=css, scale_low=0.0, archive=typography.archive, overlay=True
+            html_text, css = typography.html_and_css(
+                _rendered_translation(item), item.typography, asset,
+                use_full_table_interior=isinstance(item, PdfTableCellReplacement),
             )
             writer_floor = _accepted_writer_scale_floor(item)
+            spare, scale = page.insert_htmlbox(
+                # Measure the natural writer scale again and compare it with the
+                # independently computed preflight result below.
+                _rect(item.fitted_bbox), html_text, css=css, scale_low=0.0,
+                archive=typography.archive, overlay=True,
+            )
             if spare < 0 or not _scale_meets_floor(scale, writer_floor):
                 raise PdfExportValidationError(
                     "insert_failed",
@@ -1140,6 +1281,8 @@ def _scale_meets_floor(actual_scale: float, accepted_scale: float) -> bool:
 
 
 def _accepted_writer_scale_floor(replacement: PdfReplacement) -> float:
+    if isinstance(replacement, PdfTableCellReplacement):
+        return replacement.scale if replacement.scale is not None else _table_minimum_scale(replacement)
     if replacement.fit_strategy in {"exact", "expanded_bbox"}:
         return 1.0
     return _minimum_text_scale(replacement)
@@ -1291,9 +1434,10 @@ def _verification_text(value: str) -> str:
 
 
 def _rendered_translation(replacement: PdfReplacement) -> str:
+    value = replacement.layout_text if replacement.layout_text is not None else replacement.translated_text
     if replacement.list_marker_preserved:
-        return re.sub(r"^\s*[-–—•▪◦*]+\s*", "", replacement.translated_text, count=1)
-    return replacement.translated_text
+        return re.sub(r"^\s*[-–—•▪◦*]+\s*", "", value, count=1)
+    return value
 
 
 def _layout_rect(replacement: PdfReplacement) -> pymupdf.Rect:

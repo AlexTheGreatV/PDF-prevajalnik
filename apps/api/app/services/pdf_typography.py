@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from app.pdf_export_models import PdfExportSegment, PdfTextStyle
 
 REQUIRED_GLYPHS = "čšžČŠŽ₂°C"
 FAMILY_NAME = "FiraGO"
+MIN_SOURCE_FONT_SIZE = 0.1
+MAX_SOURCE_FONT_SIZE = 72.0
 
 
 @dataclass(frozen=True)
@@ -96,12 +99,34 @@ class PdfTypographyResolver:
         font = pymupdf.Font(fontfile=str(asset.path))
         return all(character.isspace() or font.has_glyph(ord(character)) != 0 for character in text)
 
-    def html_and_css(self, text: str, style: PdfTextStyle, asset: FontAsset) -> tuple[str, str]:
+    def source_font_sizes(self, page: pymupdf.Page, rect: pymupdf.Rect) -> list[float]:
+        """Return server-observed source sizes for the spans inside a proven rectangle."""
+        _, spans = _spans_in_rect(page, rect)
+        sizes: list[float] = []
+        for span in spans:
+            try:
+                size = float(span.get("size", 0))
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(size) or not MIN_SOURCE_FONT_SIZE <= size <= MAX_SOURCE_FONT_SIZE:
+                return []
+            sizes.append(size)
+        return sorted(sizes)
+
+    def html_and_css(
+        self,
+        text: str,
+        style: PdfTextStyle,
+        asset: FontAsset,
+        *,
+        use_full_table_interior: bool = False,
+    ) -> tuple[str, str]:
         weight = 700 if asset.bold else 400
         font_style = "italic" if asset.italic else "normal"
         css_family = f"{FAMILY_NAME}-{asset.code}"
         escaped = _escape_without_font_ligatures(text)
-        css = (
+        body_css = "body {margin:0;padding:0;}" if use_full_table_interior else ""
+        css = body_css + (
             f"@font-face {{font-family:'{css_family}';src:url('{asset.path.name}');font-weight:{weight};font-style:{font_style};}}"
             f"* {{font-family:'{css_family}';font-size:{style.font_size:.4f}pt;font-weight:{weight};font-style:{font_style};"
             f"font-variant-ligatures:none;font-feature-settings:'liga' 0,'clig' 0;"
