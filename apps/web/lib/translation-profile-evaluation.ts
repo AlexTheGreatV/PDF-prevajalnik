@@ -13,7 +13,13 @@ import {
   type TranslationRuleEvaluation,
   type TerminologySourceRecord,
 } from "./translation-profile";
-import type { GlossaryEntry, ProtectedToken, TranslationJob, TranslationSegment } from "./translation-types";
+import type { GlossaryEntry, TranslationJob, TranslationSegment } from "./translation-types";
+import { findGlossaryMatches } from "./glossary";
+import { protectTechnicalTokens } from "./technical-tokens";
+import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
+import { createTranslationContentRevision, validateTranslationTechnicalIntegrity } from "./translation-integrity";
+
+export const CURRENT_QC_RULES_REVISION = `current-segment-qc-v1:${TRANSLATION_PROFILE_ID}:${TRANSLATION_PROFILE_VERSION}:${TRANSLATION_PROFILE_CANONICAL_SHA256}:${TECHNICAL_RANGE_RULES_VERSION}`;
 
 const RULE = {
   userGlossary: "SL-SSKJ-03-002",
@@ -29,20 +35,28 @@ const RULE = {
 } as const;
 
 export function refreshTranslationProfileMetadata(job: TranslationJob): TranslationJob {
-  if (!job.translation_profile) return { ...job, quality_checklist: job.quality_checklist ?? [] };
-  const profile = job.translation_profile;
+  const profileRevision = job.translation_profile ? JSON.stringify([
+    job.translation_profile.profile_id, job.translation_profile.profile_version,
+    job.translation_profile.canonical_sha256, job.translation_profile.source_sha256,
+  ]) : "legacy-profile-unspecified";
+  const currentJob = { ...job, segments: job.segments.map((segment) => refreshCurrentSegmentQc({
+    ...segment,
+    glossary_matches: findGlossaryMatches(segment.source_text, job.glossary),
+  }, profileRevision)) };
+  if (!currentJob.translation_profile) return { ...currentJob, quality_checklist: currentJob.quality_checklist ?? [] };
+  const profile = currentJob.translation_profile;
   if (profile.profile_id !== TRANSLATION_PROFILE_ID || profile.profile_version !== TRANSLATION_PROFILE_VERSION) {
-    return { ...job, translation_profile: { ...profile, evaluation_status: "unknown_profile" } };
+    return { ...currentJob, translation_profile: { ...profile, evaluation_status: "unknown_profile" } };
   }
   if (profile.source_sha256 !== TRANSLATION_PROFILE_SOURCE_SHA256 || profile.canonical_sha256 !== TRANSLATION_PROFILE_CANONICAL_SHA256) {
-    return invalidateChangedProfile(job);
+    return invalidateChangedProfile(currentJob);
   }
   const applied = new Set<string>();
-  for (const segment of job.segments) collectAppliedRules(segment, applied);
-  const qualityChecklist = evaluateTranslationQuality(job.segments);
-  const evaluations = evaluateTranslationRules(job.segments, job.glossary, applied, qualityChecklist);
+  for (const segment of currentJob.segments) collectAppliedRules(segment, applied);
+  const qualityChecklist = evaluateTranslationQuality(currentJob.segments);
+  const evaluations = evaluateTranslationRules(currentJob.segments, currentJob.glossary, applied, qualityChecklist);
   return {
-    ...job,
+    ...currentJob,
     translation_profile: {
       ...profile,
       evaluation_status: "current",
@@ -50,10 +64,83 @@ export function refreshTranslationProfileMetadata(job: TranslationJob): Translat
       manual_review_rule_ids: evaluations.filter((item) => item.status === "needs_review").map((item) => item.rule_id),
       unverifiable_rule_ids: evaluations.filter((item) => item.status === "not_checkable").map((item) => item.rule_id),
       rule_evaluations: evaluations,
-      diagnostics: profileDiagnostics(job.glossary, job.segments, profile.terminology_sources),
-      conflicts: glossaryConflicts(job.glossary),
+      diagnostics: profileDiagnostics(currentJob.glossary, currentJob.segments, profile.terminology_sources),
+      conflicts: glossaryConflicts(currentJob.glossary),
     },
     quality_checklist: qualityChecklist,
+  };
+}
+
+export function refreshCurrentSegmentQc(segment: TranslationSegment, profileRevision = "segment-check"): TranslationSegment {
+  const target = ["pending", "failed", "translating"].includes(segment.status) && !segment.edited_translation
+    ? "" : segment.edited_translation || segment.translated_text;
+  const contentRevision = createTranslationContentRevision(segment);
+  const sourceProtection = protectTechnicalTokens(segment.source_text);
+  const rulesRevision = JSON.stringify({
+    engine: CURRENT_QC_RULES_REVISION, profile: profileRevision,
+    languages: [segment.source_language, segment.target_language],
+    glossary_matches: segment.glossary_matches,
+  });
+  const sourceFindings: NonNullable<TranslationSegment["current_qc"]>["findings"] = sourceProtection.warnings.includes("technical_range_ambiguous") ? [{
+    code: "technical_range_ambiguous",
+    severity: "warning",
+    message: "Izvor vsebuje dvoumen tehnični razpon, ki zahteva ročni pregled.",
+  }] : [];
+  if (segment.skip_reason || !target.trim()) return {
+    ...segment,
+    current_qc: { content_revision: contentRevision, rules_revision: rulesRevision, status: "not_checked", findings: segment.skip_reason ? [] : sourceFindings },
+  };
+
+  const findings: NonNullable<TranslationSegment["current_qc"]>["findings"] = [...sourceFindings];
+  let technicalValid = false;
+  try { technicalValid = validateTranslationTechnicalIntegrity(segment.source_text, target).valid; }
+  catch { /* A malformed unit or range must leave the edited text intact and fail QC. */ }
+  if (!technicalValid) findings.push({
+    code: "technical_integrity",
+    severity: "blocking",
+    message: "Trenutni prevod ne ohranja vseh zaščitenih števil, enot, kod ali tehničnih zapisov.",
+  });
+
+  const missingPlaceholder = sourceProtection.tokens.some((token) =>
+    token.kind === "source_placeholder" && !target.includes(token.replacement_value ?? token.value),
+  );
+  if (missingPlaceholder) findings.push({
+    code: "placeholder_integrity",
+    severity: "blocking",
+    message: "Trenutni prevod ne ohranja izvornega placeholderja.",
+  });
+
+  // Match order already follows glossary priority; overlapping inline protection uses the first owner.
+  const owned: Array<{ start: number; end: number }> = [];
+  for (const match of segment.glossary_matches.filter((item) => ["do_not_translate", "locked_inline"].includes(item.mode))) {
+    const start = match.start_offset ?? -1;
+    const end = match.end_offset ?? -1;
+    if (start < 0 || end <= start || owned.some((range) => start < range.end && end > range.start)) continue;
+    owned.push({ start, end });
+    const expected = match.mode === "do_not_translate" ? match.matched_text : match.target_term;
+    if (expected && !target.includes(expected)) findings.push({
+      code: "protected_glossary", severity: "blocking", glossary_entry_id: match.glossary_id,
+      message: `Trenutni prevod ne ohranja zaščitenega izraza »${expected}«.`,
+    });
+  }
+
+  for (const match of segment.glossary_matches.filter((item) =>
+    item.mode === "preferred" && item.target_term.trim() && !containsTerm(target, item.target_term),
+  )) findings.push({
+    code: "preferred_term_missing",
+    severity: "warning",
+    message: `Trenutni prevod ne vsebuje priporočenega izraza »${match.target_term}«.`,
+    glossary_entry_id: match.glossary_id,
+  });
+
+  return {
+    ...segment,
+    current_qc: {
+      content_revision: contentRevision,
+      rules_revision: rulesRevision,
+      status: findings.some((finding) => finding.severity === "blocking") ? "blocked" : findings.length ? "warnings" : "passed",
+      findings,
+    },
   };
 }
 
@@ -102,7 +189,7 @@ export function evaluateTranslationQuality(segments: TranslationSegment[]): Tran
   const technicalTokens = translated.flatMap((segment) => segment.protected_tokens.map((token) => ({ segment, token })));
   const technicalCheck = checklist.find((item) => item.source_rule_id === "SL-SSKJ-16-006");
   if (technicalCheck && technicalTokens.length > 0) {
-    const failures = technicalTokens.filter(({ segment, token }) => !translationContainsToken(segment, token));
+    const failures = translated.filter((segment) => segment.current_qc?.findings.some((finding) => finding.code === "technical_integrity"));
     technicalCheck.status = failures.length ? "failed" : "needs_review";
     technicalCheck.message = failures.length
       ? `Tehnični zapis ni ohranjen v ${failures.length} primeru oziroma primerih.`
@@ -115,7 +202,7 @@ export function evaluateTranslationQuality(segments: TranslationSegment[]): Tran
   const structureCheck = checklist.find((item) => item.source_rule_id === "SL-SSKJ-16-009");
   if (structureCheck) {
     const hasApplicableStructure = segments.some((segment) => hasSourcePlaceholder(segment) || hasTechnicalMarkup(segment.source_text));
-    const placeholderFailure = segments.some((segment) => segment.warnings.includes("placeholder_integrity"));
+    const placeholderFailure = segments.some((segment) => segment.current_qc?.findings.some((finding) => finding.code === "placeholder_integrity"));
     if (placeholderFailure) {
       structureCheck.status = "failed";
       structureCheck.message = "Vsaj en tehnični placeholder je manjkal ali je bil poškodovan.";
@@ -198,7 +285,7 @@ function createRuleContext(segments: TranslationSegment[], glossary: GlossaryEnt
   const abbreviations = active.filter((segment) => /\b[A-ZČŠŽ]{2,6}\b|[%°]/u.test(segment.source_text));
   const suspiciousSource = active.filter((segment) => /\b[a-z][A-Z]{3,}\b/.test(segment.source_text));
   const terminology = active.filter((segment) => segment.glossary_matches.length > 0 || technical.includes(segment));
-  const ambiguousRanges = active.filter((segment) => segment.warnings.includes("technical_range_ambiguous"));
+  const ambiguousRanges = active.filter((segment) => segment.current_qc?.findings.some((finding) => finding.code === "technical_range_ambiguous"));
   return {
     active, legal, markup, placeholders, machineReadable, technical, numeric, properNames, abbreviations,
     suspiciousSource, terminology, ambiguousRanges, ids,
@@ -256,9 +343,9 @@ function segmentUsesRule(segment: TranslationSegment, ruleId: string): boolean {
 
 function ruleFailed(ruleId: string, segmentIds: string[], segments: TranslationSegment[]): boolean {
   const relevant = segments.filter((segment) => segmentIds.includes(segment.segment_id));
-  if (ruleId === RULE.preservePlaceholders) return relevant.some((segment) => segment.warnings.includes("placeholder_integrity"));
+  if (ruleId === RULE.preservePlaceholders) return relevant.some((segment) => segment.current_qc?.findings.some((finding) => finding.code === "placeholder_integrity"));
   if ([RULE.preserveValues, RULE.preservePrecision, RULE.preserveSymbols, RULE.preserveMachineReadable].some((candidate) => candidate === ruleId)) {
-    return relevant.some((segment) => segment.protected_tokens.some((token) => !translationContainsToken(segment, token)));
+    return relevant.some((segment) => segment.current_qc?.findings.some((finding) => finding.code === "technical_integrity"));
   }
   return false;
 }
@@ -313,10 +400,11 @@ function profileDiagnostics(
   if (hasInconsistentGlossary(glossary)) diagnostics.push(createDiagnostic(
     "warning", RULE.terminologyConsistency, "Za isti izvorni izraz je vključenih več različnih ciljnih izrazov.",
   ));
-  for (const segment of segments.filter((item) => item.warnings.includes("placeholder_integrity"))) diagnostics.push(createDiagnostic(
-    "blocking_error", RULE.preservePlaceholders, "Poškodovan tehnični placeholder preprečuje zanesljiv prevod segmenta.", segment.segment_id, segment.source_text,
+  for (const segment of segments) for (const finding of segment.current_qc?.findings.filter((item) => item.severity === "blocking") ?? []) diagnostics.push(createDiagnostic(
+    "blocking_error", finding.code === "placeholder_integrity" ? RULE.preservePlaceholders : RULE.preserveValues,
+    finding.message, segment.segment_id, segment.source_text,
   ));
-  for (const segment of segments.filter((item) => item.warnings.includes("technical_range_ambiguous"))) diagnostics.push(createDiagnostic(
+  for (const segment of segments.filter((item) => item.current_qc?.findings.some((finding) => finding.code === "technical_range_ambiguous"))) diagnostics.push(createDiagnostic(
     "warning", RULE.preserveValues, "Zapis je podoben številčnemu razponu, vendar enota ali meja ni bila dovolj zanesljivo prepoznana.", segment.segment_id, segment.source_text,
   ));
   return diagnostics;
@@ -366,11 +454,8 @@ function normalizedTerm(entry: GlossaryEntry): string {
   return entry.source_term.trim().toLocaleLowerCase();
 }
 
-function translationContainsToken(segment: TranslationSegment, token: ProtectedToken): boolean {
-  const translation = segment.edited_translation || segment.translated_text;
-  const expected = token.replacement_value ?? token.value;
-  if (!expected) return true;
-  return translation.includes(expected);
+function containsTerm(text: string, term: string): boolean {
+  return text.toLocaleLowerCase("sl").includes(term.toLocaleLowerCase("sl"));
 }
 
 function hasSourcePlaceholder(segment: TranslationSegment): boolean {

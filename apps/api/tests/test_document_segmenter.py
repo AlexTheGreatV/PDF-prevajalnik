@@ -5,15 +5,19 @@ import pytest
 
 from app.api.pdf import _processing_tempdir, _safe_rmtree
 from app.core.config import settings
+from app.models import BBox, DocumentSpan
 from app.services.document_segmenter import (
     _cell_provenance,
     _extract_lines,
+    _has_decorative_list_marker,
+    _without_decorative_prefix_span,
     normalize_lines,
     normalize_lines_with_boundaries,
     segment_pdf,
 )
 
 ZETTEX_FIXTURE = Path("local-fixtures/Zettex MS65 Panel Bond EN - TDS.pdf")
+OTTOSEAL_FIXTURE = Path("local-fixtures/OTTOSEAL-S110-EN-TDS.pdf")
 
 
 def test_normalization_preserves_units_and_symbols() -> None:
@@ -32,6 +36,74 @@ def test_normalization_handles_soft_and_real_hyphens() -> None:
     assert normalize_lines(["one-", "component sealant"]) == "one-component sealant"
     assert "water-based" in normalize_lines(["water-based and shrink-free"])
     assert "shrink-free" in normalize_lines(["water-based and shrink-free"])
+
+
+def test_decorative_icon_font_prefix_is_not_part_of_translatable_text() -> None:
+    symbol = _span("Ð", "Wingdings3", 50, 53.4)
+    space = _span(" ", "HelveticaNeueLTPro-Lt", 53.4, 57)
+    text = _span("Application advice", "HelveticaNeueLTPro-Md", 57, 130)
+
+    filtered = _without_decorative_prefix_span([symbol, space, text])
+
+    assert "".join(span.text for span in filtered).strip() == "Application advice"
+    assert symbol not in filtered
+    assert filtered[0].bbox.x0 == pytest.approx(53.4)
+    assert _has_decorative_list_marker([symbol, space, text]) is True
+
+
+def test_decorative_icon_filter_does_not_remove_ordinary_or_unpaired_text() -> None:
+    ordinary = _span("C", "HelveticaNeueLTPro-Md", 50, 59)
+    text = _span(" Application advice", "HelveticaNeueLTPro-Md", 59, 140)
+    unpaired_symbol = _span("Ð", "Wingdings3", 50, 53.4)
+
+    assert _without_decorative_prefix_span([ordinary, text]) == [ordinary, text]
+    assert _without_decorative_prefix_span([unpaired_symbol]) == [unpaired_symbol]
+    assert _has_decorative_list_marker([ordinary, text]) is False
+
+
+def test_non_list_icon_font_is_separated_without_becoming_list_marker() -> None:
+    icon = _span("C", "tdb-symbole", 50, 59)
+    text = _span(" Application advice", "HelveticaNeueLTPro-Md", 59, 140)
+
+    assert "".join(span.text for span in _without_decorative_prefix_span([icon, text])).strip() == "Application advice"
+    assert _has_decorative_list_marker([icon, text]) is False
+
+
+@pytest.mark.skipif(not OTTOSEAL_FIXTURE.exists(), reason="Private OTTOSEAL PDF fixture is not present in local-fixtures/.")
+def test_ottoseal_keeps_icon_glyphs_outside_stable_translation_blocks() -> None:
+    first = segment_pdf(OTTOSEAL_FIXTURE)
+    second = segment_pdf(OTTOSEAL_FIXTURE)
+    first_blocks = _indexed_blocks(first)
+    second_blocks = _indexed_blocks(second)
+
+    assert first.model_dump() == second.model_dump()
+    assert first_blocks.keys() == second_blocks.keys()
+
+    expected_items = [
+        "Excellent weathering, ageing and UV-resistance",
+        "Sealing of expansion and connections joints",
+        "Tested according to EN 15651",
+        "According to regulation (EG) no. 1907/2006 (REACH)",
+    ]
+    for text in expected_items:
+        block = next(block for block in first_blocks.values() if text in block.normalized_text)
+        assert block.kind == "list_item"
+        assert "Ð" not in block.normalized_text
+
+    advice = next(block for block in first_blocks.values() if block.normalized_text == "Application advice")
+    assert advice.kind != "list_item"
+    assert advice.bbox.x0 >= 294
+
+    with fitz.open(OTTOSEAL_FIXTURE) as document:
+        fonts = {
+            span["font"]
+            for page in document
+            for block in page.get_text("dict").get("blocks", [])
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+        }
+    assert "Wingdings3" in fonts
+    assert "tdb-symbole" in fonts
 
 
 def test_visible_line_end_hyphen_is_marked_ambiguous() -> None:
@@ -411,6 +483,25 @@ def _draw_grid(page: fitz.Page, xs: list[float], ys: list[float]) -> None:
 
 def _first_table(model):
     return next(block for block in _blocks(model.pages[0]) if block.kind == "table")
+
+
+def _span(text: str, font: str, x0: float, x1: float) -> DocumentSpan:
+    return DocumentSpan(
+        span_id=f"{font}-{x0}",
+        text=text,
+        bbox=BBox(x0=x0, y0=10, x1=x1, y1=20),
+        font=font,
+        font_size=9,
+    )
+
+
+def _indexed_blocks(model):
+    return {
+        f"p{page.page_number}-r{region.reading_order}-b{block.reading_order}": block
+        for page in model.pages
+        for region in page.regions
+        for block in region.blocks
+    }
 
 
 @pytest.mark.skipif(not ZETTEX_FIXTURE.exists(), reason="Private Zettex PDF fixture is not present in local-fixtures/.")

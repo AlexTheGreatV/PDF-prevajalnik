@@ -3,10 +3,16 @@ import type { OcrReviewItem } from "./ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "./pdf-types";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
+import {
+  createTranslationContentRevision,
+  createTranslationContentRevisionFromValues,
+  validateTranslationTechnicalIntegrity,
+} from "./translation-integrity";
 import { hasVisibleTranslationText, isTranslationUnitSegment } from "./translation-units";
 import { selectExactTranslationMemoryMatch, type TranslationMemoryEntry } from "./translation-memory";
 import {
   createActiveTranslationProfileMetadata,
+  refreshCurrentSegmentQc,
   refreshTranslationProfileMetadata,
 } from "./translation-profile-evaluation";
 import type {
@@ -22,7 +28,9 @@ import type {
   TranslationSegment,
 } from "./translation-types";
 
-export const TRANSLATION_JOB_SCHEMA_VERSION = 9 as const;
+export { createTranslationContentRevision, validateTranslationTechnicalIntegrity } from "./translation-integrity";
+
+export const TRANSLATION_JOB_SCHEMA_VERSION = 10 as const;
 
 export function createTranslationJob(
   analysis: PdfAnalysis,
@@ -273,6 +281,8 @@ function createSegment(sourceText: string, input: SegmentInput): TranslationSegm
     placeholder_attempts: [],
     needs_review: false,
     warnings: [],
+    review_state: null,
+    current_qc: null,
     chunks: [],
     forced_chunking: false,
     translation_rules_version: null,
@@ -388,7 +398,8 @@ function alphabeticIndex(index: number): string {
 }
 
 export function editTranslation(segment: TranslationSegment, text: string): TranslationSegment {
-  return {
+  if (text === segment.edited_translation) return segment;
+  return refreshCurrentSegmentQc({
     ...segment,
     edited_translation: text,
     status: text.trim() ? "translated" : segment.skip_reason ? "skipped" : "pending",
@@ -399,15 +410,20 @@ export function editTranslation(segment: TranslationSegment, text: string): Tran
     translation_memory_revision: null,
     translation_memory_match: null,
     translation_memory_domain: null,
-    needs_review: false,
+    needs_review: Boolean(text.trim()),
+    review_state: null,
     translation_rules_version: null,
     translation_rule_adjustments: [],
-  };
+  });
 }
 
 export function reviewTranslation(segment: TranslationSegment): TranslationSegment {
   if (!segment.edited_translation.trim() && !segment.translated_text.trim()) return segment;
-  return { ...segment, status: "reviewed", edited_translation: segment.edited_translation || segment.translated_text, error: null, needs_review: false };
+  const reviewed = { ...segment, status: "reviewed" as const, edited_translation: segment.edited_translation || segment.translated_text, error: null, needs_review: false };
+  return refreshCurrentSegmentQc({
+    ...reviewed,
+    review_state: { content_revision: createTranslationContentRevision(reviewed), origin: "local_user_action" },
+  });
 }
 
 export function resetTranslation(segment: TranslationSegment): TranslationSegment {
@@ -429,6 +445,8 @@ export function resetTranslation(segment: TranslationSegment): TranslationSegmen
     placeholder_attempts: [],
     needs_review: false,
     warnings: [],
+    review_state: null,
+    current_qc: null,
     chunks: [],
     forced_chunking: false,
     translation_rules_version: null,
@@ -469,6 +487,23 @@ export function updateTranslationJobSegment(
   return finalizeTranslationJob({
     ...job,
     segments: job.segments.map((segment) => segment.segment_id === segmentId ? update(segment) : segment),
+  });
+}
+
+export function mergeCurrentTranslationResult(current: TranslationJob, requested: TranslationJob, result: TranslationJob): TranslationJob {
+  if (current.created_at !== requested.created_at ||
+    JSON.stringify(current.document_identity) !== JSON.stringify(requested.document_identity) ||
+    current.source_filename !== requested.source_filename) return current;
+  const originals = new Map(requested.segments.map((segment) => [segment.segment_id, segment]));
+  const results = new Map(result.segments.map((segment) => [segment.segment_id, segment]));
+  return finalizeTranslationJob({
+    ...current,
+    segments: current.segments.map((segment) => {
+      const original = originals.get(segment.segment_id);
+      if (!original || !["pending", "failed"].includes(original.status) || original.skip_reason) return segment;
+      const comparable = segment.status === "translating" ? { ...segment, status: original.status } : segment;
+      return JSON.stringify(comparable) === JSON.stringify(original) ? results.get(segment.segment_id) ?? segment : segment;
+    }),
   });
 }
 
@@ -843,27 +878,6 @@ function applyExactSegmentGlossary(segment: TranslationSegment, glossary: Glossa
   };
 }
 
-export function validateTranslationTechnicalIntegrity(source: string, target: string): { valid: boolean; normalizedTarget: string } {
-  const normalizedSource = source.replace(/−/g, "-");
-  const normalizedInput = target.replace(/−/g, "-");
-  const validPercentageSpacing = !hasInvalidPercentageSpacing(normalizedSource) && !hasInvalidPercentageSpacing(normalizedInput);
-  const sourceProtection = protectTechnicalTokens(normalizedSource);
-  const targetProtection = protectTechnicalTokens(normalizedInput);
-  const sourceValues = technicalSignatures(sourceProtection.tokens);
-  const targetValues = technicalSignatures(targetProtection.tokens);
-  const valid = validPercentageSpacing
-    && sourceValues.length === targetValues.length
-    && sourceValues.every((value, index) => value === targetValues[index]);
-  return {
-    valid,
-    normalizedTarget: valid ? restoreTechnicalTokens(targetProtection.protected_text, targetProtection.tokens) : "",
-  };
-}
-
-function hasInvalidPercentageSpacing(value: string): boolean {
-  return /[+-]?\d+(?:[.,]\d+)?(?:[ \u00a0]{2,}|[\t\r\n]+)%/u.test(value);
-}
-
 function applyExactTranslationMemory(segment: TranslationSegment, entries: TranslationMemoryEntry[], domain: string): TranslationSegment {
   const sourceLanguage = segment.source_language === "auto" ? "en" : segment.source_language;
   const result = selectExactTranslationMemoryMatch(segment.source_text, sourceLanguage, segment.target_language, domain, entries);
@@ -899,28 +913,6 @@ function applyExactTranslationMemory(segment: TranslationSegment, entries: Trans
   };
 }
 
-function technicalSignatures(tokens: ProtectedToken[]): string[] {
-  return tokens.flatMap((token) => {
-    if (token.kind === "technical_unit_boundary") return [];
-    if (token.kind !== "technical_range" || !token.technical_range) {
-      return [normalizeTechnicalSignature(token.replacement_value ?? token.value)];
-    }
-    const range = token.technical_range;
-    if (range.unit_kind === "translatable_word") {
-      return [range.start_value, range.end_value].map(normalizeTechnicalSignature);
-    }
-    const start = range.unit_placement === "both" ? `${range.start_value} ${range.unit}` : range.start_value;
-    return [start, `${range.end_value} ${range.unit}`].map(normalizeTechnicalSignature);
-  });
-}
-
-function normalizeTechnicalSignature(value: string): string {
-  const normalized = value.replace(/−/g, "-").replace(/(?<=\d)\.(?=\d)/g, ",");
-  const percentage = normalized.match(/^([+-]?\d+(?:,\d+)?)(?: |\u00a0)?%$/u);
-  if (percentage) return `${percentage[1]}%`;
-  return normalized.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-}
-
 export function exportTranslationJob(job: TranslationJob): string {
   const refreshed = finalizeTranslationJob(job);
   return JSON.stringify({ ...refreshed, glossary_snapshot: cloneGlossary(refreshed.glossary) }, null, 2);
@@ -942,7 +934,7 @@ export function importTranslationJob(value: string): TranslationJob {
           : parsed.schema_version === 5
             ? migrateSchemaSix(migrateSchemaFiveProfileMetadata(parsed))
             : migrateSchemaSixMetadata(parsed);
-  const migrated = migrateSchemaNine(migrateSchemaEight(migrateSchemaSeven(migratedSix)));
+  const migrated = migrateSchemaTen(migrateSchemaNine(migrateSchemaEight(migrateSchemaSeven(migratedSix))));
   if (!isRecord(migrated) || migrated.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
   validateJobShape(migrated);
   return finalizeTranslationJob(migrated as TranslationJob);
@@ -950,6 +942,10 @@ export function importTranslationJob(value: string): TranslationJob {
 
 export function validateTranslationJobCompatibility(imported: TranslationJob, expected: TranslationJob): void {
   if (imported.source_filename !== expected.source_filename) throw new Error("Opravilo pripada drugemu izvornemu dokumentu.");
+  if (imported.document_identity && expected.document_identity &&
+    imported.document_identity.document_model_version !== expected.document_identity.document_model_version) {
+    throw new Error("Opravilo uporablja drugo različico dokumentnega modela. PDF ponovno analizirajte; uvožena datoteka opravila ostane nespremenjena.");
+  }
   if (imported.segments.length !== expected.segments.length) throw new Error("Opravilo ni združljivo s trenutnim dokumentnim modelom.");
   const expectedById = new Map(expected.segments.map((segment) => [segment.segment_id, segment]));
   for (const segment of imported.segments) {
@@ -1139,6 +1135,31 @@ function migrateSchemaNine(job: Record<string, unknown>): Record<string, unknown
   };
 }
 
+function migrateSchemaTen(job: Record<string, unknown>): Record<string, unknown> {
+  if (job.schema_version === 10) return job;
+  if (job.schema_version !== 9) return job;
+  return {
+    ...job,
+    schema_version: 10,
+    segments: Array.isArray(job.segments) ? job.segments.map((value) => {
+      if (!isRecord(value)) return value;
+      const reviewed = value.status === "reviewed";
+      const revision = createTranslationContentRevisionFromValues(
+        typeof value.source_text === "string" ? value.source_text : "",
+        typeof value.edited_translation === "string" && value.edited_translation ? value.edited_translation : typeof value.translated_text === "string" ? value.translated_text : "",
+        value.source_text_origin === "accepted_ocr" && isRecord(value.accepted_ocr_source) && typeof value.accepted_ocr_source.revision_id === "string"
+          ? value.accepted_ocr_source.revision_id
+          : null,
+      );
+      return {
+        ...value,
+        review_state: reviewed ? { content_revision: revision, origin: "legacy_unknown" } : null,
+        current_qc: null,
+      };
+    }) : job.segments,
+  };
+}
+
 function migrateSchemaFiveProfileMetadata(job: Record<string, unknown>): Record<string, unknown> {
   if (job.schema_version !== 5 || !isRecord(job.translation_profile)) return job;
   const profile = job.translation_profile;
@@ -1222,8 +1243,24 @@ function validateJobShape(job: Record<string, unknown>): void {
       typeof segment.forced_chunking !== "boolean" ||
       !isTranslationRuleMetadata(segment.translation_rules_version, segment.translation_rule_adjustments) ||
       !Array.isArray(segment.warnings) ||
-      !segment.warnings.every((warning) => typeof warning === "string")) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
+      !segment.warnings.every((warning) => typeof warning === "string") ||
+      !isReviewState(segment.review_state) ||
+      !isCurrentQc(segment.current_qc)) throw new Error("JSON vsebuje neveljaven prevajalski segment.");
   }
+}
+
+function isReviewState(value: unknown): boolean {
+  return value === null || isRecord(value) && typeof value.content_revision === "string" &&
+    ["local_user_action", "legacy_unknown"].includes(String(value.origin));
+}
+
+function isCurrentQc(value: unknown): boolean {
+  return value === null || isRecord(value) && typeof value.content_revision === "string" &&
+    typeof value.rules_revision === "string" && ["not_checked", "passed", "warnings", "blocked"].includes(String(value.status)) &&
+    Array.isArray(value.findings) && value.findings.every((finding) => isRecord(finding) &&
+      ["technical_integrity", "placeholder_integrity", "protected_glossary", "preferred_term_missing", "technical_range_ambiguous"].includes(String(finding.code)) &&
+      ["warning", "blocking"].includes(String(finding.severity)) && typeof finding.message === "string" &&
+      (finding.glossary_entry_id === undefined || finding.glossary_entry_id === null || typeof finding.glossary_entry_id === "string"));
 }
 
 function isTranslationProfileSnapshot(value: unknown): boolean {
@@ -1431,8 +1468,17 @@ function cloneGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
 }
 
 function finalizeTranslationJob(job: TranslationJob): TranslationJob {
-  const segments = job.segments.filter(isTranslationUnitSegment);
-  const normalizedJob = segments.length === job.segments.length ? job : { ...job, segments };
+  const segments = job.segments.filter(isTranslationUnitSegment).map((segment) => {
+    const contentRevision = createTranslationContentRevision(segment);
+    if (segment.status !== "reviewed") return refreshCurrentSegmentQc({ ...segment, review_state: null });
+    if (segment.review_state?.content_revision === contentRevision) return refreshCurrentSegmentQc(segment);
+    if (segment.review_state === null) return refreshCurrentSegmentQc({
+      ...segment,
+      review_state: { content_revision: contentRevision, origin: "legacy_unknown" },
+    });
+    return refreshCurrentSegmentQc({ ...segment, status: "translated", needs_review: true, review_state: null });
+  });
+  const normalizedJob = { ...job, segments };
   return refreshTranslationProfileMetadata({
     ...normalizedJob,
     glossary_usage: collectGlossaryUsage(normalizedJob),
@@ -1455,7 +1501,9 @@ function finalizeTranslationJob(job: TranslationJob): TranslationJob {
 function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usage"] {
   const usage = job.segments.flatMap((segment) => segment.glossary_matches.map((match) => {
     const sameSource = job.glossary.filter((candidate) => candidate.enabled && candidate.source_term.toLocaleLowerCase() === match.source_term.toLocaleLowerCase());
-    const warned = segment.warnings.includes(`preferred_glossary_term_missing:${match.glossary_id}`) ||
+    const warned = segment.current_qc?.findings.some((finding) =>
+      finding.code === "preferred_term_missing" && finding.glossary_entry_id === match.glossary_id,
+    ) ||
       segment.warnings.includes("glossary_technical_integrity") ||
       (match.mode === "exact_segment" && segment.glossary_entry_id !== match.glossary_id);
     return {

@@ -10,6 +10,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from app.pdf_export_models import PdfExportJob
+from app.services.document_segmenter import DOCUMENT_MODEL_VERSION
 from app.services.pdf_exporter import export_translated_pdf, plan_pdf_export
 from app.services.pdf_image_overlap import DEFAULT_THRESHOLDS, PdfImageOverlapAnalyzer
 
@@ -233,7 +234,7 @@ def _job_payload(path: Path, *, source_text: str = SOURCE, translated_text: str 
         "document_identity": {
             "sha256": _hash(path),
             "page_count": 1,
-            "document_model_version": 2,
+            "document_model_version": DOCUMENT_MODEL_VERSION,
             "pages": [{"page_number": 1, "width": 300, "height": 200, "rotation": 0}],
         },
         "segments": [{

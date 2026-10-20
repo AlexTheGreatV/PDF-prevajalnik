@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { LocalTranslationProvider, getLocalTranslationStatus, type LocalTranslationStatus } from "../lib/local-translation-provider";
-import { translateJobBatch } from "../lib/translation-job";
+import { mergeCurrentTranslationResult, translateJobBatch } from "../lib/translation-job";
 import type { TranslationJob } from "../lib/translation-types";
 
 export function useLocalTranslation(
@@ -61,7 +61,7 @@ export function useLocalTranslation(
         (completed, total) => setProgress({ completed, total }),
       );
       if (generation !== generationRef.current) return;
-      setJob(translated);
+      setJob((current) => current ? mergeCurrentTranslationResult(current, original, translated) : current);
       if (controller.signal.aborted) setMessage("Prevajanje je bilo preklicano.");
       else if (translated.segments.some((segment) => segment.status === "failed")) setMessage("Nekateri segmenti niso bili prevedeni. Poskusite jih lahko znova.");
       else setMessage("Lokalni prevod je pripravljen za ročni pregled.");
@@ -69,7 +69,7 @@ export function useLocalTranslation(
       if (generation === generationRef.current) setStatus(nextStatus);
     } catch (error) {
       if (generation !== generationRef.current) return;
-      setJob(original);
+      setJob((current) => current ? mergeCurrentTranslationResult(current, original, original) : current);
       setMessage(error instanceof Error ? error.message : "Lokalno prevajanje ni uspelo.");
     } finally {
       if (generation === generationRef.current) {

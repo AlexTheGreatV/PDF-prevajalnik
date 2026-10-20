@@ -678,7 +678,7 @@ def _job_payload(path: Path, table_index: int = 0, block_id: str = "p1-r1-b1") -
             })
     return {
         "schema_version": 9, "source_filename": path.name,
-        "document_identity": {"sha256": analysis.sha256, "page_count": 1, "document_model_version": 2,
+        "document_identity": {"sha256": analysis.sha256, "page_count": 1, "document_model_version": analysis.document_model_version,
                               "pages": [{"page_number": 1, "width": page.dimensions.width, "height": page.dimensions.height, "rotation": page.rotation}]},
         "segments": segments,
     }

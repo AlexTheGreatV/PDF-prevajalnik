@@ -27,6 +27,7 @@ from app.models import (
     TableProvenance,
 )
 
+DOCUMENT_MODEL_VERSION = 3
 TEXT_PAGE_THRESHOLD = 25
 
 LIST_MARKER_RE = re.compile(r"^\s*(?:[•\-\*\u2013\u2014]|\d+[\.)]|[A-Za-z][\.)])\s+")
@@ -48,6 +49,7 @@ class RawLine:
     region_kind: RegionKind
     column_index: int = 0
     rotated: bool = False
+    decorative_list_marker: bool = False
 
     @property
     def x0(self) -> float:
@@ -192,15 +194,21 @@ def _extract_lines(page: fitz.Page, page_number: int) -> list[RawLine]:
         if block.get("type") != 0:
             continue
         for line_index, line in enumerate(block.get("lines", [])):
-            spans = [
+            extracted_spans = [
                 _span_from_payload(span, f"p{page_number}-b{block_index + 1}-l{line_index + 1}-s{span_index + 1}")
                 for span_index, span in enumerate(line.get("spans", [])) if span.get("text")
             ]
+            decorative_list_marker = _has_decorative_list_marker(extracted_spans)
+            spans = _without_decorative_prefix_span(extracted_spans)
             original_text = "".join(span.text for span in spans)
             original_text = _normalize_spaces(original_text)
             if not original_text:
                 continue
-            bbox = _bbox(line.get("bbox") or _union_bbox([span.bbox for span in spans]))
+            bbox = (
+                _union_bbox([span.bbox for span in spans])
+                if len(spans) != len(extracted_spans)
+                else _bbox(line.get("bbox") or _union_bbox([span.bbox for span in spans]))
+            )
             lines.append(
                 RawLine(
                     page_number=page_number,
@@ -209,9 +217,52 @@ def _extract_lines(page: fitz.Page, page_number: int) -> list[RawLine]:
                     spans=spans,
                     region_kind="body",
                     rotated=tuple(round(float(value), 4) for value in line.get("dir", (1.0, 0.0))) != (1.0, 0.0),
+                    decorative_list_marker=decorative_list_marker,
                 )
             )
     return lines
+
+
+def _without_decorative_prefix_span(spans: list[DocumentSpan]) -> list[DocumentSpan]:
+    prefix_index = _decorative_prefix_index(spans)
+    if prefix_index is None:
+        return spans
+    return spans[:prefix_index] + spans[prefix_index + 1 :]
+
+
+def _has_decorative_list_marker(spans: list[DocumentSpan]) -> bool:
+    prefix_index = _decorative_prefix_index(spans)
+    return prefix_index is not None and _is_list_marker_font(spans[prefix_index].font)
+
+
+def _decorative_prefix_index(spans: list[DocumentSpan]) -> int | None:
+    visible = [index for index, span in enumerate(spans) if span.text.strip()]
+    if len(visible) < 2:
+        return None
+
+    prefix_index = visible[0]
+    prefix = spans[prefix_index]
+    following_text = "".join(span.text for span in spans[prefix_index + 1 :])
+    if (
+        not _is_icon_font(prefix.font)
+        or len(prefix.text.strip()) != 1
+        or not any(char.isalnum() for char in following_text)
+    ):
+        return None
+    return prefix_index
+
+
+def _is_icon_font(font: str | None) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", (font or "").lower())
+    return any(
+        marker in normalized
+        for marker in ("wingdings", "webdings", "dingbats", "symbole", "symbols", "iconfont")
+    )
+
+
+def _is_list_marker_font(font: str | None) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", (font or "").lower())
+    return any(marker in normalized for marker in ("wingdings", "webdings", "dingbats"))
 
 
 def _prepare_lines(lines: list[RawLine]) -> list[RawLine]:
@@ -1127,6 +1178,7 @@ def _make_list_item_blocks(line: RawLine, body_size: float, start_order: int) ->
             region_kind=line.region_kind,
             column_index=line.column_index,
             rotated=line.rotated,
+            decorative_list_marker=line.decorative_list_marker,
         )
         blocks.append(_make_text_block([item_line], body_size, start_order + index, forced_kind="list_item"))
     return blocks
@@ -1202,6 +1254,7 @@ def _merge_lines(lines: list[RawLine], separator: str = " ") -> RawLine:
         region_kind=ordered[0].region_kind,
         column_index=ordered[0].column_index,
         rotated=any(line.rotated for line in ordered),
+        decorative_list_marker=any(line.decorative_list_marker for line in ordered),
     )
 
 
@@ -1333,7 +1386,7 @@ def _split_inline_list_items(text: str) -> list[str]:
 
 
 def _line_kind(line: RawLine, body_size: float) -> BlockKind:
-    if LIST_MARKER_RE.match(line.original_text):
+    if line.decorative_list_marker or LIST_MARKER_RE.match(line.original_text):
         return "list_item"
     if _looks_like_heading(line, body_size):
         return "heading"

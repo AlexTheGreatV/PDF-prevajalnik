@@ -41,8 +41,12 @@ export function GuidedTranslationReview({
       </label>
     </div>
     <p className="translation-origin">Izvor prevoda: {translationOriginLabel(segment)}</p>
+    <div className="translation-state-grid" aria-label="Stanje pregleda in kakovosti">
+      <span><strong>Uporabniški pregled</strong>{segment.status === "reviewed" ? segment.review_state?.origin === "local_user_action" ? "Uporabniško potrjeno" : "Potrditev neznanega izvora" : "Ni potrjeno"}</span>
+      <span><strong>Avtomatski QC</strong>{qcLabel(segment)}</span>
+    </div>
     {segment.needs_review && <p className="translation-warning">Ta prevod zahteva ročni pregled.</p>}
-    {segment.warnings.map((warning) => <p className="translation-warning" key={warning}>{warning}</p>)}
+    {segment.current_qc?.findings.map((finding, index) => <p className={finding.severity === "blocking" ? "translation-error" : "translation-warning"} key={`${finding.code}-${finding.glossary_entry_id ?? index}`}>{finding.message}</p>)}
     {segment.error && <p className="translation-error">{segment.error}</p>}
     <div className="translation-row-actions">
       <button className="button secondary" onClick={() => textareaRef.current?.focus()}>Uredi</button>
@@ -56,8 +60,16 @@ export function GuidedTranslationReview({
       {segment.translation_memory_entry_id && <p>Prevajalski spomin: {segment.translation_memory_entry_id} · rev. {segment.translation_memory_revision}</p>}
       {segment.model_id && <p>Model: {segment.model_id}</p>}
       {segment.chunks.length > 1 && <p>Prevajalski deli: {segment.chunks.length}</p>}
+      {segment.warnings.length > 0 && <p>Zgodovinska opozorila ponudnika: {segment.warnings.join(", ")}</p>}
     </details>
   </section>;
+}
+
+function qcLabel(segment: TranslationSegment): string {
+  if (!segment.current_qc || segment.current_qc.status === "not_checked") return "Ni preverjeno";
+  if (segment.current_qc.status === "passed") return "Zaščiteni podatki preverjeni";
+  if (segment.current_qc.status === "warnings") return "Opozorila";
+  return "Blokada";
 }
 
 function translationOriginLabel(segment: TranslationSegment): string {

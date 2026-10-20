@@ -1042,6 +1042,25 @@ pre {
   font-size: 13px;
 }
 
+.translation-state-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.translation-state-grid span {
+  display: grid;
+  gap: 2px;
+  border-left: 3px solid #7a8580;
+  padding: 6px 9px;
+  background: #f5f7f6;
+  color: #35413c;
+  font-size: 13px;
+}
+
+.translation-state-grid strong { color: #17211d; }
+.translation-history { color: var(--muted); font-size: 13px; }
+
 .translation-profile-summary {
   border-block: 1px solid #d7ddd9;
   padding-block: 18px;

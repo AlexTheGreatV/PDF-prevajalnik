@@ -14,6 +14,7 @@ import {
   getSkipReason,
   importTranslationJob,
   invalidateStaleOcrApprovals,
+  mergeCurrentTranslationResult,
   protectForTranslation,
   resetTranslation,
   restoreProtectedTokens,
@@ -21,11 +22,13 @@ import {
   reviewTranslation,
   splitOversizedChunk,
   translateJobBatch,
+  updateTranslationJobSegment,
   validateTranslationTechnicalIntegrity,
   validateTranslationJobCompatibility,
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationProvider, TranslationProviderResult, TranslationRequest } from "../lib/translation-types";
 import { updateTerminologySources } from "../lib/translation-profile-evaluation";
+import { refreshTranslationProfileMetadata } from "../lib/translation-profile-evaluation";
 import type { TranslationMemoryEntry } from "../lib/translation-memory";
 
 const tests: Promise<void>[] = [];
@@ -105,7 +108,7 @@ test("creates stable document-order segments including table cells", () => {
   assert.deepEqual(first.segments.filter((segment) => segment.block_type === "table_cell").map((segment) => segment.source_text), ["Package", "290 ml", "Colour", "RAL 9001"]);
 });
 
-test("schema nine JSON round trip preserves complete table cell provenance", () => {
+test("schema ten JSON round trip preserves schema nine table cell provenance", () => {
   const analysis = fixture();
   analysis.document_model_version = 2;
   const table = analysis.document!.pages[0].regions[1].blocks.find((item) => item.kind === "table")!;
@@ -872,10 +875,10 @@ test("cancelled batch returns the unchanged job", async () => {
 
 test("JSON roundtrip retains work and rejects unsupported versions", () => {
   const base = createTranslationJob(fixture(), [acceptedOcr()], { source_language: "en", target_language: "sl" });
-  const job = { ...base, segments: base.segments.map((segment, index) => index === 0 ? reviewTranslation(editTranslation(segment, "UPORABA")) : segment) };
+  const job = updateTranslationJobSegment(base, base.segments[0].segment_id, (segment) => reviewTranslation(editTranslation(segment, "UPORABA")));
   assert.deepEqual(importTranslationJob(exportTranslationJob(job)), job);
   assert.throws(() => importTranslationJob("not-json"), /veljaven JSON/);
-  assert.throws(() => importTranslationJob('{"schema_version":10}'), /ni podprta/);
+  assert.throws(() => importTranslationJob('{"schema_version":11}'), /ni podprta/);
 });
 
 test("schema four import stays compatible without claiming the new profile", () => {
@@ -885,7 +888,7 @@ test("schema four import stays compatible without claiming the new profile", () 
   delete legacy.translation_profile;
   delete legacy.quality_checklist;
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 9);
+  assert.equal(migrated.schema_version, 10);
   assert.equal(migrated.translation_profile, null);
   assert.deepEqual(migrated.quality_checklist, []);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
@@ -993,6 +996,24 @@ test("import compatibility rejects changes to immutable source text", () => {
   validateTranslationJobCompatibility(imported, expected);
   const tampered = { ...imported, segments: imported.segments.map((segment, index) => index === 0 ? { ...segment, source_text: "spremenjen vir" } : segment) };
   assert.throws(() => validateTranslationJobCompatibility(tampered, expected), /spremenjene ali nezdružljive/);
+});
+
+test("import compatibility explains that a stale document model requires reanalysis", () => {
+  const expected = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const imported = importTranslationJob(exportTranslationJob(expected));
+  const stale = {
+    ...imported,
+    document_identity: imported.document_identity
+      ? { ...imported.document_identity, document_model_version: imported.document_identity.document_model_version - 1 }
+      : null,
+  };
+
+  assert.throws(
+    () => validateTranslationJobCompatibility(stale, expected),
+    /PDF ponovno analizirajte; uvožena datoteka opravila ostane nespremenjena/,
+  );
+  assert.equal(stale.segments[0].source_text, imported.segments[0].source_text);
+  assert.equal(stale.segments[0].edited_translation, imported.segments[0].edited_translation);
 });
 
 test("built-in exact segment glossary translates without automatic review", () => {
@@ -1139,7 +1160,7 @@ test("schema one import migrates explicitly and retains immutable source identit
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 9);
+  assert.equal(migrated.schema_version, 10);
   assert.equal(migrated.glossary[0].mode, "do_not_translate");
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.glossary_snapshot, migrated.glossary);
@@ -1248,7 +1269,7 @@ test("schema two job migrates chunk fields without changing source identity", ()
     return legacySegment;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 9);
+  assert.equal(migrated.schema_version, 10);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   assert.deepEqual(migrated.segments[0].chunks, []);
 });
@@ -1276,7 +1297,7 @@ test("schema seven mixed chunks migrate without inventing TM provenance", async 
     }),
   }));
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 9);
+  assert.equal(migrated.schema_version, 10);
   assert.equal(migrated.segments[0].translation_origin, "mixed");
   assert.deepEqual(migrated.segments[0].chunks.map((chunk) => chunk.translation_origin), ["translation_memory", "provider"]);
 });
@@ -1301,7 +1322,7 @@ test("schema three job migrates without inventing identity and can be safely reb
     return copy;
   });
   const migrated = importTranslationJob(JSON.stringify(legacy));
-  assert.equal(migrated.schema_version, 9);
+  assert.equal(migrated.schema_version, 10);
   assert.equal(migrated.document_identity, null);
   assert.equal(migrated.segments[0].source_text, current.segments[0].source_text);
   const rebound = bindTranslationJobToAnalysis(migrated, current);
@@ -1314,6 +1335,180 @@ test("cancellation during chunk translation returns the unchanged job", async ()
   const controller = new AbortController();
   const provider: TranslationProvider = { id: "cancel-midway", async translateBatch(requests) { controller.abort(); return requests.map((request) => ({ segment_id: request.segment_id, translated_text: request.text, confidence: null, error: null })); } };
   assert.equal(await translateJobBatch(job, provider, controller.signal), job);
+});
+
+test("manual correction keeps provider history but recomputes current placeholder QC", async () => {
+  const source = "Support the bonded materials for at least 24 hours after application.";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", source)],
+  }];
+  const initial = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  const failed = await translateJobBatch(initial, new DeterministicProvider(() => "Podprite materiale vsaj 24 ur po nanosu."));
+  assert.equal(failed.segments[0].status, "failed");
+  assert.ok(failed.segments[0].warnings.includes("placeholder_integrity"));
+
+  const corrected = updateTranslationJobSegment(failed, failed.segments[0].segment_id, (segment) =>
+    editTranslation(segment, "Podprite lepljene materiale vsaj 24 ur po nanosu."),
+  );
+  assert.ok(corrected.segments[0].warnings.includes("placeholder_integrity"));
+  assert.equal(corrected.segments[0].placeholder_attempts.length, failed.segments[0].placeholder_attempts.length);
+  assert.equal(corrected.segments[0].current_qc?.status, "passed");
+  assert.equal(corrected.segments[0].status, "translated");
+  assert.equal(corrected.segments[0].needs_review, true);
+});
+
+test("current QC blocks a manual edit that changes a protected value or unit", () => {
+  const source = "Use 2.5 MPa for 24 hours.";
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", source)],
+  }];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  const missingUnit = updateTranslationJobSegment(job, job.segments[0].segment_id, (segment) =>
+    editTranslation(segment, "Uporabite 2,5 za 24 ur."),
+  );
+  assert.equal(missingUnit.segments[0].current_qc?.status, "blocked");
+  assert.ok(missingUnit.segments[0].current_qc?.findings.some((finding) => finding.code === "technical_integrity"));
+
+  const changedValue = updateTranslationJobSegment(job, job.segments[0].segment_id, (segment) =>
+    editTranslation(segment, "Uporabite 3 MPa za 24 ur."),
+  );
+  assert.equal(changedValue.segments[0].current_qc?.status, "blocked");
+});
+
+test("preferred terminology warning follows the current edited translation", () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", "Fast curing")],
+  }];
+  const glossary: GlossaryEntry[] = [{
+    id: "preferred-fast-curing", source_term: "Fast curing", target_term: "hitro utrjevanje",
+    case_sensitive: false, mode: "preferred", enabled: true, origin: "user", scope: "document", status: "approved", revision: 1,
+  }];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl", glossary });
+  const missing = updateTranslationJobSegment(job, job.segments[0].segment_id, (segment) => editTranslation(segment, "Hitro sušenje"));
+  assert.ok(missing.segments[0].current_qc?.findings.some((finding) => finding.code === "preferred_term_missing"));
+  const present = updateTranslationJobSegment(missing, missing.segments[0].segment_id, (segment) => editTranslation(segment, "hitro utrjevanje"));
+  assert.ok(!present.segments[0].current_qc?.findings.some((finding) => finding.code === "preferred_term_missing"));
+  const removed = updateTranslationJobSegment(present, present.segments[0].segment_id, (segment) => editTranslation(segment, "Hitro sušenje"));
+  assert.ok(removed.segments[0].current_qc?.findings.some((finding) => finding.code === "preferred_term_missing"));
+});
+
+test("review is revision-bound while repeated QC keeps an unchanged review", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const id = job.segments[0].segment_id;
+  const reviewed = updateTranslationJobSegment(job, id, (segment) => reviewTranslation(editTranslation(segment, "UPORABA")));
+  assert.equal(reviewed.segments[0].status, "reviewed");
+  assert.equal(reviewed.segments[0].review_state?.origin, "local_user_action");
+  const rechecked = updateTranslationJobSegment(reviewed, id, (segment) => ({ ...segment }));
+  assert.equal(rechecked.segments[0].status, "reviewed");
+  assert.deepEqual(rechecked.segments[0].review_state, reviewed.segments[0].review_state);
+  const edited = updateTranslationJobSegment(rechecked, id, (segment) => editTranslation(segment, "DRUGA UPORABA"));
+  assert.equal(edited.segments[0].status, "translated");
+  assert.equal(edited.segments[0].review_state, null);
+});
+
+test("schema nine review migrates without inventing reviewer identity", () => {
+  const current = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const reviewed = updateTranslationJobSegment(current, current.segments[0].segment_id, (segment) => reviewTranslation(editTranslation(segment, "UPORABA")));
+  const legacy = JSON.parse(exportTranslationJob(reviewed)) as Record<string, unknown>;
+  legacy.schema_version = 9;
+  legacy.segments = (legacy.segments as Array<Record<string, unknown>>).map((segment) => {
+    const copy = { ...segment };
+    delete copy.review_state;
+    delete copy.current_qc;
+    return copy;
+  });
+  const imported = importTranslationJob(JSON.stringify(legacy));
+  assert.equal(imported.schema_version, 10);
+  assert.equal(imported.segments[0].status, "reviewed");
+  assert.equal(imported.segments[0].review_state?.origin, "legacy_unknown");
+});
+
+test("current QC rejects extra missing and altered protected data while allowing existing typography rules", () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", "Use CO₂ at -40 °C and 2.5 MPa for 24 hours with 72% coverage. RAL 9001 {{code}}")],
+  }];
+  const job = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  const correct = "Uporabite CO₂ pri −40\u00a0°C in 2,5\u00a0MPa za 24 ur z 72\u00a0% pokritostjo. RAL 9001 {{code}}";
+  const checked = (text: string) => updateTranslationJobSegment(job, job.segments[0].segment_id, (segment) => editTranslation(segment, text)).segments[0];
+  assert.ok(checked(correct).current_qc?.findings.every((finding) => finding.code === "technical_range_ambiguous"));
+  for (const broken of [
+    correct.replace("24", ""), correct.replace("MPa", "kPa"), correct.replace("CO₂", "CO2"),
+    correct.replace("RAL 9001", "RAL 9002"), correct.replace("{{code}}", ""), `${correct} 17`,
+  ]) assert.equal(checked(broken).current_qc?.status, "blocked", broken);
+});
+
+test("editing a reviewed translation to empty leaves QC unchecked and never reuses the old target", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const id = job.segments[0].segment_id;
+  const reviewed = updateTranslationJobSegment(job, id, (segment) => reviewTranslation(editTranslation({ ...segment, translated_text: "UPORABA" }, "UPORABA")));
+  const emptied = updateTranslationJobSegment(reviewed, id, (segment) => editTranslation(segment, ""));
+  assert.equal(emptied.segments[0].status, "pending");
+  assert.equal(emptied.segments[0].current_qc?.status, "not_checked");
+  assert.equal(emptied.segments[0].review_state, null);
+});
+
+test("QC configuration changes are recorded without changing the reviewed wording", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const id = job.segments[0].segment_id;
+  const reviewed = updateTranslationJobSegment(job, id, (segment) => reviewTranslation(editTranslation(segment, "UPORABA")));
+  const next = refreshTranslationProfileMetadata({ ...reviewed, glossary: [{
+    id: "current-term", source_term: reviewed.segments[0].source_text, target_term: "Priporočeni izraz",
+    case_sensitive: true, mode: "preferred", enabled: true, origin: "user", scope: "document", status: "approved",
+  }] });
+  assert.notEqual(next.segments[0].current_qc?.rules_revision, reviewed.segments[0].current_qc?.rules_revision);
+  assert.equal(next.segments[0].status, "reviewed");
+  assert.equal(next.segments[0].edited_translation, "UPORABA");
+  assert.ok(next.segments[0].current_qc?.findings.some((finding) => finding.code === "preferred_term_missing"));
+});
+
+test("import recomputes a stale QC result and invalidates a review bound to different wording", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const id = job.segments[0].segment_id;
+  const reviewed = updateTranslationJobSegment(job, id, (segment) => reviewTranslation(editTranslation(segment, "UPORABA")));
+  const stale = JSON.parse(exportTranslationJob(reviewed));
+  stale.segments[0].edited_translation = "DRUGA UPORABA";
+  const imported = importTranslationJob(JSON.stringify(stale));
+  assert.equal(imported.segments[0].status, "translated");
+  assert.equal(imported.segments[0].review_state, null);
+  assert.notEqual(imported.segments[0].current_qc?.content_revision, reviewed.segments[0].current_qc?.content_revision);
+});
+
+test("a delayed provider result or failure cannot overwrite a newer manual edit and review", async () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{
+    kind: "body", bbox: { x0: 0, y0: 0, x1: 100, y1: 50 }, reading_order: 1,
+    blocks: [block(1, "paragraph", "Keep the surface clean."), block(2, "paragraph", "Use a clean cloth.")],
+  }];
+  const requested = createTranslationJob(analysis, [], { source_language: "en", target_language: "sl" });
+  let release!: () => void;
+  const delayed = new Promise<void>((resolve) => { release = resolve; });
+  const provider: TranslationProvider = { id: "delayed-test", async translateBatch(requests) {
+    await delayed;
+    return requests.map((request) => ({ segment_id: request.segment_id, translated_text: "Odgovor ponudnika.", confidence: null, error: null }));
+  } };
+  const pending = translateJobBatch(requested, provider);
+  const running = { ...requested, segments: requested.segments.map((segment) => ({ ...segment, status: "translating" as const })) };
+  const edited = updateTranslationJobSegment(running, running.segments[0].segment_id, (segment) => reviewTranslation(editTranslation(segment, "Površina naj bo čista.")));
+  release();
+  const result = await pending;
+  const merged = mergeCurrentTranslationResult(edited, requested, result);
+  assert.equal(merged.segments[0].edited_translation, "Površina naj bo čista.");
+  assert.equal(merged.segments[0].status, "reviewed");
+  assert.deepEqual(merged.segments[0].review_state, edited.segments[0].review_state);
+  assert.equal(merged.segments[1].edited_translation, "Odgovor ponudnika.");
+  const failed = mergeCurrentTranslationResult(edited, requested, requested);
+  assert.equal(failed.segments[0].edited_translation, "Površina naj bo čista.");
+  assert.equal(failed.segments[0].status, "reviewed");
+  const otherDocument = { ...edited, document_identity: { ...edited.document_identity!, sha256: "f".repeat(64) } };
+  assert.equal(mergeCurrentTranslationResult(otherDocument, requested, result), otherDocument);
 });
 
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });

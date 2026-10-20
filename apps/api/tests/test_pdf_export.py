@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
+import app.services.pdf_exporter as pdf_exporter
 from app.core.config import settings
 from app.main import app
 from app.models import BBox
@@ -35,6 +36,26 @@ from app.services.pdf_typography import PdfTypographyResolver
 SOURCE_TEXT = "Digital source text for a safe translated PDF preview."
 TRANSLATED_TEXT = "Varen prevod čšžČŠŽ, CO₂ in +5 °C."
 client = TestClient(app)
+
+
+def test_export_accepts_schema_ten_review_metadata_without_changing_pdf_writer(tmp_path: Path) -> None:
+    source = tmp_path / "schema-ten.pdf"
+    _make_pdf(source)
+    payload = _job_payload(source)
+    payload["schema_version"] = 10
+    payload["segments"][0]["review_state"] = {
+        "content_revision": "local-content-identity", "origin": "local_user_action",
+    }
+    payload["segments"][0]["current_qc"] = {
+        "content_revision": "local-content-identity", "rules_revision": "test-rules",
+        "status": "passed", "findings": [],
+    }
+    job = PdfExportJob.model_validate(payload)
+    plan = plan_pdf_export(source, job, "replacement_preview", _work(tmp_path, "schema-ten-plan"))
+    assert plan.summary.eligible == 1
+    output = export_translated_pdf(source, job, "replacement_preview", _work(tmp_path, "schema-ten-output"))
+    with pymupdf.open(output.path) as document:
+        assert _written_text_matches(TRANSLATED_TEXT, document[0].get_text())
 
 
 def test_writer_scale_floor_accepts_only_floating_point_noise() -> None:
@@ -382,6 +403,11 @@ def test_identity_rejects_hash_page_count_and_geometry_mismatch(tmp_path: Path) 
     with pytest.raises(PdfExportValidationError, match="Geometrija"):
         plan_pdf_export(source, PdfExportJob.model_validate(payload), "diagnostic", _work(tmp_path, "geometry"))
 
+    payload = _job_payload(source)
+    payload["document_identity"]["document_model_version"] -= 1
+    with pytest.raises(PdfExportValidationError, match="PDF ponovno analizirajte; staro opravilo ostane nespremenjeno"):
+        plan_pdf_export(source, PdfExportJob.model_validate(payload), "diagnostic", _work(tmp_path, "model-version"))
+
 
 def test_plan_exports_only_reviewed_and_reports_invalid_regions(tmp_path: Path) -> None:
     source = tmp_path / "eligibility.pdf"
@@ -637,6 +663,194 @@ def test_multiline_style_and_safe_expansion_do_not_cross_neighbor(tmp_path: Path
     multiline = _job_payload(source, source_text="Line one\nLine two", translated_text="Prva vrstica\nDruga vrstica")
     multiline_plan = plan_pdf_export(source, PdfExportJob.model_validate(multiline), "diagnostic", _work(tmp_path, "multiline"))
     assert multiline_plan.replacements[0].original_line_count == 2
+
+
+def test_single_line_expansion_keeps_source_baseline_clear_of_vector_rule(tmp_path: Path) -> None:
+    source = tmp_path / "ruled-row.pdf"
+    source_text = "Pieces per pallet"
+    translated_text = "Kosi na paleti"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=180)
+        page.insert_text((30, 100), source_text, fontsize=9, fontname="helv")
+        source_rect = page.search_for(source_text)[0]
+        rule_y = source_rect.y1 + 0.5
+        page.draw_line((20, rule_y), (280, rule_y), color=(0.2, 0.2, 0.2), width=0.5)
+        document.save(source)
+
+    artifact = export_translated_pdf(
+        source,
+        PdfExportJob.model_validate(_job_payload(source, source_text=source_text, translated_text=translated_text)),
+        "replacement_preview",
+        _work(tmp_path, "ruled-row"),
+    )
+    replacement = artifact.plan.replacements[0]
+    assert replacement.fit_strategy == "expanded_bbox"
+    assert "source_baseline_aligned_around_vector_stroke" in replacement.typography_warnings
+
+    with pymupdf.open(source) as original, pymupdf.open(artifact.path) as output:
+        source_span = next(
+            span
+            for block in original[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span["text"] == source_text
+        )
+        translated_span = next(
+            span
+            for block in output[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span["text"] == translated_text
+        )
+        assert translated_span["origin"][1] == pytest.approx(source_span["origin"][1], abs=0.01)
+        assert translated_span["bbox"][3] < rule_y - 0.25
+        assert source_text not in output[0].get_text()
+        assert translated_text in output[0].get_text()
+        drawing_keys = ("items", "type", "color", "width", "rect")
+        assert [tuple(drawing[key] for key in drawing_keys) for drawing in output[0].get_drawings()] == [
+            tuple(drawing[key] for key in drawing_keys) for drawing in original[0].get_drawings()
+        ]
+
+
+def test_single_line_baseline_writer_avoids_false_html_leading_overflow(tmp_path: Path) -> None:
+    source = tmp_path / "tight-single-line.pdf"
+    source_text = "Short source"
+    translated_text = "Prevedeni dovolj dolgi enovrstični zapis"
+    with pymupdf.open() as document:
+        page = document.new_page(width=500, height=180)
+        page.insert_text((40, 88), "Previous", fontsize=9, fontname="helv")
+        page.insert_text((40, 100), source_text, fontsize=9, fontname="helv")
+        page.insert_text((40, 112), "Following", fontsize=9, fontname="helv")
+        document.save(source)
+
+    payload = _job_payload(source, source_text=source_text, translated_text=translated_text)
+    payload["segments"][0]["source_bbox"] = {"x0": 40, "y0": 91, "x1": 92, "y1": 100}
+    artifact = export_translated_pdf(
+        source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "tight-single-line"),
+    )
+    replacement = artifact.plan.replacements[0]
+
+    assert replacement.eligible is True
+    assert replacement.fit_strategy in {"expanded_bbox", "scaled"}
+    assert replacement.scale is not None and replacement.scale >= 0.75
+    assert "source_baseline_direct_write" in replacement.typography_warnings
+    with pymupdf.open(source) as original, pymupdf.open(artifact.path) as output:
+        source_span = next(
+            span
+            for block in original[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span["text"] == source_text
+        )
+        translated_span = next(
+            span
+            for block in output[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span["text"] == translated_text
+        )
+        assert translated_span["origin"][1] == pytest.approx(source_span["origin"][1], abs=0.01)
+        assert source_text not in output[0].get_text()
+        assert "Previous" in output[0].get_text()
+        assert "Following" in output[0].get_text()
+
+
+def test_single_line_baseline_writer_does_not_cross_enclosing_vector_border(tmp_path: Path) -> None:
+    source = tmp_path / "bordered-single-line.pdf"
+    source_text = "Short source"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=180)
+        page.draw_rect((35, 88, 115, 104), color=(0, 0, 0), width=0.5)
+        page.insert_text((40, 100), source_text, fontsize=9, fontname="helv")
+        document.save(source)
+
+    payload = _job_payload(
+        source,
+        source_text=source_text,
+        translated_text="Prevedeni zapis, ki bi prečkal desni rob okvirja",
+    )
+    payload["segments"][0]["source_bbox"] = {"x0": 40, "y0": 91, "x1": 92, "y1": 100}
+    artifact = export_translated_pdf(
+        source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "bordered-single-line"),
+    )
+    replacement = artifact.plan.replacements[0]
+
+    assert replacement.eligible is False
+    assert replacement.skip_reason == "overflow"
+    assert artifact.applied_replacements == 0
+    with pymupdf.open(artifact.path) as output:
+        assert source_text in output[0].get_text()
+
+
+def test_single_line_html_fit_preserves_source_baseline_next_to_marker(tmp_path: Path) -> None:
+    source = tmp_path / "aligned-marker.pdf"
+    source_text = "A longer source line"
+    translated_text = "Krajši prevod"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=180)
+        page.insert_text((30, 100), "*", fontsize=9, fontname="helv")
+        page.insert_text((42, 100), source_text, fontsize=9, fontname="helv")
+        source_rect = page.search_for(source_text)[0]
+        marker_rect = page.search_for("*")[0]
+        document.save(source)
+
+    payload = _job_payload(source, source_text=source_text, translated_text=translated_text)
+    payload["segments"][0]["source_bbox"] = {
+        "x0": source_rect.x0, "y0": source_rect.y0, "x1": source_rect.x1, "y1": source_rect.y1,
+    }
+    artifact = export_translated_pdf(
+        source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "aligned-marker"),
+    )
+    replacement = artifact.plan.replacements[0]
+
+    assert replacement.eligible is True
+    assert "source_baseline_preserved" in replacement.typography_warnings
+    with pymupdf.open(source) as original, pymupdf.open(artifact.path) as output:
+        source_span = next(
+            span
+            for block in original[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span["text"] == source_text
+        )
+        translated_span = next(
+            span
+            for block in output[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span["text"] == translated_text
+        )
+        assert translated_span["origin"][1] == pytest.approx(source_span["origin"][1], abs=0.01)
+        output_marker = output[0].search_for("*")[0]
+        assert tuple(output_marker) == pytest.approx(tuple(marker_rect), abs=0.01)
+
+
+def test_unresolved_vector_stroke_alignment_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "unsafe-ruled-row.pdf"
+    source_text = "Short"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=180)
+        page.insert_text((30, 100), source_text, fontsize=9, fontname="helv")
+        source_rect = page.search_for(source_text)[0]
+        page.draw_line((20, source_rect.y1 + 0.5), (280, source_rect.y1 + 0.5), width=0.5)
+        document.save(source)
+    monkeypatch.setattr(pdf_exporter, "_align_single_line_around_vector_strokes", lambda *_args: False)
+
+    plan = plan_pdf_export(
+        source,
+        PdfExportJob.model_validate(
+            _job_payload(source, source_text=source_text, translated_text="Daljši prevedeni naslov")
+        ),
+        "replacement_preview",
+        _work(tmp_path, "unsafe-ruled-row"),
+    )
+
+    replacement = plan.replacements[0]
+    assert replacement.eligible is False
+    assert replacement.skip_reason == "overlap_conflict"
+    assert replacement.resolution == "blocked_overlap_conflict"
 
 
 def test_missing_glyph_is_explicit_and_original_remains(tmp_path: Path) -> None:

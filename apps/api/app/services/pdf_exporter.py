@@ -30,14 +30,13 @@ from app.pdf_export_models import (
     SkipReason,
 )
 from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer
-from app.services.document_segmenter import segment_pdf
+from app.services.document_segmenter import DOCUMENT_MODEL_VERSION, segment_pdf
 from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canonical_text, is_technical_value, parse_cell_position
 from app.services.pdf_typography import FontAsset, MAX_SOURCE_FONT_SIZE, MIN_SOURCE_FONT_SIZE, PdfTypographyResolver
 from app.services.ocr_review_registry import ocr_review_registry
 
 LOGGER = logging.getLogger(__name__)
 
-DOCUMENT_MODEL_VERSION = 2
 MIN_FONT_SIZE = 6.0
 GEOMETRY_TOLERANCE = 0.5
 OVERLAP_TOLERANCE = 0.1
@@ -167,7 +166,10 @@ def export_translated_pdf(path: Path, job: PdfExportJob, mode: ExportMode, temp_
 def _validate_document_identity(path: Path, document: pymupdf.Document, job: PdfExportJob) -> None:
     identity = job.document_identity
     if identity.document_model_version != DOCUMENT_MODEL_VERSION:
-        raise PdfExportValidationError("document_model_version_mismatch", "Različica dokumentnega modela se ne ujema.")
+        raise PdfExportValidationError(
+            "document_model_version_mismatch",
+            "Različica dokumentnega modela se ne ujema. PDF ponovno analizirajte; staro opravilo ostane nespremenjeno.",
+        )
     if _sha256(path) != identity.sha256:
         raise PdfExportValidationError("pdf_hash_mismatch", "Prevajalsko opravilo pripada drugemu PDF-ju.")
     if document.page_count != identity.page_count or len(identity.pages) != document.page_count:
@@ -912,13 +914,22 @@ def _fit_replacement(
     if expanded != original:
         expanded_fit = _htmlbox_preflight(page.rect, expanded, replacement, typography, asset, 1.0)
         if expanded_fit[0] >= 0:
-            return _accept_fit(replacement, expanded, expanded_fit, "expanded_bbox")
+            _accept_fit(replacement, expanded, expanded_fit, "expanded_bbox")
+            if not _align_single_line_around_vector_strokes(page, replacement, replacements, typography, asset):
+                _skip(replacement, "overlap_conflict", "Prevoda ni mogoče varno odmakniti od vektorske črte.")
+            return
 
     fit_rect = expanded if expanded != original else original
     minimum_scale = _minimum_text_scale(replacement)
     scaled = _htmlbox_preflight(page.rect, fit_rect, replacement, typography, asset, minimum_scale)
     if scaled[0] >= 0 and scaled[1] + 0.0001 >= minimum_scale:
-        return _accept_fit(replacement, fit_rect, scaled, "scaled")
+        _accept_fit(replacement, fit_rect, scaled, "scaled")
+        if not _align_single_line_around_vector_strokes(page, replacement, replacements, typography, asset):
+            _skip(replacement, "overlap_conflict", "Prevoda ni mogoče varno odmakniti od vektorske črte.")
+        return
+
+    if _fit_single_line_on_source_baseline(page, fit_rect, replacement, asset, minimum_scale):
+        return
 
     replacement.fit_strategy = "overflow"
     _skip(replacement, "overflow", "Prevod se ne prilega znotraj dovoljene tipografske meje.", "overflow")
@@ -1125,6 +1136,275 @@ def _htmlbox_preflight(
     return spare, scale, line_count
 
 
+@dataclass(frozen=True)
+class _SingleLineGeometry:
+    bbox: pymupdf.Rect
+    baseline_y: float
+
+
+def _align_single_line_around_vector_strokes(
+    page: pymupdf.Page,
+    replacement: PdfReplacement,
+    replacements: list[PdfReplacement],
+    typography: PdfTypographyResolver,
+    asset: FontAsset,
+) -> bool:
+    """Keep a proven source baseline when a single-line HTML replacement can be shifted safely."""
+    if replacement.original_line_count != 1 or replacement.fitted_bbox is None or replacement.source_bbox is None:
+        return True
+    source_rect = _rect(replacement.source_bbox)
+    source = _single_source_line_geometry(page, source_rect)
+    rendered = _single_rendered_line_geometry(page.rect, _rect(replacement.fitted_bbox), replacement, typography, asset)
+    if source is None or rendered is None:
+        return True
+
+    strokes = _vector_stroke_obstacles(page)
+    rendered_collisions = [stroke for stroke in strokes if _is_material_overlap(rendered.bbox & stroke)]
+    delta_y = source.baseline_y - rendered.baseline_y
+    if abs(delta_y) <= GEOMETRY_TOLERANCE:
+        return True
+    shifted = pymupdf.Rect(
+        replacement.fitted_bbox.x0,
+        replacement.fitted_bbox.y0 + delta_y,
+        replacement.fitted_bbox.x1,
+        replacement.fitted_bbox.y1 + delta_y,
+    )
+    if not _inside(shifted, page.rect):
+        return False
+    aligned = _single_rendered_line_geometry(page.rect, shifted, replacement, typography, asset)
+    if aligned is None or abs(aligned.baseline_y - source.baseline_y) > GEOMETRY_TOLERANCE:
+        return False
+    if any(_is_material_overlap(aligned.bbox & stroke) for stroke in strokes):
+        return False
+
+    obstacles = [
+        rect for rect in _text_span_rects(page)
+        if (rect & source_rect).is_empty
+    ]
+    obstacles.extend(
+        pymupdf.Rect(image["bbox"])
+        for image in page.get_image_info()
+        if (pymupdf.Rect(image["bbox"]) & source_rect).is_empty
+    )
+    obstacles.extend(
+        _rect(item.original_bbox)
+        for item in replacements
+        if item is not replacement
+        and item.page_number == replacement.page_number
+        and item.original_bbox is not None
+        and (_rect(item.original_bbox) & source_rect).is_empty
+    )
+    if any(_is_material_overlap(aligned.bbox & obstacle) for obstacle in obstacles):
+        return False
+
+    replacement.fitted_bbox = _bbox(shifted)
+    replacement.typography_warnings.append("source_baseline_preserved")
+    if rendered_collisions:
+        replacement.typography_warnings.append("source_baseline_aligned_around_vector_stroke")
+    return True
+
+
+def _fit_single_line_on_source_baseline(
+    page: pymupdf.Page,
+    fit_rect: pymupdf.Rect,
+    replacement: PdfReplacement,
+    asset: FontAsset,
+    minimum_scale: float,
+) -> bool:
+    """Use the proven source baseline when HTML box leading alone causes overflow."""
+    if (
+        replacement.original_line_count != 1
+        or replacement.source_bbox is None
+        or replacement.alignment != "left"
+        or "\n" in _rendered_translation(replacement)
+    ):
+        return False
+    source = _single_source_line_geometry(page, _layout_rect(replacement))
+    if source is None:
+        return False
+    fit_rect = _bounded_by_enclosing_vector_stroke(page, _layout_rect(replacement), fit_rect)
+
+    def measured(scale: float) -> _SingleLineGeometry | None:
+        geometry = _direct_single_line_geometry(
+            page.rect,
+            source.bbox.x0,
+            source.baseline_y,
+            replacement,
+            asset,
+            scale,
+        )
+        if geometry is None or not _contains_with_tolerance(fit_rect, geometry.bbox):
+            return None
+        return geometry
+
+    exact = measured(1.0)
+    if exact is not None:
+        scale = 1.0
+        geometry = exact
+    else:
+        geometry = measured(minimum_scale)
+        if geometry is None:
+            return False
+        low, high = minimum_scale, 1.0
+        for _ in range(24):
+            candidate = (low + high) / 2
+            candidate_geometry = measured(candidate)
+            if candidate_geometry is None:
+                high = candidate
+            else:
+                low = candidate
+                geometry = candidate_geometry
+        scale = low
+
+    replacement.fitted_bbox = _bbox(geometry.bbox)
+    replacement.scale = scale
+    replacement.fitted_font_size = round(replacement.requested_font_size * scale, 2)
+    replacement.fitted_line_count = 1
+    if scale < 1.0:
+        replacement.fit_strategy = "scaled"
+    elif _contains_with_tolerance(_layout_rect(replacement), geometry.bbox):
+        replacement.fit_strategy = "exact"
+    else:
+        replacement.fit_strategy = "expanded_bbox"
+    replacement.fit_status = "fits"
+    replacement.eligible = True
+    replacement.resolution = "replacement_planned"
+    replacement.typography_warnings.append("source_baseline_direct_write")
+    return True
+
+
+def _direct_single_line_geometry(
+    page_rect: pymupdf.Rect,
+    origin_x: float,
+    baseline_y: float,
+    replacement: PdfReplacement,
+    asset: FontAsset,
+    scale: float,
+) -> _SingleLineGeometry | None:
+    with pymupdf.open() as scratch:
+        page = scratch.new_page(width=page_rect.width, height=page_rect.height)
+        page.insert_font(fontname=asset.code, fontfile=str(asset.path))
+        written = page.insert_text(
+            (origin_x, baseline_y),
+            _rendered_translation(replacement),
+            fontname=asset.code,
+            fontsize=replacement.requested_font_size * scale,
+        )
+        if written != 1:
+            return None
+        lines = [
+            line
+            for block in page.get_text("dict").get("blocks", [])
+            for line in block.get("lines", [])
+            if any(span.get("text", "").strip() for span in line.get("spans", []))
+        ]
+    if len(lines) != 1:
+        return None
+    return _line_geometry(lines[0])
+
+
+def _contains_with_tolerance(outer: pymupdf.Rect, inner: pymupdf.Rect) -> bool:
+    return (
+        inner.x0 >= outer.x0 - GEOMETRY_TOLERANCE
+        and inner.y0 >= outer.y0 - GEOMETRY_TOLERANCE
+        and inner.x1 <= outer.x1 + GEOMETRY_TOLERANCE
+        and inner.y1 <= outer.y1 + GEOMETRY_TOLERANCE
+    )
+
+
+def _bounded_by_enclosing_vector_stroke(
+    page: pymupdf.Page,
+    source_rect: pymupdf.Rect,
+    fit_rect: pymupdf.Rect,
+) -> pymupdf.Rect:
+    """Keep direct text inside the smallest stroked container that owns its source."""
+    containers: list[tuple[float, pymupdf.Rect, float]] = []
+    for drawing in page.get_drawings():
+        if "s" not in str(drawing.get("type", "")):
+            continue
+        bounds = pymupdf.Rect(drawing["rect"])
+        if not _contains_with_tolerance(bounds, source_rect):
+            continue
+        containers.append((bounds.width * bounds.height, bounds, float(drawing.get("width") or 0.0)))
+    if not containers:
+        return fit_rect
+    _, bounds, stroke_width = min(containers, key=lambda item: item[0])
+    clearance = max(GEOMETRY_TOLERANCE, stroke_width / 2)
+    interior = pymupdf.Rect(
+        bounds.x0 + clearance,
+        bounds.y0 + clearance,
+        bounds.x1 - clearance,
+        bounds.y1 - clearance,
+    )
+    return fit_rect & interior
+
+
+def _single_source_line_geometry(page: pymupdf.Page, rect: pymupdf.Rect) -> _SingleLineGeometry | None:
+    lines = [
+        line
+        for block in page.get_text("dict", clip=rect).get("blocks", [])
+        for line in block.get("lines", [])
+        if any(span.get("text", "").strip() for span in line.get("spans", []))
+    ]
+    if len(lines) != 1:
+        return None
+    return _line_geometry(lines[0])
+
+
+def _single_rendered_line_geometry(
+    page_rect: pymupdf.Rect,
+    rect: pymupdf.Rect,
+    replacement: PdfReplacement,
+    typography: PdfTypographyResolver,
+    asset: FontAsset,
+) -> _SingleLineGeometry | None:
+    html_text, css = typography.html_and_css(_rendered_translation(replacement), replacement.typography, asset)
+    with pymupdf.open() as scratch:
+        page = scratch.new_page(width=page_rect.width, height=page_rect.height)
+        spare, scale = page.insert_htmlbox(rect, html_text, css=css, scale_low=0.0, archive=typography.archive)
+        if spare < 0 or replacement.scale is None or not _scale_meets_floor(scale, replacement.scale):
+            return None
+        lines = [
+            line
+            for block in page.get_text("dict", clip=rect).get("blocks", [])
+            for line in block.get("lines", [])
+            if any(span.get("text", "").strip() for span in line.get("spans", []))
+        ]
+    if len(lines) != 1:
+        return None
+    return _line_geometry(lines[0])
+
+
+def _line_geometry(line: dict) -> _SingleLineGeometry | None:
+    spans = [span for span in line.get("spans", []) if span.get("text", "").strip()]
+    if not spans or any("origin" not in span or "bbox" not in span for span in spans):
+        return None
+    baseline_values = [float(span["origin"][1]) for span in spans]
+    if max(baseline_values) - min(baseline_values) > GEOMETRY_TOLERANCE:
+        return None
+    bbox = pymupdf.Rect(spans[0]["bbox"])
+    for span in spans[1:]:
+        bbox |= pymupdf.Rect(span["bbox"])
+    return _SingleLineGeometry(bbox=bbox, baseline_y=sum(baseline_values) / len(baseline_values))
+
+
+def _vector_stroke_obstacles(page: pymupdf.Page) -> list[pymupdf.Rect]:
+    obstacles: list[pymupdf.Rect] = []
+    for drawing in page.get_drawings():
+        half_width = max(0.01, float(drawing.get("width") or 0.0) / 2)
+        for item in drawing.get("items", []):
+            if item[0] != "l":
+                continue
+            start, end = item[1], item[2]
+            obstacles.append(pymupdf.Rect(
+                min(start.x, end.x) - half_width,
+                min(start.y, end.y) - half_width,
+                max(start.x, end.x) + half_width,
+                max(start.y, end.y) + half_width,
+            ))
+    return obstacles
+
+
 def _safe_expansion(
     page: pymupdf.Page,
     rect: pymupdf.Rect,
@@ -1144,6 +1424,7 @@ def _safe_expansion(
         min(right_limit, rect.x1 + max(36.0, rect.width * 1.5)),
         min(page.rect.y1 - 12, rect.y1 + max(12.0, rect.height * 1.2)),
     )
+    candidate = _bounded_by_enclosing_vector_stroke(page, rect, candidate)
     obstacles = _text_span_rects(page)
     obstacles.extend(pymupdf.Rect(image["bbox"]) for image in page.get_image_info())
     obstacles.extend(pymupdf.Rect(drawing["rect"]) for drawing in page.get_drawings())
@@ -1244,6 +1525,12 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
     for page_number in pages:
         page = document[page_number - 1]
         page_items = [item for item in eligible if item.page_number == page_number]
+        direct_origins = {
+            item.segment_id: geometry
+            for item in page_items
+            if "source_baseline_direct_write" in item.typography_warnings
+            and (geometry := _single_source_line_geometry(page, _layout_rect(item))) is not None
+        }
         for item in page_items:
             redactions = item.redaction_rects if item.background_patch_used and item.redaction_rects else [item.original_bbox]
             for redaction in redactions:
@@ -1255,6 +1542,29 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
                 for patch in item.patch_rects:
                     page.draw_rect(_rect(patch), color=None, fill=patch_color, fill_opacity=1, overlay=True)
             asset = _asset_for(item, typography)
+            if "source_baseline_direct_write" in item.typography_warnings:
+                source = direct_origins.get(item.segment_id)
+                if source is None or item.scale is None:
+                    raise PdfExportValidationError(
+                        "insert_failed",
+                        f"Izvorne osnovnice segmenta {item.segment_id} pri končnem zapisu ni bilo mogoče potrditi.",
+                    )
+                page.insert_font(fontname=asset.code, fontfile=str(asset.path))
+                written = page.insert_text(
+                    (source.bbox.x0, source.baseline_y),
+                    _rendered_translation(item),
+                    fontname=asset.code,
+                    fontsize=item.requested_font_size * item.scale,
+                    color=_style_color(item.color),
+                    overlay=True,
+                )
+                if written != 1:
+                    raise PdfExportValidationError(
+                        "insert_failed",
+                        f"Enovrstični prevod segmenta {item.segment_id} pri končnem zapisu ni bil vstavljen.",
+                    )
+                applied += 1
+                continue
             html_text, css = typography.html_and_css(
                 _rendered_translation(item), item.typography, asset,
                 use_full_table_interior=isinstance(item, PdfTableCellReplacement),

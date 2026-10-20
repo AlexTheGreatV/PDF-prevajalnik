@@ -2,9 +2,19 @@ import { apiBaseUrl } from "./pdf-client";
 import type { BBox, TableGeometryEvidence, TableOwnership } from "./pdf-types";
 import type { TranslationJob } from "./translation-types";
 import { isTranslationUnitSegment } from "./translation-units";
+import { exportTranslationJob } from "./translation-job";
 
 export type PdfExportMode = "diagnostic" | "replacement_preview";
 export const FINAL_PDF_EXPORT_MODE: PdfExportMode = "replacement_preview";
+export type RevisionBoundValue<T> = { revisionKey: string; value: T } | null;
+
+export function currentRevisionValue<T>(state: RevisionBoundValue<T>, revisionKey: string): T | null {
+  return state?.revisionKey === revisionKey ? state.value : null;
+}
+
+export function isCurrentPdfExportRevision(requestRevision: string, currentRevision: string): boolean {
+  return requestRevision === currentRevision;
+}
 export type ImageOverlapKind = "none" | "simple_background" | "complex_background" | "image_only_text" | "uncertain";
 export type PdfExportResolution =
   | "replacement_planned"
@@ -354,11 +364,16 @@ export async function downloadPdfExport(file: File, job: TranslationJob, mode: P
 }
 
 function postExportRequest(path: string, file: File, job: TranslationJob, mode: PdfExportMode): Promise<Response> {
+  const currentJob = JSON.parse(exportTranslationJob(job)) as TranslationJob;
+  const blocked = currentJob.segments.filter((segment) => segment.status === "reviewed" && segment.current_qc?.status === "blocked");
+  if (mode === FINAL_PDF_EXPORT_MODE && blocked.length) {
+    throw new Error(`Aktualni QC blokira PDF izvoz: ${blocked.map((segment) => segment.segment_id).join(", ")}. Popravite zaščitene podatke in znova potrdite prevod.`);
+  }
   const form = new FormData();
   form.append("file", file);
   form.append("translation_job", JSON.stringify({
-    ...job,
-    segments: job.segments.filter(isTranslationUnitSegment),
+    ...currentJob,
+    segments: currentJob.segments.filter(isTranslationUnitSegment),
   }));
   form.append("mode", mode);
   return fetch(`${apiBaseUrl}${path}`, { method: "POST", body: form });

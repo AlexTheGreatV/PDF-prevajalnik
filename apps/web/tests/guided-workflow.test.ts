@@ -29,13 +29,15 @@ function segment(status: TranslationSegment["status"], id = "segment-1"): Transl
     skip_reason: null, protected_tokens: [], glossary_matches: [], translation_origin: status === "pending" ? null : "provider",
     glossary_entry_id: null, model_id: status === "pending" ? null : "hplt", provider_id: status === "pending" ? null : "local",
     placeholder_attempts: [], needs_review: status !== "reviewed", warnings: [], chunks: [], forced_chunking: false,
+    review_state: status === "reviewed" ? { content_revision: "fixture", origin: "legacy_unknown" } : null,
+    current_qc: null,
     created_at: "2026-09-25T00:00:00Z",
   };
 }
 
 function job(segments: TranslationSegment[]): TranslationJob {
   return {
-    schema_version: 9, source_filename: "sample.pdf", source_language: "en", target_language: "sl", domain: "",
+    schema_version: 10, source_filename: "sample.pdf", source_language: "en", target_language: "sl", domain: "",
     created_at: "2026-09-25T00:00:00Z", document_identity: null, glossary: [], glossary_snapshot: [],
     glossary_set_hash: null, glossary_usage: [], translation_memory_snapshot: [], translation_memory_set_hash: null,
     translation_memory_usage: [], segments, translation_profile: null, quality_checklist: [],

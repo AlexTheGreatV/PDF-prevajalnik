@@ -19,6 +19,22 @@ export type AcceptedOcrSource = {
   reason: string;
 };
 export type TranslationOrigin = "glossary" | "translation_memory" | "provider" | "mixed" | "manual" | null;
+export type TranslationReviewState = {
+  content_revision: string;
+  origin: "local_user_action" | "legacy_unknown";
+};
+export type TranslationQcFinding = {
+  code: "technical_integrity" | "placeholder_integrity" | "protected_glossary" | "preferred_term_missing" | "technical_range_ambiguous";
+  severity: "warning" | "blocking";
+  message: string;
+  glossary_entry_id?: string | null;
+};
+export type TranslationQcResult = {
+  content_revision: string;
+  rules_revision: string;
+  status: "not_checked" | "passed" | "warnings" | "blocked";
+  findings: TranslationQcFinding[];
+};
 export type TableCellSourceProvenance = StructuredTableCellProvenance & {
   table_id: string;
   table_bbox: BBox;
@@ -168,6 +184,8 @@ export type TranslationSegment = {
   placeholder_attempts: PlaceholderAttempt[];
   needs_review: boolean;
   warnings: string[];
+  review_state: TranslationReviewState | null;
+  current_qc: TranslationQcResult | null;
   chunks: TranslationChunk[];
   forced_chunking: boolean;
   translation_rules_version?: string | null;
@@ -176,7 +194,7 @@ export type TranslationSegment = {
 };
 
 export type TranslationJob = {
-  schema_version: 9;
+  schema_version: 10;
   source_filename: string;
   source_language: string;
   target_language: string;

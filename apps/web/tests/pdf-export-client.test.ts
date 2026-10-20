@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { calculateDocumentCoverage, createCoverageRevisionKey } from "../lib/document-coverage";
 import {
   downloadPdfExport,
+  currentRevisionValue,
+  isCurrentPdfExportRevision,
   preparePdfExport,
   resolvePdfExportMode,
   validatePdfExportDownload,
@@ -12,6 +14,7 @@ import {
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, PdfKind } from "../lib/pdf-types";
 import type { TranslationJob } from "../lib/translation-types";
+import { editTranslation, reviewTranslation, updateTranslationJobSegment } from "../lib/translation-job";
 
 const tests: Promise<void>[] = [];
 function test(name: string, run: () => void | Promise<void>) {
@@ -20,7 +23,7 @@ function test(name: string, run: () => void | Promise<void>) {
 
 function job(): TranslationJob {
   return {
-    schema_version: 9,
+    schema_version: 10,
     source_filename: "source.pdf",
     source_language: "en",
     target_language: "sl",
@@ -47,7 +50,7 @@ test("prepares a local multipart PDF export plan", async () => {
     assert.equal(init?.method, "POST");
     const form = init?.body as FormData;
     assert.equal(form.get("mode"), "diagnostic");
-    assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 9);
+    assert.equal(JSON.parse(String(form.get("translation_job"))).schema_version, 10);
     return new Response(JSON.stringify({
       filename: "source-sl-diagnostic.pdf",
       mode: "diagnostic",
@@ -432,6 +435,44 @@ test("invalidates export completion when translation review OCR source or docume
   assert.notEqual(createCoverageRevisionKey({ analysis: baseAnalysis, ocrItems: baseOcr, job: baseJob, mode: "replacement_preview" }), key);
 });
 
+test("a delayed result from an older export revision cannot become current", async () => {
+  let resolve!: (value: string) => void;
+  const delayed = new Promise<string>((done) => { resolve = done; });
+  const requestRevision = "revision-before-edit";
+  let currentRevision = requestRevision;
+  const result = delayed.then((value) => isCurrentPdfExportRevision(requestRevision, currentRevision) ? value : null);
+  currentRevision = "revision-after-edit";
+  resolve("old export error");
+  assert.equal(await result, null);
+  assert.equal(currentRevisionValue({ revisionKey: requestRevision, value: "old export error" }, currentRevision), null);
+  assert.equal(currentRevisionValue({ revisionKey: currentRevision, value: "new export error" }, currentRevision), "new export error");
+});
+
+test("a failed export becomes stale after editing and a new attempt uses the new review and QC", () => {
+  const currentJob = job();
+  currentJob.segments = [reviewTranslation(editTranslation(segment({ source_text: "Keep 24 hours." }), "Ohranite 24 ur."))];
+  const context = { analysis: analysis(["digital"]), ocrItems: [] as OcrReviewItem[], mode: "replacement_preview" };
+  const before = createCoverageRevisionKey({ ...context, job: currentJob });
+  const failedAttempt = { revisionKey: before, value: "Preverjanje vstavljanja ni uspelo." };
+  assert.equal(currentRevisionValue(failedAttempt, before), failedAttempt.value);
+  const edited = updateTranslationJobSegment(currentJob, currentJob.segments[0].segment_id, (segment) => editTranslation(segment, "Pustite 24 ur."));
+  const after = createCoverageRevisionKey({ ...context, job: edited });
+  assert.equal(currentRevisionValue(failedAttempt, after), null);
+  assert.equal(currentRevisionValue({ revisionKey: before, value: plan([]) }, after), null);
+  assert.equal(edited.segments[0].status, "translated");
+  const approved = updateTranslationJobSegment(edited, edited.segments[0].segment_id, reviewTranslation);
+  assert.equal(approved.segments[0].current_qc?.status, "passed");
+  assert.ok(!isCurrentPdfExportRevision(before, createCoverageRevisionKey({ ...context, job: approved })));
+});
+
+test("PDF transport rechecks current technical integrity even when stored QC claims success", async () => {
+  const currentJob = job();
+  const damaged = reviewTranslation(editTranslation(segment({ source_text: "Keep 24 hours at 2.5 MPa." }), "Ohranite 24 ur pri 2,5 kPa."));
+  damaged.current_qc = { content_revision: "stale", rules_revision: "stale", status: "passed", findings: [] };
+  currentJob.segments = [damaged];
+  await assert.rejects(() => preparePdfExport(new File(["%PDF-"], "source.pdf"), currentJob, "replacement_preview"), /Aktualni QC blokira/);
+});
+
 test("does not mark an empty document or an export plan as completed", () => {
   const emptyCoverage = calculateDocumentCoverage({
     analysis: analysis([]), ocrItems: [], job: job(), plan: null, downloadCompleted: false,
@@ -468,7 +509,8 @@ function segment(overrides: Partial<TranslationJob["segments"][number]> = {}): T
     source_style: null, accepted_ocr_source: null, translated_text: "", edited_translation: "", status: "pending",
     quality: null, error: null, skip_reason: null, protected_tokens: [], glossary_matches: [], translation_origin: null,
     glossary_entry_id: null, model_id: null, provider_id: null, placeholder_attempts: [], needs_review: false,
-    warnings: [], chunks: [], forced_chunking: false, created_at: "2026-09-11T00:00:00Z", ...overrides,
+    warnings: [], review_state: null, current_qc: null, chunks: [], forced_chunking: false,
+    created_at: "2026-09-11T00:00:00Z", ...overrides,
   };
 }
 

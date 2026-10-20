@@ -380,6 +380,10 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
         <strong>Stran {segment.page_number} · {segment.block_type}</strong>
         <span>{segment.status} · besedilo: {segment.source_text_origin === "accepted_ocr" ? "potrjeni OCR" : "native"} · prevod: {segment.translation_origin === "mixed" ? "mešano (TM + lokalni model)" : segment.translation_origin ?? "še ni"}</span>
       </header>
+      <div className="translation-state-grid" aria-label="Stanje pregleda in kakovosti">
+        <span><strong>Uporabniški pregled</strong>{reviewStateLabel(segment)}</span>
+        <span><strong>Avtomatski QC</strong>{qcStateLabel(segment)}</span>
+      </div>
       <div className="translation-columns">
         <div><h3>Izvorno</h3><pre>{segment.source_text || "Ni izvornega besedila."}</pre></div>
         {segment.skip_reason
@@ -391,9 +395,15 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
       {segment.translation_memory_entry_id && <div className="translation-origin">Prevajalski spomin: {segment.translation_memory_entry_id} · rev. {segment.translation_memory_revision} · exact</div>}
       {segment.model_id && <div className="translation-origin">Model: {segment.model_id}</div>}
       {segment.needs_review && <p className="translation-warning">Potreben je ročni pregled.</p>}
-      {segment.warnings.length > 0 && <div className="translation-origin">Opozorila: {segment.warnings.join(", ")}</div>}
+      {segment.current_qc?.findings.map((finding, index) => <p className={finding.severity === "blocking" ? "translation-error" : "translation-warning"} key={`${finding.code}-${finding.glossary_entry_id ?? index}`}>{finding.message}</p>)}
+      {(segment.warnings.length > 0 || segment.placeholder_attempts.length > 0) && <details className="translation-history">
+        <summary>Zgodovina prevajanja in ponovnih poskusov</summary>
+        {segment.warnings.length > 0 && <p>Pretekla opozorila: {segment.warnings.join(", ")}</p>}
+        {segment.placeholder_attempts.length > 0 && <p>Poskusi placeholderjev: {segment.placeholder_attempts.length}</p>}
+      </details>}
       {segment.chunks.length > 1 && <details className="translation-chunks">
-        <summary>Prevajalske enote: {segment.chunks.filter((chunk) => chunk.status === "translated").length}/{segment.chunks.length}</summary>
+        <summary>Zgodovinski modelni deli: {segment.chunks.filter((chunk) => chunk.status === "translated").length}/{segment.chunks.length}</summary>
+        {segment.translation_origin === "manual" && <p>Ti deli pripadajo prejšnjemu prevajanju. Aktualni QC preverja celoten ročno urejeni segment.</p>}
         {segment.chunks.map((chunk) => <div key={chunk.chunk_id} className={`translation-chunk ${chunk.status}`}>
           <strong>{chunk.chunk_id} · {chunk.status} · {chunk.translation_origin === "translation_memory" ? "natančen zadetek TM" : chunk.translation_origin === "provider" ? "lokalni model" : "brez izvora"}</strong>
           <p>{chunk.source_text}</p>
@@ -413,6 +423,20 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
       </div>}
     </article>
   );
+}
+
+function reviewStateLabel(segment: TranslationSegment): string {
+  if (segment.status !== "reviewed" || !segment.review_state) return "Ni potrjeno";
+  return segment.review_state.origin === "local_user_action"
+    ? "Uporabniško potrjeno za trenutno besedilo"
+    : "Potrjeno v starejšem ali uvoženem opravilu; izvor potrditve ni znan";
+}
+
+function qcStateLabel(segment: TranslationSegment): string {
+  if (!segment.current_qc || segment.current_qc.status === "not_checked") return "Ni preverjeno";
+  if (segment.current_qc.status === "passed") return "Zaščiteni podatki preverjeni";
+  if (segment.current_qc.status === "warnings") return "Opozorila za trenutno besedilo";
+  return "Blokada za trenutno besedilo";
 }
 
 function GlossaryEditor({ entries, onChange, onAdd }: { entries: GlossaryEntry[]; onChange: (entries: GlossaryEntry[]) => void; onAdd: () => void }) {
