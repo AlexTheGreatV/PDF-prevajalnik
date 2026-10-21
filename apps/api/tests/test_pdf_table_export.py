@@ -7,6 +7,7 @@ from pathlib import Path
 import pymupdf
 import pytest
 from PIL import Image, ImageChops, ImageDraw
+import app.services.pdf_exporter as pdf_exporter
 
 from app.pdf_export_models import PdfExportJob
 from app.services.pdf_exporter import (
@@ -20,6 +21,151 @@ from app.services.pdf_exporter import (
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_table_export import PdfTableAnalyzer, is_technical_value
 from app.services.pdf_typography import PdfTypographyResolver
+
+
+def test_tight_table_baseline_exports_complete_text_and_preserves_neighbors(tmp_path: Path) -> None:
+    source = tmp_path / "tight-table.pdf"
+    _make_baseline_table(source)
+    before = _hash(source)
+    drawings = _drawing_signature(source)
+    neighbor = _render_clip(source, pymupdf.Rect(201, 41, 369, 67))
+    target = "Trdnost čšž 2,5\u00a0MPa"
+    # Synthetic fixture review is a test setup, not approval of a real document.
+    job = _job(source, translations={(0, 0): target})
+    artifact = export_translated_pdf(source, job, "replacement_preview", tmp_path / "output")
+    cell = artifact.plan.tables[0].cells[0]
+    assert artifact.applied_replacements == 1
+    assert "verified_table_source_baseline" in cell.typography_warnings
+    assert cell.fitted_font_size >= max(5.5, cell.source_font_size * 0.75)
+    assert cell.fitted_line_count == 1
+    assert pdf_exporter._rect(cell.content_bbox).contains(pdf_exporter._rect(cell.fitted_bbox))
+    assert _hash(source) == before and _drawing_signature(artifact.path) == drawings
+    assert ImageChops.difference(neighbor, _render_clip(artifact.path, pymupdf.Rect(201, 41, 369, 67))).getbbox() is None
+    with pymupdf.open(source) as original, pymupdf.open(artifact.path) as output:
+        text = output[0].get_text()
+        assert pdf_exporter._written_text_matches(target, output[0].get_text(clip=pdf_exporter._rect(cell.fitted_bbox)))
+        assert "Strength 2.5 MPa" not in text
+        assert all(value in text for value in ("20 L", "1200", "Other label"))
+        native = pdf_exporter._single_source_line_geometry(original[0], pdf_exporter._rect(cell.source_bbox))
+        inserted = pdf_exporter._single_source_line_geometry(output[0], pdf_exporter._rect(cell.fitted_bbox))
+        assert inserted.baseline_y == pytest.approx(native.baseline_y, abs=0.01)
+
+
+@pytest.mark.parametrize("target", ["Predolgi prevod " * 70, "Prva vrstica\nDruga vrstica"])
+def test_tight_table_baseline_overflow_preserves_source(tmp_path: Path, target: str) -> None:
+    source = tmp_path / "overflow-baseline.pdf"
+    _make_baseline_table(source)
+    artifact = export_translated_pdf(source, _job(source, translations={(0, 0): target}), "replacement_preview", tmp_path / "output")
+    cell = artifact.plan.tables[0].cells[0]
+    assert not cell.eligible and cell.skip_reason == "cell_overflow"
+    assert "verified_table_source_baseline" not in cell.typography_warnings
+    assert artifact.applied_replacements == 0
+    with pymupdf.open(artifact.path) as output:
+        assert "Strength 2.5 MPa" in output[0].get_text()
+
+
+def test_tight_table_baseline_does_not_reduce_small_source_font_or_hit_border(tmp_path: Path) -> None:
+    source = tmp_path / "too-low-cell.pdf"
+    _make_baseline_table(source, row_height=8, font_size=5, baseline_offset=6)
+    artifact = export_translated_pdf(source, _job(source, translations={(0, 0): "Trdnost 2,5 MPa"}), "replacement_preview", tmp_path / "output")
+    cell = artifact.plan.tables[0].cells[0]
+    assert not cell.eligible
+    assert artifact.applied_replacements == 0
+    with pymupdf.open(artifact.path) as output:
+        assert "Strength 2.5 MPa" in output[0].get_text()
+
+
+def test_tight_table_baseline_does_not_export_unreviewed_fitting_text(tmp_path: Path) -> None:
+    source = tmp_path / "unreviewed-baseline.pdf"
+    _make_baseline_table(source)
+    reviewed_fixture = _job(source, translations={(0, 0): "Trdnost 2,5 MPa"})
+    measured = plan_pdf_export(source, reviewed_fixture, "replacement_preview", tmp_path / "measured")
+    assert "verified_table_source_baseline" in measured.tables[0].cells[0].typography_warnings
+    unreviewed = reviewed_fixture.model_copy(deep=True)
+    unreviewed.segments[0].status = "translated"
+    artifact = export_translated_pdf(source, unreviewed, "replacement_preview", tmp_path / "unreviewed")
+    assert artifact.plan.tables[0].cells[0].skip_reason == "not_reviewed"
+    assert artifact.applied_replacements == 0
+    with pymupdf.open(artifact.path) as output:
+        assert "Strength 2.5 MPa" in output[0].get_text()
+
+
+@pytest.mark.parametrize("damage", ["missing", "ambiguous"])
+def test_tight_table_provenance_blocks_before_baseline_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str) -> None:
+    source = tmp_path / "provenance-baseline.pdf"
+    _make_baseline_table(source)
+    job = _job(source, translations={(0, 0): "Trdnost 2,5 MPa"})
+    payload = job.model_dump()
+    if damage == "missing":
+        payload["segments"][0]["table_cell_provenance"] = None
+    else:
+        payload["segments"][0]["table_cell_provenance"]["ownership"] = "ambiguous"
+    def forbidden(*_args):
+        pytest.fail("Unproven cell must not reach baseline fitting")
+    monkeypatch.setattr(pdf_exporter, "_fit_table_single_line_on_source_baseline", forbidden)
+    plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "replacement_preview", tmp_path / "output")
+    cell = next(item for item in plan.replacements if item.segment_id == job.segments[0].segment_id)
+    assert not cell.eligible
+    assert cell.skip_reason in {"missing_table_provenance", "stale_table_provenance"}
+
+
+@pytest.mark.parametrize("obstacle", ["line", "rectangle", "partial_fill", "curve", "image", "text"])
+def test_table_baseline_guard_rejects_foreground_obstacles(tmp_path: Path, obstacle: str) -> None:
+    source = tmp_path / "obstacle-baseline.pdf"
+    _make_baseline_table(source)
+    plan = plan_pdf_export(source, _job(source, translations={(0, 0): "Trdnost 2,5 MPa"}), "replacement_preview", tmp_path / "plan")
+    cell = plan.tables[0].cells[0]
+    font_dir = tmp_path / "fonts"
+    font_dir.mkdir()
+    typography = PdfTypographyResolver(font_dir)
+    asset = pdf_exporter._asset_for(cell, typography)
+    with pymupdf.open(source) as document:
+        page = document[0]
+        if obstacle == "line":
+            page.draw_line((34, 48), (190, 48), width=0.5)
+        elif obstacle == "rectangle":
+            page.draw_rect((34, 47, 100, 49), width=0.5)
+        elif obstacle == "partial_fill":
+            page.draw_rect((34, 45, 100, 52), color=None, fill=(0.8, 0.9, 1))
+        elif obstacle == "curve":
+            page.draw_bezier((34, 48), (50, 46), (70, 50), (100, 48), width=0.5)
+        elif obstacle == "image":
+            buffer = io.BytesIO()
+            Image.new("RGB", (20, 10), "red").save(buffer, format="PNG")
+            page.insert_image((34, 46, 100, 51), stream=buffer.getvalue())
+        else:
+            page.insert_text((120, 50), "Neighbor", fontsize=9)
+            cell.translated_text = "Prevod s podaljsanjem do sosednjega besedila 2,5 MPa"
+        cell.layout_text = None
+        assert not pdf_exporter._fit_table_single_line_on_source_baseline(page, cell, asset, pdf_exporter._table_minimum_scale(cell))
+
+
+def test_direct_baseline_geometry_rejects_clipped_partial_extraction(tmp_path: Path) -> None:
+    source = tmp_path / "partial-extraction.pdf"
+    _make_baseline_table(source)
+    plan = plan_pdf_export(source, _job(source, translations={(0, 0): "Trdnost 2,5 MPa"}), "replacement_preview", tmp_path / "plan")
+    cell = plan.tables[0].cells[0]
+    cell.translated_text = "X" * 400
+    cell.layout_text = None
+    font_dir = tmp_path / "fonts"
+    font_dir.mkdir()
+    typography = PdfTypographyResolver(font_dir)
+    assert pdf_exporter._direct_single_line_geometry(pymupdf.Rect(0, 0, 400, 200), 34, 50, cell, pdf_exporter._asset_for(cell, typography), 1.0) is None
+
+
+def _make_baseline_table(path: Path, *, row_height: float = 14, font_size: float = 9, baseline_offset: float = 10) -> None:
+    """Synthetic one-line cells with fixed neighbor values and a tight proven grid."""
+    with pymupdf.open() as document:
+        page = document.new_page(width=400, height=180)
+        xs = (30, 200, 370)
+        ys = (40, 40 + row_height, 40 + 2 * row_height)
+        for x in xs:
+            page.draw_line((x, ys[0]), (x, ys[-1]), width=0.5)
+        for y in ys:
+            page.draw_line((xs[0], y), (xs[-1], y), width=0.5)
+        for (row, column), text in zip(((0, 0), (0, 1), (1, 0), (1, 1)), ("Strength 2.5 MPa", "20 L", "Other label", "1200")):
+            page.insert_text((xs[column] + 4, ys[row] + baseline_offset), text, fontsize=font_size)
+        document.save(path)
 
 
 def test_regular_table_exports_cells_and_preserves_grid_and_fill(tmp_path: Path) -> None:

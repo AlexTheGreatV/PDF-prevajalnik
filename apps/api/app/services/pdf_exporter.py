@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Callable
 
 import pymupdf
 
@@ -1079,7 +1080,7 @@ def _fit_table_cell(
             minimum_scale = _table_minimum_scale(replacement)
             if not _try_table_layouts(
                 page, content, replacement, typography, asset, layouts, minimum_scale, "scaled",
-            ):
+            ) and not _fit_table_single_line_on_source_baseline(page, replacement, asset, minimum_scale):
                 replacement.fit_strategy = "overflow"
                 _skip(replacement, "cell_overflow", "Prevod se ne prilega varnemu območju celice.", "overflow")
                 return
@@ -1140,6 +1141,81 @@ def _htmlbox_preflight(
 class _SingleLineGeometry:
     bbox: pymupdf.Rect
     baseline_y: float
+
+
+def _fit_table_single_line_on_source_baseline(
+    page: pymupdf.Page,
+    replacement: PdfTableCellReplacement,
+    asset: FontAsset,
+    minimum_scale: float,
+) -> bool:
+    if (
+        replacement.ownership != "owned"
+        or len(replacement.proven_edges) != 4
+        or replacement.source_match_status != "matched"
+        or not replacement.source_span_ids
+        or replacement.geometry_evidence is None
+        or replacement.row_span != 1
+        or replacement.column_span != 1
+        or replacement.source_font_size is None
+        or replacement.typography is None
+        or replacement.typography.dominant_style_confidence < 0.99
+        or replacement.content_bbox is None
+        or replacement.cell_bbox is None
+    ):
+        return False
+    content = _rect(replacement.content_bbox)
+    if content.is_empty or not _rect(replacement.cell_bbox).contains(content):
+        return False
+    obstacles = _table_baseline_obstacles(page, replacement)
+
+    def safe_geometry(rect: pymupdf.Rect) -> bool:
+        return content.contains(rect) and not any(not (rect & obstacle).is_empty for obstacle in obstacles)
+
+    accepted = _fit_single_line_on_source_baseline(
+        page, content, replacement, asset, minimum_scale, geometry_guard=safe_geometry,
+    )
+    if accepted:
+        replacement.fit_strategy = "scaled" if replacement.scale < 1.0 else "exact"
+        replacement.typography_warnings.append("verified_table_source_baseline")
+    return accepted
+
+
+def _table_baseline_obstacles(page: pymupdf.Page, replacement: PdfTableCellReplacement) -> list[pymupdf.Rect]:
+    """Exclude only owned text and proven rectangular background fills, never cell strokes."""
+    source = _rect(replacement.source_bbox)
+    cell = _rect(replacement.cell_bbox)
+    obstacles = [rect for rect in _text_span_rects(page) if not _contains_with_tolerance(source, rect)]
+    obstacles.extend(pymupdf.Rect(info["bbox"]) for info in page.get_image_info())
+    for drawing in page.get_drawings():
+        items = drawing.get("items", [])
+        background_fill = (
+            len(items) == 1 and items[0][0] == "re"
+            and _contains_with_tolerance(pymupdf.Rect(items[0][1]), cell)
+        )
+        if drawing.get("fill") is not None and not background_fill:
+            obstacles.append(pymupdf.Rect(drawing["rect"]))
+        if "s" not in str(drawing.get("type", "")):
+            continue
+        padding = float(drawing.get("width") or 0.0) / 2 + max(GEOMETRY_TOLERANCE, replacement.border_clearance)
+        for item in items:
+            if item[0] == "l":
+                start, end = item[1], item[2]
+                obstacles.append(pymupdf.Rect(
+                    min(start.x, end.x) - padding, min(start.y, end.y) - padding,
+                    max(start.x, end.x) + padding, max(start.y, end.y) + padding,
+                ))
+            elif item[0] == "re":
+                rect = pymupdf.Rect(item[1])
+                obstacles.extend((
+                    pymupdf.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y0 + padding),
+                    pymupdf.Rect(rect.x0 - padding, rect.y1 - padding, rect.x1 + padding, rect.y1 + padding),
+                    pymupdf.Rect(rect.x0 - padding, rect.y0 - padding, rect.x0 + padding, rect.y1 + padding),
+                    pymupdf.Rect(rect.x1 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding),
+                ))
+            else:
+                obstacles.append(pymupdf.Rect(drawing["rect"]))
+    return obstacles
 
 
 def _align_single_line_around_vector_strokes(
@@ -1210,6 +1286,8 @@ def _fit_single_line_on_source_baseline(
     replacement: PdfReplacement,
     asset: FontAsset,
     minimum_scale: float,
+    *,
+    geometry_guard: Callable[[pymupdf.Rect], bool] | None = None,
 ) -> bool:
     """Use the proven source baseline when HTML box leading alone causes overflow."""
     if (
@@ -1217,6 +1295,8 @@ def _fit_single_line_on_source_baseline(
         or replacement.source_bbox is None
         or replacement.alignment != "left"
         or "\n" in _rendered_translation(replacement)
+        or not math.isfinite(minimum_scale)
+        or not 0 < minimum_scale <= 1
     ):
         return False
     source = _single_source_line_geometry(page, _layout_rect(replacement))
@@ -1234,6 +1314,8 @@ def _fit_single_line_on_source_baseline(
             scale,
         )
         if geometry is None or not _contains_with_tolerance(fit_rect, geometry.bbox):
+            return None
+        if geometry_guard is not None and not geometry_guard(geometry.bbox):
             return None
         return geometry
 
@@ -1299,6 +1381,9 @@ def _direct_single_line_geometry(
             if any(span.get("text", "").strip() for span in line.get("spans", []))
         ]
     if len(lines) != 1:
+        return None
+    extracted = "".join(span.get("text", "") for span in lines[0].get("spans", []))
+    if not _written_text_matches(_rendered_translation(replacement), extracted):
         return None
     return _line_geometry(lines[0])
 
