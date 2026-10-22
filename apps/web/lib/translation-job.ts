@@ -204,7 +204,8 @@ export function invalidateStaleOcrApprovals(job: TranslationJob, ocrItems: OcrRe
     const provenance = segment.accepted_ocr_source;
     if (segment.source_text_origin !== "accepted_ocr" || !provenance) return segment;
     const current = items.get(provenance.review_id);
-    const accepted = current?.status === "accepted" && current.selected_text_source === "ocr" && hasVisibleTranslationText(current.effective_text);
+    const accepted = current?.status === "accepted" && current.selected_text_source === "ocr" && hasVisibleTranslationText(current.effective_text)
+      && current.page_number === segment.page_number && JSON.stringify(current.pdf_bbox) === JSON.stringify(provenance.bbox);
     const next = accepted ? acceptedOcrSource(current) : null;
     if (next && JSON.stringify(next) === JSON.stringify(provenance)) return segment;
     changed = true;
@@ -212,8 +213,9 @@ export function invalidateStaleOcrApprovals(job: TranslationJob, ocrItems: OcrRe
       ...segment,
       source_text: next?.accepted_text ?? segment.source_text,
       source_bbox: next?.bbox ?? segment.source_bbox,
-      accepted_ocr_source: next,
+      accepted_ocr_source: next ?? (provenance.source === "block" ? { ...provenance, revision_id: null } : null),
       status: segment.edited_translation.trim() ? "translated" as const : "pending" as const,
+      review_state: null,
       needs_review: true,
       warnings: [...new Set([...segment.warnings, "ocr_source_changed_after_review"])],
     };
@@ -986,6 +988,41 @@ export function bindTranslationJobToAnalysis(imported: TranslationJob, expected:
       };
     }),
   };
+}
+
+export function recoverTranslationJobForAnalysis(imported: TranslationJob, expected: TranslationJob, ocrItems: OcrReviewItem[]): TranslationJob {
+  // Recovery is deliberately narrower than ordinary import: an authoritative native
+  // block and a fresh OCR candidate must prove the same document, page and rectangle.
+  if (!imported.document_identity || !expected.document_identity ||
+    JSON.stringify(imported.document_identity) !== JSON.stringify(expected.document_identity)) {
+    return bindTranslationJobToAnalysis(imported, expected);
+  }
+  const recovering = new Set<string>();
+  const byId = new Map(imported.segments.map((segment) => [segment.segment_id, segment]));
+  const comparable = { ...expected, segments: expected.segments.map((native) => {
+    const old = byId.get(native.segment_id);
+    const provenance = old?.accepted_ocr_source;
+    if (!old || old.source_text_origin !== "accepted_ocr" || !provenance || native.source_text_origin !== "native") return native;
+    const item = ocrItems.find((candidate) => candidate.id === provenance.review_id);
+    if (!item || item.source !== "block" || provenance.source !== "block" || item.reason !== provenance.reason ||
+      item.page_number !== old.page_number || old.page_number !== native.page_number ||
+      item.native_text.trim() !== native.source_text || provenance.accepted_text !== old.source_text ||
+      JSON.stringify(item.pdf_bbox) !== JSON.stringify(provenance.bbox) ||
+      JSON.stringify(old.source_bbox) !== JSON.stringify(provenance.bbox) ||
+      JSON.stringify(native.source_bbox) !== JSON.stringify(provenance.bbox) ||
+      !old.block_id.endsWith(`-b${item.linked_block_reading_order}`)) return native;
+    recovering.add(old.segment_id);
+    return { ...native, source_text: old.source_text, source_text_origin: old.source_text_origin, accepted_ocr_source: provenance };
+  }) };
+  const bound = bindTranslationJobToAnalysis(imported, comparable);
+  return finalizeTranslationJob({ ...bound, segments: bound.segments.map((segment) => recovering.has(segment.segment_id) ? {
+    ...segment,
+    accepted_ocr_source: { ...segment.accepted_ocr_source!, revision_id: null },
+    status: segment.edited_translation.trim() ? "translated" : "pending",
+    needs_review: true,
+    review_state: null,
+    warnings: [...new Set([...segment.warnings, "ocr_recovery_required"])],
+  } : segment) });
 }
 
 function migrateSchemaOne(job: Record<string, unknown>): Record<string, unknown> {

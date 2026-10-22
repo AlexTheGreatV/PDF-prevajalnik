@@ -1,10 +1,21 @@
 import { apiBaseUrl } from "./pdf-client";
 import type { BBox, TableGeometryEvidence, TableOwnership } from "./pdf-types";
-import type { TranslationJob } from "./translation-types";
+import type { TranslationJob, TranslationSegment } from "./translation-types";
 import { isTranslationUnitSegment } from "./translation-units";
 import { exportTranslationJob } from "./translation-job";
 
+export class PdfExportQcError extends Error {
+  constructor(public readonly blockers: TranslationSegment[]) {
+    super(`Aktualni QC blokira celoten PDF izvoz: ${blockers.map((segment) => segment.segment_id).join(", ")}. Geometrijski načrt še ni izdelan; druge enote niso bile geometrijsko zavrnjene.`);
+    this.name = "PdfExportQcError";
+  }
+}
+
 export type PdfExportMode = "diagnostic" | "replacement_preview";
+export type PdfTypographyProfile = "original" | "document-role-typography-pilot-v1";
+export function pdfTypographyRevisionKey(base: string, profile: PdfTypographyProfile): string {
+  return JSON.stringify([base, profile]);
+}
 export const FINAL_PDF_EXPORT_MODE: PdfExportMode = "replacement_preview";
 export type RevisionBoundValue<T> = { revisionKey: string; value: T } | null;
 
@@ -112,6 +123,12 @@ export type PdfOcrReplacement = PdfExportReplacement & {
 };
 
 export type PdfExportPlan = {
+  typography_revision?: string | null;
+  typography_coverage?: {
+    profile: string; translated: number; source_formatted: number; untouched: number;
+    groups: { group: string; role: string; pages: number[]; total: number; unified: number;
+      partial: boolean; excluded_reasons: Record<string, number> }[];
+  } | null;
   schema_version: 2;
   filename: string;
   mode: PdfExportMode;
@@ -168,14 +185,29 @@ export type PdfExportPlan = {
   };
 };
 
-export async function preparePdfExport(file: File, job: TranslationJob, mode: PdfExportMode): Promise<PdfExportPlan> {
-  const response = await postExportRequest("/api/pdf/export-translated/plan", file, job, mode);
+export async function preparePdfExport(file: File, job: TranslationJob, mode: PdfExportMode, profile: PdfTypographyProfile = "original"): Promise<PdfExportPlan> {
+  const response = await postExportRequest("/api/pdf/export-translated/plan", file, job, mode, profile);
   if (!response.ok) throw new Error(await exportError(response));
   return parsePdfExportPlan(await response.json());
 }
 
 export function parsePdfExportPlan(value: unknown): PdfExportPlan {
   if (!isRecord(value)) throw new Error("Strežnik je vrnil neveljaven načrt PDF izvoza.");
+  if (value.typography_coverage !== undefined && value.typography_coverage !== null) {
+    const coverage = value.typography_coverage;
+    if (!isRecord(coverage) || coverage.profile !== "document-role-typography-pilot-v1"
+        || typeof value.typography_revision !== "string" || !/^[a-f0-9]{64}$/.test(value.typography_revision)
+        || ![coverage.translated, coverage.source_formatted, coverage.untouched].every(v => Number.isSafeInteger(v) && Number(v) >= 0)
+        || !Array.isArray(coverage.groups) || !coverage.groups.every(group => isRecord(group)
+          && typeof group.group === "string" && typeof group.role === "string"
+          && Array.isArray(group.pages) && group.pages.every(page => Number.isSafeInteger(page) && page > 0)
+          && Number.isSafeInteger(group.total) && Number.isSafeInteger(group.unified)
+          && Number(group.unified) >= 0 && Number(group.unified) <= Number(group.total)
+          && group.partial === (group.unified !== group.total) && isRecord(group.excluded_reasons)
+          && Object.values(group.excluded_reasons).every(count => Number.isSafeInteger(count) && Number(count) >= 0))) {
+      throw new Error("Strežnik je vrnil neveljavno tipografsko pokritost.");
+    }
+  }
   validatePlanEnvelope(value);
   const version = value.schema_version;
   if (version === 2) {
@@ -298,11 +330,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export type PdfExportDownload = {
+  typography_profile?: PdfTypographyProfile;
+  typography_revision?: string;
+  source_formatted?: number;
   blob: Blob;
   filename: string;
   mode: PdfExportMode;
   applied_replacements: number;
 };
+
+export function validatePdfTypographyDownload(result: Pick<PdfExportDownload, "typography_revision" | "source_formatted">,
+  profile: PdfTypographyProfile, plan: PdfExportPlan | null): void {
+  if (profile !== "original" && (!plan?.typography_revision || result.typography_revision !== plan.typography_revision
+      || result.source_formatted !== plan.typography_coverage?.source_formatted)) {
+    throw new Error("Tipografski načrt ni več aktualen. Znova preverite izvoz.");
+  }
+}
 
 export function resolvePdfExportMode(simpleMode: boolean, selectedMode: PdfExportMode): PdfExportMode {
   return simpleMode ? FINAL_PDF_EXPORT_MODE : selectedMode;
@@ -326,8 +369,8 @@ export function validatePdfExportDownload(
   return true;
 }
 
-export async function downloadPdfExport(file: File, job: TranslationJob, mode: PdfExportMode): Promise<PdfExportDownload> {
-  const response = await postExportRequest("/api/pdf/export-translated", file, job, mode);
+export async function downloadPdfExport(file: File, job: TranslationJob, mode: PdfExportMode, profile: PdfTypographyProfile = "original"): Promise<PdfExportDownload> {
+  const response = await postExportRequest("/api/pdf/export-translated", file, job, mode, profile);
   if (!response.ok) throw new Error(await exportError(response));
   const disposition = response.headers.get("content-disposition") ?? "";
   const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
@@ -355,7 +398,16 @@ export async function downloadPdfExport(file: File, job: TranslationJob, mode: P
   if (applied === null || !/^\d+$/.test(applied)) {
     throw new Error("Strežnik ni potrdil števila zapisanih PDF zamenjav.");
   }
+  const revision = response.headers.get("x-pdf-typography-revision");
+  const formatted = response.headers.get("x-pdf-source-formatted");
+  if (profile !== "original" && (response.headers.get("x-pdf-typography-profile") !== profile
+      || !revision || !/^[a-f0-9]{64}$/.test(revision) || formatted === null || !/^\d+$/.test(formatted))) {
+    throw new Error("Strežnik ni potrdil izbranega tipografskega profila.");
+  }
   return {
+    typography_profile: profile,
+    typography_revision: revision ?? undefined,
+    source_formatted: formatted === null ? 0 : Number(formatted),
     blob: await response.blob(),
     filename,
     mode: responseMode,
@@ -363,16 +415,17 @@ export async function downloadPdfExport(file: File, job: TranslationJob, mode: P
   };
 }
 
-function postExportRequest(path: string, file: File, job: TranslationJob, mode: PdfExportMode): Promise<Response> {
+function postExportRequest(path: string, file: File, job: TranslationJob, mode: PdfExportMode, profile: PdfTypographyProfile): Promise<Response> {
   const currentJob = JSON.parse(exportTranslationJob(job)) as TranslationJob;
   const blocked = currentJob.segments.filter((segment) => segment.status === "reviewed" && segment.current_qc?.status === "blocked");
   if (mode === FINAL_PDF_EXPORT_MODE && blocked.length) {
-    throw new Error(`Aktualni QC blokira PDF izvoz: ${blocked.map((segment) => segment.segment_id).join(", ")}. Popravite zaščitene podatke in znova potrdite prevod.`);
+    throw new PdfExportQcError(blocked);
   }
   const form = new FormData();
   form.append("file", file);
   form.append("translation_job", JSON.stringify({
     ...currentJob,
+    typography_profile: profile,
     segments: currentJob.segments.filter(isTranslationUnitSegment),
   }));
   form.append("mode", mode);

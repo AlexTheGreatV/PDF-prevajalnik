@@ -24,7 +24,8 @@ from app.pdf_export_models import (
 from app.services.ocr import run_selective_ocr
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.pdf_renderer import render_pdf_pages_as_data_urls
-from app.services.pdf_exporter import PdfExportValidationError, export_translated_pdf, plan_pdf_export
+from app.services.pdf_exporter import ExportArtifact, PdfExportValidationError, export_translated_pdf, plan_pdf_export
+from app.services.pdf_document_typography import export_document_typography_pilot
 from app.services.ocr_review_registry import OCR_REVIEW_TTL_SECONDS, document_sha256, ocr_review_registry
 
 router = APIRouter()
@@ -140,9 +141,13 @@ async def plan_translated_export(
             temp_path = Path(temp_dir)
             path = await _save_upload(file, temp_path)
             try:
+                if job.typography_profile != "original":
+                    if mode != "replacement_preview":
+                        raise PdfExportValidationError("typography_mode", "Poenotena tipografija zahteva končni način izvoza.")
+                    return export_document_typography_pilot(path, job, temp_path, plan_only=True).translation_plan
                 return plan_pdf_export(path, job, mode, temp_path)
             except PdfExportValidationError as exc:
-                raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+                raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc), **exc.details}) from exc
             except Exception as exc:
                 raise HTTPException(status_code=400, detail="Načrta izvoza PDF ni bilo mogoče pripraviti.") from exc
 
@@ -157,10 +162,16 @@ async def translated_export(
             temp_path = Path(temp_dir)
             path = await _save_upload(file, temp_path)
             try:
-                artifact = export_translated_pdf(path, job, mode, temp_path)
+                if job.typography_profile != "original":
+                    if mode != "replacement_preview":
+                        raise PdfExportValidationError("typography_mode", "Poenotena tipografija zahteva končni način izvoza.")
+                    pilot = export_document_typography_pilot(path, job, temp_path)
+                    artifact = ExportArtifact(pilot.path, pilot.translation_plan, pilot.translated_written)
+                else:
+                    artifact = export_translated_pdf(path, job, mode, temp_path)
                 content = artifact.path.read_bytes()
             except PdfExportValidationError as exc:
-                raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+                raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc), **exc.details}) from exc
             except Exception as exc:
                 raise HTTPException(status_code=400, detail="Izvoza PDF ni bilo mogoče izdelati.") from exc
     encoded_name = quote(artifact.plan.filename)
@@ -171,6 +182,9 @@ async def translated_export(
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
             "X-PDF-Export-Mode": artifact.plan.mode,
             "X-PDF-Replacements-Applied": str(artifact.applied_replacements),
+            "X-PDF-Typography-Profile": job.typography_profile,
+            "X-PDF-Typography-Revision": artifact.plan.typography_revision or "original",
+            "X-PDF-Source-Formatted": str(artifact.plan.typography_coverage.source_formatted if artifact.plan.typography_coverage else 0),
         },
     )
 

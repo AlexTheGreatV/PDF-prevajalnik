@@ -6,7 +6,7 @@ import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
 import { PdfExportPanel, type PdfExportUiState } from "./pdf-export-panel";
 import {
-  bindTranslationJobToAnalysis,
+  recoverTranslationJobForAnalysis,
   createTranslationJob,
   editTranslation,
   exportTranslationJob,
@@ -16,7 +16,6 @@ import {
   retryFailedTranslation,
   reviewTranslation,
   updateTranslationJobSegment,
-  validateTranslationJobCompatibility,
 } from "../lib/translation-job";
 import type { GlossaryEntry, TranslationJob, TranslationSegment, TranslationStatus } from "../lib/translation-types";
 import { useLocalTranslation } from "./use-local-translation";
@@ -71,6 +70,10 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [guidedReviewIndex, setGuidedReviewIndex] = useState(0);
+  const [qcFocusId, setQcFocusId] = useState<string | null>(null);
+  useEffect(() => {
+    if (qcFocusId) document.getElementById(`translation-${qcFocusId}`)?.focus();
+  }, [qcFocusId, filter, mode]);
   const [exportState, setExportState] = useState<PdfExportUiState>({ plan: null, downloadCompleted: false, appliedReplacements: 0 });
   const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
   const local = useLocalTranslation(job, setJob);
@@ -228,14 +231,15 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
         domain: imported.domain,
         created_at: imported.created_at,
       });
-      validateTranslationJobCompatibility(imported, expected);
-      const compatible = bindTranslationJobToAnalysis(imported, expected);
+      const compatible = recoverTranslationJobForAnalysis(imported, expected, ocrItems);
       setJob(compatible);
       setDocumentGlossary(compatible.glossary.filter((entry) => entry.scope === "document"));
       setSourceLanguage(imported.source_language);
       setTargetLanguage(imported.target_language);
       setTranslationDomain(imported.domain);
-      setMessage("Prevajalsko opravilo je bilo uspešno uvoženo.");
+      setMessage(compatible.segments.some((segment) => segment.warnings.includes("ocr_recovery_required"))
+        ? "Opravilo je obnovljeno. Zastareli OCR zahteva ponovni pregled izreza in potrditev; drugi prevodi so ohranjeni."
+        : "Prevajalsko opravilo je bilo uspešno uvoženo.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Uvoz prevajalskega opravila ni uspel.");
     } finally {
@@ -349,7 +353,17 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
             ocrItems={ocrItems}
             simpleMode={mode === "simple"}
             onStateChange={setExportState}
+            onNavigateSegment={(id) => { setFilter("all"); setQcFocusId(id); document.getElementById(`translation-${id}`)?.focus(); }}
           />}
+          {mode === "simple" && qcFocusId && job.segments.filter((segment) => segment.segment_id === qcFocusId).map((segment) => <TranslationSegmentRow
+            key={segment.segment_id} segment={segment}
+            onEdit={(text) => updateSegment(segment.segment_id, (current) => editTranslation(current, text))}
+            onReview={() => updateSegment(segment.segment_id, reviewTranslation)}
+            onReset={() => updateSegment(segment.segment_id, resetTranslation)}
+            onRetry={() => updateSegment(segment.segment_id, retryFailedTranslation)}
+            onPropose={() => setGlossaryProposal({ key: segment.segment_id, ...createReviewedCorrectionDraft(segment) })}
+            onProposeMemory={() => setTranslationMemoryProposal({ key: segment.segment_id, ...createTranslationMemoryDraft(segment, job) })}
+          />)}
           <div className="translation-filters advanced-only" aria-label="Filtri prevodov">
             {FILTERS.map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{FILTER_LABELS[value]}</button>)}
           </div>
@@ -375,10 +389,10 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
   segment: TranslationSegment; onEdit: (text: string) => void; onReview: () => void; onReset: () => void; onRetry: () => void; onPropose: () => void; onProposeMemory: () => void;
 }) {
   return (
-    <article className={`translation-segment translation-${segment.status}`}>
+    <article id={`translation-${segment.segment_id}`} tabIndex={-1} className={`translation-segment translation-${segment.status}`}>
       <header>
         <strong>Stran {segment.page_number} · {segment.block_type}</strong>
-        <span>{segment.status} · besedilo: {segment.source_text_origin === "accepted_ocr" ? "potrjeni OCR" : "native"} · prevod: {segment.translation_origin === "mixed" ? "mešano (TM + lokalni model)" : segment.translation_origin ?? "še ni"}</span>
+        <span>{segment.status} · besedilo: {segment.source_text_origin === "accepted_ocr" ? (segment.accepted_ocr_source?.revision_id ? "potrjeni OCR" : "OCR čaka ponovno potrditev") : "native"} · prevod: {segment.translation_origin === "mixed" ? "mešano (TM + lokalni model)" : segment.translation_origin ?? "še ni"}</span>
       </header>
       <div className="translation-state-grid" aria-label="Stanje pregleda in kakovosti">
         <span><strong>Uporabniški pregled</strong>{reviewStateLabel(segment)}</span>
@@ -395,6 +409,7 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
       {segment.translation_memory_entry_id && <div className="translation-origin">Prevajalski spomin: {segment.translation_memory_entry_id} · rev. {segment.translation_memory_revision} · exact</div>}
       {segment.model_id && <div className="translation-origin">Model: {segment.model_id}</div>}
       {segment.needs_review && <p className="translation-warning">Potreben je ročni pregled.</p>}
+      {segment.source_text_origin === "accepted_ocr" && !segment.accepted_ocr_source?.revision_id && <p className="translation-warning">Prevod je shranjen, vendar OCR-povezava ni potrjena. <a href="#ocr-review-list">Preglej izvorni izrez in ponovno potrdi OCR</a>. Nato ločeno potrdi prevod te različice.</p>}
       {segment.current_qc?.findings.map((finding, index) => <p className={finding.severity === "blocking" ? "translation-error" : "translation-warning"} key={`${finding.code}-${finding.glossary_entry_id ?? index}`}>{finding.message}</p>)}
       {(segment.warnings.length > 0 || segment.placeholder_attempts.length > 0) && <details className="translation-history">
         <summary>Zgodovina prevajanja in ponovnih poskusov</summary>
@@ -415,7 +430,7 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
       </details>}
       {segment.error && <p className="translation-error">{segment.error}</p>}
       {!segment.skip_reason && <div className="translation-row-actions">
-        <button className="button secondary" disabled={!segment.edited_translation.trim()} onClick={onReview}>Potrdi prevod</button>
+        <button className="button secondary" disabled={!segment.edited_translation.trim() || (segment.source_text_origin === "accepted_ocr" && !segment.accepted_ocr_source?.revision_id)} onClick={onReview}>Potrdi prevod</button>
         <button className="button secondary" onClick={onReset}>Ponastavi</button>
         {segment.status === "reviewed" && segment.translation_origin === "manual" && <button className="button secondary" onClick={onPropose}>Predlagaj za glosar</button>}
         {segment.status === "reviewed" && segment.translation_origin === "manual" && <button className="button secondary" onClick={onProposeMemory}>Predlagaj za prevajalski spomin</button>}

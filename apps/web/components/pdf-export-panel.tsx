@@ -11,11 +11,15 @@ import {
   preparePdfExport,
   resolvePdfExportMode,
   validatePdfExportDownload,
+  validatePdfTypographyDownload,
+  pdfTypographyRevisionKey,
+  PdfExportQcError,
+  type PdfTypographyProfile,
   type PdfExportMode,
   type PdfExportPlan,
 } from "../lib/pdf-export-client";
 import type { PdfAnalysis } from "../lib/pdf-types";
-import type { TranslationJob } from "../lib/translation-types";
+import type { TranslationJob, TranslationSegment } from "../lib/translation-types";
 import { DocumentCoverageSummary } from "./document-coverage-summary";
 
 const REASON_LABELS: Record<string, string> = {
@@ -60,24 +64,27 @@ export type PdfExportUiState = {
   appliedReplacements: number;
 };
 
-export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode = false, onStateChange }: {
+export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode = false, onStateChange, onNavigateSegment }: {
   sourceFile: File;
   job: TranslationJob;
   analysis: PdfAnalysis;
   ocrItems: OcrReviewItem[];
   simpleMode?: boolean;
   onStateChange?: (state: PdfExportUiState) => void;
+  onNavigateSegment?: (segmentId: string) => void;
 }) {
   const [mode, setMode] = useState<PdfExportMode>("diagnostic");
+  const [typographyProfile, setTypographyProfile] = useState<PdfTypographyProfile>("original");
   const [planned, setPlanned] = useState<{ revisionKey: string; value: PdfExportPlan } | null>(null);
   const [busy, setBusy] = useState<"plan" | "download" | null>(null);
-  const [error, setError] = useState<{ revisionKey: string; value: string } | null>(null);
+  const [error, setError] = useState<{ revisionKey: string; value: string; blockers?: TranslationSegment[] } | null>(null);
   const [downloadedRevisionKey, setDownloadedRevisionKey] = useState<string | null>(null);
   const [appliedReplacements, setAppliedReplacements] = useState(0);
   const [diagnosticDownloadedRevisionKey, setDiagnosticDownloadedRevisionKey] = useState<string | null>(null);
   const busyRef = useRef(false);
   const effectiveMode = resolvePdfExportMode(simpleMode, mode);
-  const revisionKey = createCoverageRevisionKey({ analysis, ocrItems, job, mode: effectiveMode });
+  const effectiveProfile = effectiveMode === "diagnostic" ? "original" : typographyProfile;
+  const revisionKey = pdfTypographyRevisionKey(createCoverageRevisionKey({ analysis, ocrItems, job, mode: effectiveMode }), effectiveProfile);
   const revisionKeyRef = useRef(revisionKey);
   useLayoutEffect(() => {
     revisionKeyRef.current = revisionKey;
@@ -103,13 +110,17 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
     setDiagnosticDownloadedRevisionKey(null);
     const requestRevision = revisionKey;
     try {
-      const preparedPlan = await preparePdfExport(sourceFile, job, effectiveMode);
+      const preparedPlan = await preparePdfExport(sourceFile, job, effectiveMode, effectiveProfile);
+      if (effectiveProfile !== "original" && preparedPlan.typography_coverage?.profile !== effectiveProfile) {
+        throw new Error("Načrt ne uporablja izbranega tipografskega profila.");
+      }
       if (!isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) return;
       setPlanned({ revisionKey: requestRevision, value: preparedPlan });
     } catch (caught) {
       if (isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) setError({
         revisionKey: requestRevision,
         value: caught instanceof Error ? caught.message : "Načrta izvoza ni bilo mogoče pripraviti.",
+        blockers: caught instanceof PdfExportQcError ? caught.blockers : undefined,
       });
     } finally {
       busyRef.current = false;
@@ -127,7 +138,8 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
     setDiagnosticDownloadedRevisionKey(null);
     const requestRevision = revisionKey;
     try {
-      const result = await downloadPdfExport(sourceFile, job, effectiveMode);
+      const result = await downloadPdfExport(sourceFile, job, effectiveMode, effectiveProfile);
+      validatePdfTypographyDownload(result, effectiveProfile, plan);
       const expectedReplacements = (plan?.summary.eligible ?? 0) + (plan?.ocr_summary.eligible_regions ?? 0);
       const finalDownload = validatePdfExportDownload(result, effectiveMode, expectedReplacements);
       if (!isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) return;
@@ -146,6 +158,7 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
       if (isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) setError({
         revisionKey: requestRevision,
         value: caught instanceof Error ? caught.message : "Izvoz PDF ni uspel.",
+        blockers: caught instanceof PdfExportQcError ? caught.blockers : undefined,
       });
     } finally {
       busyRef.current = false;
@@ -161,6 +174,13 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
         <button className={mode === "replacement_preview" ? "active" : ""} onClick={() => { setMode("replacement_preview"); setError(null); }}>Končni prevedeni PDF</button>
       </div>
     </div>
+    {effectiveMode !== "diagnostic" && <div className="translation-languages"><label>Oblikovanje PDF-ja
+      <select value={typographyProfile} onChange={(event) => setTypographyProfile(event.target.value as PdfTypographyProfile)}>
+        <option value="original">Ohrani izvorne sloge</option>
+        <option value="document-role-typography-pilot-v1">Poenoti tipografske skupine</option>
+      </select>
+      {typographyProfile !== "original" && <small>Poenotenje lahko spremeni prileganje. Varno oblikovano izvorno besedilo ni prevedena vsebina.</small>}
+    </label></div>}
     <div className="translation-actions">
       {!plan && <button className="button" disabled={busy !== null || !job.document_identity} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi PDF"}</button>}
       {plan && <button className="button" disabled={downloadCompleted || diagnosticDownloadCompleted || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : downloadCompleted ? "PDF je prenesen" : diagnosticDownloadCompleted ? "Diagnostični PDF je prenesen" : effectiveMode === "diagnostic" ? "Prenesi diagnostični PDF" : "Prenesi prevedeni PDF"}</button>}
@@ -172,6 +192,17 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
     <DocumentCoverageSummary analysis={analysis} ocrItems={ocrItems} job={job} plan={plan} downloadCompleted={downloadCompleted} appliedReplacements={appliedReplacements} />
     {!job.document_identity && <p className="translation-warning">Opravilo nima preverjene identitete PDF-ja. Znova ga povežite s trenutno analizo.</p>}
     {currentError && <p className="translation-error">{currentError}</p>}
+    {currentError && error?.blockers && <PdfExportQcDiagnostics blockers={error.blockers} onNavigateSegment={onNavigateSegment} />}
+    {plan?.typography_coverage && <section aria-label="Tipografska pokritost">
+      <h4>Tipografska pokritost {downloadCompleted ? "izvedenega izvoza" : "načrta"}</h4>
+      <p>Prevodi: {plan.typography_coverage.translated} · Samo oblikovani izvori: {plan.typography_coverage.source_formatted} · Nedotaknjeno: {plan.typography_coverage.untouched}</p>
+      <details><summary>Slogovne skupine in izjeme</summary>
+        {plan.typography_coverage.groups.map((group) => <p key={group.group}>
+          {group.role} · strani {group.pages.join(", ")} · {group.unified}/{group.total} · {group.partial ? "delno" : "poenoteno"}
+          {group.partial && <> · {Object.entries(group.excluded_reasons).map(([reason, count]) => `${reason}: ${count}`).join(", ")}</>}
+        </p>)}
+      </details>
+    </section>}
     {plan && <div className={simpleMode ? "guided-export-details" : ""}>
       <div className="export-summary">
         <ExportMetric label={downloadCompleted ? "Dejansko zamenjani" : "Načrtovane zamenjave"} value={downloadCompleted ? appliedReplacements : plan.resolution_summary.replacement_planned} />
@@ -284,6 +315,18 @@ const OVERLAP_WARNING_LABELS: Record<string, string> = {
   table_content_background_checked: "celotno območje celice je ponovno preverjeno",
   table_content_background_not_safe: "ozadje celotnega območja celice ni varno",
 };
+
+export function PdfExportQcDiagnostics({ blockers, onNavigateSegment }: {
+  blockers: TranslationSegment[];
+  onNavigateSegment?: (segmentId: string) => void;
+}) {
+  return <>{blockers.map((segment) => <div key={segment.segment_id} className="translation-error">
+    <a href={`#translation-${segment.segment_id}`} onClick={() => onNavigateSegment?.(segment.segment_id)}>Odpri segment {segment.segment_id}</a>
+    <p>Izvor: {segment.source_text}</p>
+    <p>Trenutni prevod: {segment.edited_translation || segment.translated_text}</p>
+    {segment.current_qc?.findings.filter((finding) => finding.severity === "blocking").map((finding, index) => <p key={index}>{finding.message}</p>)}
+  </div>)}</>;
+}
 
 function formatSize(value: number): string {
   return `${value.toLocaleString("sl-SI", { maximumFractionDigits: 2 })} pt`;

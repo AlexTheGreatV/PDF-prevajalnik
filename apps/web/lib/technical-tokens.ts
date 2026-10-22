@@ -1,7 +1,7 @@
 import type { PlaceholderStrategy, ProtectedToken } from "./translation-types";
 import { analyzeTechnicalRanges, TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
 
-const TOKEN_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\{\{[A-Za-z_][\w.-]*\}\}|\$\{[A-Za-z_][\w.-]*\}|\{[A-Za-z_][\w.-]*\}|%(?:s|d)|\[LINK\]|\bRAL\s+\d{3,5}\b|(?<![\p{L}\p{N}])[+-]\s*\/\s*[A-Z]\s+\d+(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\+\d(?:[\d -]{5,}\d)(?![\p{L}\p{N}])|[+-]?\d+(?:[.,]\d+)?\s*(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%)(?=$|\s|[),.;:])|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|(?<!\p{L})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){2,}(?!\p{L})|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|[+-]?\d+(?:[.,]\d+)?/gu;
+const TOKEN_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\{\{[A-Za-z_][\w.-]*\}\}|\$\{[A-Za-z_][\w.-]*\}|\{[A-Za-z_][\w.-]*\}|%(?:s|d)|\[LINK\]|\bRAL\s+\d{3,5}\b|(?<![\p{L}\p{N}])[+-]\s*\/\s*[A-Z]\s+\d+(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\+\d(?:[\d -]{5,}\d)(?![\p{L}\p{N}])|[+-]?\d+(?:[.,]\d+)?(?:\s*(?:°\s*[CF]|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|min|kW|W|h|m|%)|[ \u00a0]+K)(?=$|\s|[),.;:])|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|(?<!\p{L})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){2,}(?!\p{L})|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|(?<![\p{L}\p{N}])\d+[A-Z][A-Z0-9/-]*(?![\p{L}\p{N}])|[+-]?\d+(?:[.,]\d+)?/gu;
 export function protectTechnicalTokens(text: string, strategy: PlaceholderStrategy = "primary_tk"): { protected_text: string; tokens: ProtectedToken[]; warnings: string[] } {
   const tokens: ProtectedToken[] = [];
   const analysis = analyzeTechnicalRanges(text);
@@ -108,6 +108,8 @@ function placeholderFor(index: number, strategy: PlaceholderStrategy): string {
 }
 
 function protectValues(text: string, tokens: ProtectedToken[], strategy: PlaceholderStrategy): string {
+  // Digit-leading designations (e.g. coating systems) must not lose their letters.
+  // Existing measurements/URLs win at the same offset; the code wins over a bare number.
   return text.replace(TOKEN_PATTERN, (value, offset: number) => {
     const index = String(tokens.length).padStart(3, "0");
     const placeholder = strategy === "primary_tk" ? `TK${index}TK` : `PHX${index}XHP`;
@@ -146,7 +148,7 @@ function tokenKind(value: string, offset: number, source: string): ProtectedToke
   if (/^https?:|^www\./i.test(value)) return "url";
   if (value.includes("@")) return "email";
   if (/^(?:\{\{|\$?\{|%(?:s|d)$|\[LINK\]$)/.test(value)) return "source_placeholder";
-  if (/\d\s*(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%)$/u.test(value)) return "measurement";
+  if (/\d(?:\s*(?:°\s*[CF]|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|min|kW|W|h|m|%)|[ \u00a0]+K)$/u.test(value)) return "measurement";
   if (/^[+-]?\d+(?:[.,]\d+)?$/.test(value)) {
     const before = source[offset - 1] ?? "";
     const after = source[offset + value.length] ?? "";

@@ -136,6 +136,7 @@ class PdfExportJob(BaseModel):
 
     schema_version: Literal[4, 5, 6, 7, 8, 9, 10]
     source_filename: str
+    typography_profile: Literal["original", "document-role-typography-pilot-v1"] = "original"
     document_identity: PdfDocumentIdentity
     segments: list[PdfExportSegment] = Field(max_length=10_000)
 
@@ -309,11 +310,31 @@ class PdfExportResolutionSummary(BaseModel):
     resolved_if_exported: int = 0
 
 
+class PdfTypographyGroupCoverage(BaseModel):
+    group: str
+    role: str
+    pages: list[int]
+    total: int
+    unified: int
+    partial: bool
+    excluded_reasons: dict[str, int]
+
+
+class PdfTypographyCoverage(BaseModel):
+    profile: str
+    translated: int
+    source_formatted: int
+    untouched: int
+    groups: list[PdfTypographyGroupCoverage]
+
+
 class PdfExportPlan(BaseModel):
     schema_version: Literal[2] = 2
     filename: str
     mode: ExportMode
     document_sha256: str
+    typography_revision: str | None = None
+    typography_coverage: PdfTypographyCoverage | None = None
     summary: PdfExportSummary
     replacements: list[PdfReplacement]
     table_summary: PdfTableExportSummary = Field(default_factory=PdfTableExportSummary)

@@ -34,7 +34,7 @@ from app.services.pdf_exporter import (
 from app.services.pdf_typography import PdfTypographyResolver
 
 SOURCE_TEXT = "Digital source text for a safe translated PDF preview."
-TRANSLATED_TEXT = "Varen prevod čšžČŠŽ, CO₂ in +5 °C."
+TRANSLATED_TEXT = "Varen prevod čšžČŠŽ."
 client = TestClient(app)
 
 

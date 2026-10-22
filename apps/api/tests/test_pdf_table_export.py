@@ -51,7 +51,7 @@ def test_tight_table_baseline_exports_complete_text_and_preserves_neighbors(tmp_
         assert inserted.baseline_y == pytest.approx(native.baseline_y, abs=0.01)
 
 
-@pytest.mark.parametrize("target", ["Predolgi prevod " * 70, "Prva vrstica\nDruga vrstica"])
+@pytest.mark.parametrize("target", ["Predolgi prevod " * 70 + "2,5 MPa", "Prva vrstica\nDruga vrstica 2,5 MPa"])
 def test_tight_table_baseline_overflow_preserves_source(tmp_path: Path, target: str) -> None:
     source = tmp_path / "overflow-baseline.pdf"
     _make_baseline_table(source)
@@ -352,7 +352,7 @@ def test_materially_mixed_server_source_sizes_block_the_table_cell(
 
 def test_table_wrap_uses_two_lines_and_preserves_unbreakable_technical_tokens(tmp_path: Path) -> None:
     source = tmp_path / "safe-wrap.pdf"
-    _make_table(source, row_height=34)
+    _make_table(source, row_height=34, values=("Coating RAL 9001 above 20 °C", "Values", "Material", "MS Polymer"))
     translation = "Temperatura premaza RAL 9001 pri uporabi nad 20 °C"
     artifact = export_translated_pdf(
         source, _job(source, translations={(0, 0): translation}), "replacement_preview", tmp_path / "work",

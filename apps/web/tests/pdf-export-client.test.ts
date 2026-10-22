@@ -10,6 +10,9 @@ import {
   validatePdfExportDownload,
   type PdfExportPlan,
   parsePdfExportPlan,
+  pdfTypographyRevisionKey,
+  validatePdfTypographyDownload,
+  PdfExportQcError,
 } from "../lib/pdf-export-client";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, PdfKind } from "../lib/pdf-types";
@@ -17,6 +20,23 @@ import type { TranslationJob } from "../lib/translation-types";
 import { editTranslation, reviewTranslation, updateTranslationJobSegment } from "../lib/translation-job";
 
 const tests: Promise<void>[] = [];
+test("download must match typography revision and source formatting is not translation", () => {
+  const profile = "document-role-typography-pilot-v1";
+  const plan = { typography_revision: "a".repeat(64), typography_coverage: {source_formatted: 12} } as PdfExportPlan;
+  assert.doesNotThrow(() => validatePdfTypographyDownload({typography_revision: "a".repeat(64), source_formatted: 12}, profile, plan));
+  assert.throws(() => validatePdfTypographyDownload({typography_revision: "b".repeat(64), source_formatted: 12}, profile, plan));
+  assert.throws(() => validatePdfTypographyDownload({typography_revision: "a".repeat(64), source_formatted: 11}, profile, plan));
+  assert.throws(() => validatePdfTypographyDownload({}, profile, plan));
+  assert.throws(() => validatePdfExportDownload({mode:"replacement_preview", applied_replacements:12}, "replacement_preview", 2));
+});
+test("profile switch invalidates export state without changing linguistic review", () => {
+  const original = pdfTypographyRevisionKey("same-reviewed-content", "original");
+  const unified = pdfTypographyRevisionKey("same-reviewed-content", "document-role-typography-pilot-v1");
+  assert.notEqual(original, unified);
+  assert.equal(currentRevisionValue({ revisionKey: original, value: "old success" }, unified), null);
+  assert.equal(isCurrentPdfExportRevision(original, unified), false);
+  assert.equal(isCurrentPdfExportRevision(unified, pdfTypographyRevisionKey("same-reviewed-content", "document-role-typography-pilot-v1")), true);
+});
 function test(name: string, run: () => void | Promise<void>) {
   tests.push(Promise.resolve().then(run).then(() => console.log(`ok - ${name}`)));
 }
@@ -556,5 +576,27 @@ function plan(items: Array<{ segment_id: string; page_number: number; eligible: 
   };
 }
 
+
+test("temperature QC allows shared units in the actual export request without bypassing a missing designation", async () => {
+  const fetchBefore = globalThis.fetch;
+  const current = job();
+  current.segments = [segment({source_text: "-40 °C to +90 °C"})];
+  current.segments[0] = reviewTranslation(editTranslation(current.segments[0], "od −40 do 90 °C"));
+  let requests = 0;
+  globalThis.fetch = async () => { requests++; throw new Error("transport reached"); };
+  try {
+    await assert.rejects(() => preparePdfExport(new File(["%PDF-"], "source.pdf"), current, "replacement_preview"), /transport reached/);
+    assert.equal(requests, 1);
+    current.segments[0] = reviewTranslation(editTranslation({...current.segments[0],source_text:"Use 2K paint."}, "Uporabite dvokomponentno barvo."));
+    await assert.rejects(() => preparePdfExport(new File(["%PDF-"], "source.pdf"), current, "replacement_preview"), (error: unknown) => {
+      assert.ok(error instanceof PdfExportQcError);
+      assert.match(error.message, /celoten PDF izvoz/);
+      assert.match(error.message, /druge enote niso bile geometrijsko zavrnjene/);
+      assert.match(error.blockers[0].current_qc!.findings[0].message, /Pričakovano:.*2K.*Zaznano: \[\]/);
+      return true;
+    });
+    assert.equal(requests, 1, "blocked request never reaches backend");
+  } finally { globalThis.fetch = fetchBefore; }
+});
 
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });

@@ -35,6 +35,7 @@ from app.services.document_segmenter import DOCUMENT_MODEL_VERSION, segment_pdf
 from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canonical_text, is_technical_value, parse_cell_position
 from app.services.pdf_typography import FontAsset, MAX_SOURCE_FONT_SIZE, MIN_SOURCE_FONT_SIZE, PdfTypographyResolver
 from app.services.ocr_review_registry import ocr_review_registry
+from app.services.technical_integrity import validate_technical_integrity
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,9 +78,24 @@ TABLE_PRODUCT_PATTERN = re.compile(
 
 
 class PdfExportValidationError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, details: dict | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.details = details or {}
+
+
+def _require_technical_integrity(segment: PdfExportSegment, authoritative_source: str) -> None:
+    # Fuzzy source matching is only a geometry aid, never a protected-data proof.
+    for stage, text in (("source", segment.source_text), ("target", segment.edited_translation)):
+        result = validate_technical_integrity(authoritative_source, text)
+        if not result.valid:
+            raise PdfExportValidationError(
+                "protected_data_mismatch",
+                f"Zaščiteni podatki segmenta {segment.segment_id} se ne ujemajo ({stage}). "
+                f"Pričakovano: {result.expected}; zaznano: {result.detected}.",
+                details={"segment_id": segment.segment_id, "stage": stage,
+                         "expected": result.expected, "detected": result.detected},
+            )
 
 
 @dataclass(frozen=True)
@@ -89,9 +105,12 @@ class ExportArtifact:
     applied_replacements: int
 
 
-def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: Path) -> PdfExportPlan:
+def plan_pdf_export(
+    path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: Path,
+    *, typography: PdfTypographyResolver | None = None,
+) -> PdfExportPlan:
     temp_dir.mkdir(parents=True, exist_ok=True)
-    typography = PdfTypographyResolver(temp_dir)
+    typography = typography or PdfTypographyResolver(temp_dir)
     overlap_analyzer = PdfImageOverlapAnalyzer()
     authoritative_model = segment_pdf(path)
     with pymupdf.open(path) as document:
@@ -130,6 +149,7 @@ def plan_pdf_export(path: Path, job: PdfExportJob, mode: ExportMode, temp_dir: P
         filename=_output_filename(job.source_filename, mode),
         mode=mode,
         document_sha256=job.document_identity.sha256,
+        typography_revision=getattr(typography, "typography_revision", None),
         summary=_summarize(replacements),
         replacements=replacements,
         table_summary=_summarize_tables(tables),
@@ -189,11 +209,14 @@ def _plan_segment(
     segment: PdfExportSegment,
     typography: PdfTypographyResolver,
     overlap_analyzer: PdfImageOverlapAnalyzer,
+    *, source_formatting: bool = False,
 ) -> PdfReplacement:
+    if source_formatting and (segment.source_text_origin != "native" or segment.edited_translation != segment.source_text):
+        raise ValueError("Source formatting may only write the exact native source text.")
     replacement = _new_replacement(segment)
-    if segment.status == "skipped":
+    if segment.status == "skipped" and not source_formatting:
         return _not_applicable(replacement, "Segment ni prevajalska enota za PDF izvoz.")
-    if segment.status != "reviewed":
+    if segment.status != "reviewed" and not source_formatting:
         return _skip(replacement, "not_reviewed", "Izvozi se samo ročno potrjene prevode.")
     if not segment.edited_translation.strip():
         return _skip(replacement, "empty_translation", "Potrjeni segment nima prevoda.")
@@ -216,8 +239,11 @@ def _plan_segment(
     extracted = page.get_text("text", clip=rect, sort=True)
     if not _text_matches(segment.source_text, extracted):
         return _skip(replacement, "source_text_mismatch", "Besedilo v navedenem območju se ne ujema z izvornim segmentom.")
-    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
+    _require_technical_integrity(segment, extracted)
+    if not source_formatting and _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
         return _preserve_identical(replacement)
+    if source_formatting and not _written_text_matches(segment.source_text, extracted):
+        return _skip(replacement, "source_text_mismatch", "Oblikovanje zahteva natančno ujemanje izvornega besedila.")
     assessment = overlap_analyzer.analyze(page, rect, preserve_list_marker=segment.block_type == "list_item")
     _apply_overlap_assessment(replacement, assessment)
     if assessment.kind != "none" and not assessment.safe_for_background_patch:
@@ -280,10 +306,11 @@ def _plan_ocr_segment(
             "Strežniška OCR revizija ni sprejeta, je zastarela ali se ne ujema. Ponovno registrirajte in sprejmite aktualni vir ter potrdite prevod."
         )
         return _skip(replacement, reason, message)
-    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
-        return _preserve_identical(replacement)
     if segment.source_text != provenance.accepted_text or not _same_bbox(segment.source_bbox, provenance.bbox):
         return _skip(replacement, "ocr_provenance_mismatch", "Sprejeto OCR besedilo ali območje se je po potrditvi spremenilo.")
+    _require_technical_integrity(segment, provenance.accepted_text)
+    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
+        return _preserve_identical(replacement)
     if not 1 <= segment.page_number <= document.page_count:
         return _skip(replacement, "invalid_page", "OCR segment kaže na neobstoječo stran.")
     page = document[segment.page_number - 1]
@@ -593,7 +620,15 @@ def _plan_provenance_cell(
     segment: PdfExportSegment,
     typography: PdfTypographyResolver,
     overlap_analyzer: PdfImageOverlapAnalyzer,
+    *, source_formatting: bool = False,
 ) -> PdfTableCellReplacement:
+    if source_formatting and (
+        segment.source_text_origin != "native" or segment.edited_translation != source_text
+        or segment.source_text != source_text
+    ):
+        raise ValueError("Source formatting may only write the authoritative native cell text.")
+    if segment.status == "reviewed" and segment.source_text_origin == "native":
+        _require_technical_integrity(segment, source_text)
     base = _new_replacement(segment).model_dump()
     base.update(
         source_bbox=provenance.source_bbox,
@@ -619,7 +654,7 @@ def _plan_provenance_cell(
         ownership=provenance.ownership,
         provenance_block_reason=provenance.block_reason,
     )
-    if segment.status == "skipped":
+    if segment.status == "skipped" and not source_formatting:
         return _not_applicable(cell, "Celica ni prevajalska enota za PDF izvoz.")
     if provenance.ownership == "empty":
         return _not_applicable(cell, "Prazna celica ostane del strukturnega modela.")
@@ -640,11 +675,11 @@ def _plan_provenance_cell(
         cell.source_match_status = "mismatch"
         return _skip(cell, "source_text_mismatch", "Izvorno besedilo se ne ujema z dokazano vsebino celice.")
     cell.source_match_status = "matched"
-    if segment.status != "reviewed":
+    if segment.status != "reviewed" and not source_formatting:
         return _skip(cell, "not_reviewed", "Celica ni ročno potrjena.")
     if not segment.edited_translation.strip():
         return _skip(cell, "empty_translation", "Potrjena celica nima prevoda.")
-    if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
+    if not source_formatting and _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
         return _preserve_identical(cell)
     if page.rotation != 0 or segment.source_rotation not in {0, None}:
         return _skip(cell, "rotated_page", "Rotirana tabela ni podprta.")
@@ -755,6 +790,8 @@ def _plan_table_cell(
         return _skip(cell, "duplicate_cell_geometry", "Več celic uporablja isto geometrijo.")
     if geometry.source_bbox is None or geometry.content_bbox is None or geometry.cell_bbox is None:
         return _skip(cell, "missing_cell_bbox", "Celica nima zanesljivega vsebinskega območja.")
+    if segment.status == "reviewed" and segment.source_text_origin == "native":
+        _require_technical_integrity(segment, geometry.text)
     if canonical_text(geometry.text) != canonical_text(segment.source_text):
         cell.source_match_status = "mismatch"
         return _skip(cell, "source_text_mismatch", "Izvorno besedilo se ne ujema z vsebino celice.")
@@ -905,8 +942,72 @@ def _fit_replacement(
     replacements: list[PdfReplacement],
     typography: PdfTypographyResolver,
 ) -> None:
+    _fit_replacement_layout(page, replacement, replacements, typography)
+    if (replacement.eligible and "document_profile_fixed_size" in replacement.typography_warnings
+            and "source_baseline_direct_write" not in replacement.typography_warnings):
+        _preserve_profile_source_inset(page, replacement, replacements, typography)
+
+
+def _preserve_profile_source_inset(page, replacement, replacements, typography) -> None:
+    original = _layout_rect(replacement)
+    lines = [line for block in page.get_text("dict", clip=original).get("blocks", [])
+             for line in block.get("lines", []) if any(s.get("text", "").strip() for s in line.get("spans", []))]
+    if not lines:
+        _skip(replacement, "overlap_conflict", "Izvornega zamika besedila ni mogoče potrditi.")
+        return
+    source_x = next(span["origin"][0] for span in lines[0]["spans"] if span.get("text", "").strip())
+    # Preserve only a demonstrable inset (for example after a separate icon), not
+    # an inferred margin or a request to extend an ordinary paragraph to the left.
+    if source_x <= original.x0 + GEOMETRY_TOLERANCE:
+        return
+    asset = _asset_for(replacement, typography)
+    rect = _rect(replacement.fitted_bbox)
+    html, css = typography.html_and_css(_rendered_translation(replacement), replacement.typography, asset)
+    with pymupdf.open() as scratch:
+        target = scratch.new_page(width=page.rect.width, height=page.rect.height)
+        spare, scale = target.insert_htmlbox(rect, html, css=css, scale_low=1.0, archive=typography.archive)
+        rendered = [line for block in target.get_text("dict").get("blocks", []) for line in block.get("lines", [])]
+    if spare < 0 or scale != 1.0 or not rendered:
+        _skip(replacement, "overlap_conflict", "Zamika oblikovanega besedila ni mogoče izmeriti.")
+        return
+    delta_x = source_x - rendered[0]["spans"][0]["origin"][0]
+    if abs(delta_x) <= GEOMETRY_TOLERANCE:
+        return
+    candidate = pymupdf.Rect(rect.x0 + delta_x, rect.y0, rect.x1, rect.y1)
+    if candidate.x0 < min(rect.x0, original.x0) or candidate.width <= 0:
+        _skip(replacement, "overlap_conflict", "Zamik bi presegel preverjeno območje besedila.")
+        return
+    fit = _htmlbox_preflight(page.rect, candidate, replacement, typography, asset, 1.0)
+    if fit[0] < 0:
+        _skip(replacement, "overflow", "Besedilo se ob ohranjenem izvornem zamiku ne prilega.", "overflow")
+        return
+    _accept_fit(replacement, candidate, fit, replacement.fit_strategy)
+    if not _align_single_line_around_vector_strokes(page, replacement, replacements, typography, asset):
+        _skip(replacement, "overlap_conflict", "Besedila ob ohranjenem zamiku ni mogoče varno poravnati.")
+        return
+    replacement.typography_warnings.append("source_text_inset_preserved")
+
+
+def _fit_replacement_layout(
+    page: pymupdf.Page,
+    replacement: PdfReplacement,
+    replacements: list[PdfReplacement],
+    typography: PdfTypographyResolver,
+) -> None:
     original = _layout_rect(replacement)
     asset = _asset_for(replacement, typography)
+    if "document_profile_fixed_size" in replacement.typography_warnings:
+        available = _safe_expansion(page, original, replacement, replacements)
+        obstacles = [r for r in _text_span_rects(page) if not _contains_with_tolerance(original, r)]
+        obstacles.extend(pymupdf.Rect(i["bbox"]) for i in page.get_image_info())
+        for drawing in page.get_drawings():
+            bounds = pymupdf.Rect(drawing["rect"])
+            obstacles.append(bounds + (-0.5, -0.5, 0.5, 0.5))
+        if _fit_single_line_on_source_baseline(
+            page, available, replacement, asset, _minimum_text_scale(replacement),
+            geometry_guard=lambda rect: not any(not (rect & obstacle).is_empty for obstacle in obstacles),
+        ):
+            return
     exact = _htmlbox_preflight(page.rect, original, replacement, typography, asset, 1.0)
     if exact[0] >= 0:
         return _accept_fit(replacement, original, exact, "exact")
@@ -956,6 +1057,8 @@ def _fit_ocr_replacement(
 
 
 def _minimum_text_scale(replacement: PdfReplacement) -> float:
+    if "document_profile_fixed_size" in replacement.typography_warnings:
+        return max(1.0, MIN_FONT_SIZE / replacement.requested_font_size)
     relative_minimum = HEADING_MIN_SCALE if replacement.block_type == "heading" else BODY_MIN_SCALE
     return max(MIN_FONT_SIZE / replacement.requested_font_size, relative_minimum)
 
@@ -973,7 +1076,8 @@ def _table_minimum_scale(replacement: PdfTableCellReplacement) -> float:
         return minimum_font_size / requested_font_size
     relative_minimum = TABLE_TITLE_MIN_SCALE if replacement.column_span > 1 else TABLE_BODY_MIN_SCALE
     minimum_font_size = max(TABLE_MIN_FONT_SIZE, relative_minimum * source_font_size)
-    return minimum_font_size / requested_font_size
+    floor = minimum_font_size / requested_font_size
+    return max(1.0, floor) if "document_profile_fixed_size" in replacement.typography_warnings else floor
 
 
 def _verified_table_source_font_size(source_font_sizes: list[float]) -> float | None:
@@ -1683,7 +1787,9 @@ def _accepted_writer_scale_floor(replacement: PdfReplacement) -> float:
     return _minimum_text_scale(replacement)
 
 
-def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
+def _verify_inserted_text(
+    path: Path, plan: PdfExportPlan, *, measured_glyph_regions: dict[str, list[BBox]] | None = None,
+) -> None:
     with pymupdf.open(path) as document:
         for item in [*plan.replacements, *plan.ocr_replacements]:
             if not item.eligible or item.source_bbox is None:
@@ -1695,6 +1801,13 @@ def _verify_inserted_text(path: Path, plan: PdfExportPlan) -> None:
             extracted_regions = [page.get_text("text", clip=_rect(bbox), sort=True) for bbox in verification_boxes]
             if item.fitted_bbox is not None:
                 extracted_regions.extend(_text_blocks_in_rect(page, _rect(item.fitted_bbox)))
+            # Adjacent paragraphs can become one extraction block. Server-measured
+            # writer glyph boxes allow strict full-text comparison without including
+            # neighboring glyphs from the unused part of an HTML layout rectangle.
+            measured = (measured_glyph_regions or {}).get(item.segment_id, [])
+            bounds = _rect(item.source_bbox) | _rect(item.fitted_bbox or item.source_bbox)
+            if measured and all(_contains_with_tolerance(bounds, _rect(box)) for box in measured):
+                extracted_regions.append("\n".join(page.get_text("text", clip=_rect(box), sort=True) for box in measured))
             if not any(_written_text_matches(_rendered_translation(item), text) for text in extracted_regions):
                 raise PdfExportValidationError("output_verification_failed", f"Vstavljenega prevoda segmenta {item.segment_id} ni bilo mogoče preveriti.")
 

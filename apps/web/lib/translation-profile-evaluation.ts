@@ -17,9 +17,9 @@ import type { GlossaryEntry, TranslationJob, TranslationSegment } from "./transl
 import { findGlossaryMatches } from "./glossary";
 import { protectTechnicalTokens } from "./technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
-import { createTranslationContentRevision, validateTranslationTechnicalIntegrity } from "./translation-integrity";
+import { createTranslationContentRevision, validateTranslationTechnicalIntegrity, PROTECTED_DATA_RULES_VERSION } from "./translation-integrity";
 
-export const CURRENT_QC_RULES_REVISION = `current-segment-qc-v1:${TRANSLATION_PROFILE_ID}:${TRANSLATION_PROFILE_VERSION}:${TRANSLATION_PROFILE_CANONICAL_SHA256}:${TECHNICAL_RANGE_RULES_VERSION}`;
+export const CURRENT_QC_RULES_REVISION = `current-segment-qc-v2:${PROTECTED_DATA_RULES_VERSION}:${TRANSLATION_PROFILE_ID}:${TRANSLATION_PROFILE_VERSION}:${TRANSLATION_PROFILE_CANONICAL_SHA256}:${TECHNICAL_RANGE_RULES_VERSION}`;
 
 const RULE = {
   userGlossary: "SL-SSKJ-03-002",
@@ -93,12 +93,17 @@ export function refreshCurrentSegmentQc(segment: TranslationSegment, profileRevi
 
   const findings: NonNullable<TranslationSegment["current_qc"]>["findings"] = [...sourceFindings];
   let technicalValid = false;
-  try { technicalValid = validateTranslationTechnicalIntegrity(segment.source_text, target).valid; }
+  let technicalDifference = "";
+  try {
+    const checked = validateTranslationTechnicalIntegrity(segment.source_text, target);
+    technicalValid = checked.valid;
+    technicalDifference = ` Pričakovano: ${JSON.stringify(checked.expected)}. Zaznano: ${JSON.stringify(checked.detected)}.`;
+  }
   catch { /* A malformed unit or range must leave the edited text intact and fail QC. */ }
   if (!technicalValid) findings.push({
     code: "technical_integrity",
     severity: "blocking",
-    message: "Trenutni prevod ne ohranja vseh zaščitenih števil, enot, kod ali tehničnih zapisov.",
+    message: `Trenutni prevod ne ohranja vseh zaščitenih števil, enot, kod ali tehničnih zapisov.${technicalDifference}`,
   });
 
   const missingPlaceholder = sourceProtection.tokens.some((token) =>
@@ -455,7 +460,8 @@ function normalizedTerm(entry: GlossaryEntry): string {
 }
 
 function containsTerm(text: string, term: string): boolean {
-  return text.toLocaleLowerCase("sl").includes(term.toLocaleLowerCase("sl"));
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "iu").test(text);
 }
 
 function hasSourcePlaceholder(segment: TranslationSegment): boolean {

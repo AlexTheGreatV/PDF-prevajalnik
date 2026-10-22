@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
@@ -7,6 +9,7 @@ import { protectTechnicalTokens, restoreTechnicalTokens } from "../lib/technical
 import { TECHNICAL_RANGE_RULES_VERSION } from "../lib/technical-ranges";
 import {
   bindTranslationJobToAnalysis,
+  recoverTranslationJobForAnalysis,
   createTranslationJob,
   createTranslationChunks,
   editTranslation,
@@ -32,6 +35,10 @@ import { refreshTranslationProfileMetadata } from "../lib/translation-profile-ev
 import type { TranslationMemoryEntry } from "../lib/translation-memory";
 
 const tests: Promise<void>[] = [];
+test("frontend QC matches shared server protected-data contract cases", () => {
+  const cases: Array<{id:string;source:string;target:string;valid:boolean}> = JSON.parse(readFileSync(resolve(process.cwd(), "../api/tests/fixtures/protected-data-cases.json"), "utf8"));
+  for (const row of cases) assert.equal(validateTranslationTechnicalIntegrity(row.source,row.target).valid,row.valid,row.id);
+});
 function test(name: string, run: () => void | Promise<void>) {
   tests.push(Promise.resolve().then(run).then(() => console.log(`ok - ${name}`)));
 }
@@ -477,7 +484,7 @@ test("changing or rejecting an OCR source invalidates its old translation approv
   const item = acceptedManualOcr();
   const base = createTranslationJob(fixture(), [item], { source_language: "en", target_language: "sl" });
   const reviewed = { ...base, segments: base.segments.map((segment) => segment.segment_id === "ocr-manual-ocr" ? reviewTranslation(editTranslation(segment, "Garancijsko obdobje")) : segment) };
-  const changed = { ...item, effective_text: "Changed OCR", ocr_text: "Changed OCR", pdf_bbox: { ...item.pdf_bbox, x1: 75 } };
+  const changed = { ...item, effective_text: "Changed OCR", ocr_text: "Changed OCR" };
   const invalidated = invalidateStaleOcrApprovals(reviewed, [changed]);
   const segment = invalidated.segments.find((entry) => entry.segment_id === "ocr-manual-ocr")!;
   assert.equal(segment.status, "translated");
@@ -1509,6 +1516,125 @@ test("a delayed provider result or failure cannot overwrite a newer manual edit 
   assert.equal(failed.segments[0].status, "reviewed");
   const otherDocument = { ...edited, document_identity: { ...edited.document_identity!, sha256: "f".repeat(64) } };
   assert.equal(mergeCurrentTranslationResult(otherDocument, requested, result), otherDocument);
+});
+
+test("temperature range integrity compares ordered signed bounds and shared units only", () => {
+  const cases = [
+    ["-40 °C to +90 °C", "od −40 do +90\u00a0°C"],
+    ["+5 °C to 35 °C", "od 5 do 35 °C"],
+    ["-12.5 °C to +86 °C", "od −12,5 °C do 86 °C"],
+    ["Resistance -40 °C to +90 °C, RAL 9001", "Odpornost od -40 do 90 °C, RAL 9001"],
+  ];
+  for (const [source, target] of cases) {
+    assert.equal(validateTranslationTechnicalIntegrity(source, target).valid, true, target);
+    assert.equal(validateTranslationTechnicalIntegrity(target, source).valid, true, source);
+  }
+  const source = "-40 °C to +90 °C";
+  for (const target of [
+    "od 40 do 90 °C", "od −41 do 90 °C", "od −40 do 91 °C", "od −40 do −90 °C",
+    "od 90 do −40 °C", "od −40 do 90 °F", "od −40 do 90 K", "od −40 do 90",
+    "od −40 K do 90 °C", "od −40 do 90 °C, 90 °C", "od −4 0 do 90 °C",
+    "od −40 do 9,0 °C", "od −40 do 90 °C, RAL 9001", "od −40 °C in 90 °C",
+  ]) assert.equal(validateTranslationTechnicalIntegrity(source, target).valid, false, target);
+  assert.equal(validateTranslationTechnicalIntegrity("+5 °C", "5 °C").valid, false, "isolated quantity stays strict");
+});
+
+test("digit-leading designations retain letters and cannot be replaced by an explanation or another code", () => {
+  const source = "Use 2K paint, 3D parts and 20 L.";
+  assert.ok(protectTechnicalTokens(source).tokens.some(token => token.value === "2K" && token.kind === "product_code"));
+  assert.equal(validateTranslationTechnicalIntegrity(source, "Uporabite dvokomponentno barvo (2K), dele 3D in 20 L.").valid, true);
+  for (const target of ["Uporabite barvo 2X, dele 3D in 20 L.", "Uporabite barvo 2, dele 3D in 20 L.", "Uporabite dvokomponentno barvo, dele 3D in 20 L."]) {
+    assert.equal(validateTranslationTechnicalIntegrity(source, target).valid, false, target);
+  }
+});
+
+test("new temperature QC refresh preserves valid content review and reports exact genuine differences", () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{kind: "body", bbox: {x0: 0,y0: 0,x1: 100,y1: 50}, reading_order: 1,
+    blocks: [block(1, "paragraph", "-40 °C to +90 °C")] }];
+  const job = createTranslationJob(analysis, [], {source_language: "en",target_language: "sl"});
+  const reviewed = updateTranslationJobSegment(job, job.segments[0].segment_id, s => reviewTranslation(editTranslation(s, "od −40 do 90 °C")));
+  const current = refreshTranslationProfileMetadata(reviewed);
+  assert.equal(current.segments[0].status, "reviewed");
+  assert.deepEqual(current.segments[0].review_state, reviewed.segments[0].review_state);
+  assert.equal(current.segments[0].current_qc?.status, "passed");
+  assert.ok(current.segments[0].current_qc?.rules_revision.includes("current-segment-qc-v2"));
+  const wrong = updateTranslationJobSegment(current, current.segments[0].segment_id, s => editTranslation(s, "od 40 do 90 °C"));
+  assert.equal(wrong.segments[0].status, "translated");
+  assert.equal(wrong.segments[0].current_qc?.status, "blocked");
+  assert.match(wrong.segments[0].current_qc!.findings[0].message, /Pričakovano:.*-40.*Zaznano:.*40/);
+});
+
+test("preferred term QC uses whole words and never guesses Slovenian inflection", () => {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{kind: "body", bbox: {x0: 0,y0: 0,x1: 100,y1: 50}, reading_order: 1,
+    blocks: [block(1, "paragraph", "Use sealant with fibre cement panels.")] }];
+  const glossary: GlossaryEntry[] = [
+    {id:"term-a",source_term:"sealant",target_term:"tesnilna masa",case_sensitive:false,mode:"preferred",enabled:true,origin:"user"},
+    {id:"term-b",source_term:"fibre cement panels",target_term:"vlaknocementne plošče",case_sensitive:false,mode:"preferred",enabled:true,origin:"user"},
+  ];
+  const job = createTranslationJob(analysis, [], {source_language:"en",target_language:"sl",glossary});
+  const warnings = (target: string) => updateTranslationJobSegment(job,job.segments[0].segment_id,s=>editTranslation(s,target)).segments[0].current_qc!.findings.filter(f=>f.code==="preferred_term_missing");
+  assert.equal(warnings("Tesnilna masa, vlaknocementne plošče.").length,0);
+  assert.equal(warnings("Tesnilna masaaa, vlaknocementne plošče.").length,1);
+  assert.equal(warnings("Tesnilne mase, vlaknocementne plošče.").length,1,"no unsupported automatic inflection");
+  assert.equal(warnings("Tesnilna masa, vlakna cementne plošče.").length,1,"real terminology error remains visible");
+});
+
+test("OCR recovery retains all translations but invalidates only the unproven source review", () => {
+  const analysis = fixture();
+  const box = analysis.document!.pages[0].regions.find(r=>r.kind==="header")!.blocks[0].bbox;
+  const accepted = {...acceptedOcr(),pdf_bbox:box};
+  const candidate = {...accepted,status:"pending" as const,selected_text_source:"native" as const,effective_text:accepted.native_text,ocr_text:null,server_revision_id:null};
+  const imported = createTranslationJob(analysis,[accepted],{source_language:"en",target_language:"sl"});
+  // Synthetic fixture reviews are test setup, not human approval of real documents.
+  const reviewed = importTranslationJob(exportTranslationJob({...imported,segments:imported.segments.map(s=>s.skip_reason?s:reviewTranslation(editTranslation(s,s.source_text)))}));
+  const expected = createTranslationJob(analysis,[candidate],{source_language:"en",target_language:"sl"});
+  const original = JSON.stringify(reviewed);
+  const recovered = recoverTranslationJobForAnalysis(reviewed,expected,[candidate]);
+  const ocr = recovered.segments.find(s=>s.source_text_origin==="accepted_ocr")!;
+  assert.equal(ocr.edited_translation,"APPLICATIONS");
+  assert.equal(ocr.source_text,"APPLICATIONS");
+  assert.equal(ocr.status,"translated");
+  assert.equal(ocr.review_state,null);
+  assert.equal(ocr.accepted_ocr_source?.revision_id,null);
+  assert.equal(ocr.accepted_ocr_source?.review_id,candidate.id);
+  assert.ok(ocr.warnings.includes("ocr_recovery_required"));
+  assert.equal(JSON.stringify(reviewed),original);
+  for(const s of recovered.segments.filter(s=>s.segment_id!==ocr.segment_id)) {
+    assert.deepEqual(s,reviewed.segments.find(old=>old.segment_id===s.segment_id));
+  }
+  assert.deepEqual(importTranslationJob(exportTranslationJob(recovered)).segments,recovered.segments);
+  const stillPending = invalidateStaleOcrApprovals(recovered,[candidate]);
+  assert.equal(stillPending.segments[0].accepted_ocr_source?.review_id,candidate.id);
+  const relinked = invalidateStaleOcrApprovals(stillPending,[{...accepted,server_revision_id:"new-explicit-acceptance"}]);
+  assert.equal(relinked.segments[0].accepted_ocr_source?.revision_id,"new-explicit-acceptance");
+  assert.equal(relinked.segments[0].status,"translated");
+  assert.equal(relinked.segments[0].review_state,null);
+  const changedText = invalidateStaleOcrApprovals(recovered,[{...accepted,effective_text:"OTHER HEADING",server_revision_id:"new-revision"}]);
+  assert.equal(changedText.segments[0].source_text,"OTHER HEADING");
+  assert.equal(changedText.segments[0].edited_translation,"APPLICATIONS");
+  assert.equal(changedText.segments[0].review_state,null);
+});
+
+test("OCR recovery rejects another PDF or unproven block rectangle and never adopts a moved acceptance", () => {
+  const analysis=fixture();
+  const box=analysis.document!.pages[0].regions.find(r=>r.kind==="header")!.blocks[0].bbox;
+  const accepted={...acceptedOcr(),pdf_bbox:box};
+  const candidate={...accepted,status:"pending" as const,selected_text_source:"native" as const,effective_text:accepted.native_text,server_revision_id:null};
+  const imported=createTranslationJob(analysis,[accepted],{source_language:"en",target_language:"sl"});
+  const expected=createTranslationJob(analysis,[candidate],{source_language:"en",target_language:"sl"});
+  const other={...expected,document_identity:{...expected.document_identity!,sha256:"b".repeat(64)}};
+  assert.throws(()=>recoverTranslationJobForAnalysis(imported,other,[candidate]));
+  for(const changed of [
+    {...candidate,pdf_bbox:{...box,x0:box.x0+1}}, {...candidate,page_number:2},
+    {...candidate,linked_block_reading_order:2}, {...candidate,native_text:"Different native block"},
+    {...candidate,source:"manual" as const}, {...candidate,id:"different-review"},
+  ]) assert.throws(()=>recoverTranslationJobForAnalysis(imported,expected,[changed]));
+  const recovered=recoverTranslationJobForAnalysis(imported,expected,[candidate]);
+  const moved=invalidateStaleOcrApprovals(recovered,[{...accepted,pdf_bbox:{...box,x0:box.x0+1},server_revision_id:"moved"}]);
+  assert.equal(moved.segments[0].accepted_ocr_source?.revision_id,null);
+  assert.deepEqual(moved.segments[0].source_bbox,box);
 });
 
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });

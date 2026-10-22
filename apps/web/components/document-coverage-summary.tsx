@@ -73,7 +73,7 @@ export function DocumentCoverageSummary({
           <div><dt>Dekorativne slike</dt><dd>{page.decorative_image_areas}</dd></div>
           <div><dt>Slike za varnost izvoza</dt><dd>{page.export_safety_image_areas}</dd></div>
           <div><dt>Prevodljivi / prevedeni</dt><dd>{page.translatable_segments} / {page.translated_segments}</dd></div>
-          <div><dt>Pregledani / za PDF</dt><dd>{page.reviewed_segments} / {page.export_ready_segments}</dd></div>
+          <div><dt>Pregledani / za PDF</dt><dd>{page.reviewed_segments} / {coverage.pdf_export.plan_available ? page.export_ready_segments : "še ni preverjeno"}</dd></div>
           <div><dt>Izvoženi</dt><dd>{page.exported_segments}</dd></div>
         </dl>
         {page.skips.length > 0 && <p>Preskoki: {page.skips.map((skip) => `${skip.count} × ${skip.reason}`).join("; ")}</p>}
