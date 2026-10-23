@@ -294,6 +294,8 @@ def _plan_ocr_segment(
         page_number=segment.page_number,
         bbox=segment.source_bbox,
         text=segment.source_text,
+        source=provenance.source,
+        reason=provenance.reason,
     )
     if registry_error is not None:
         reason = {

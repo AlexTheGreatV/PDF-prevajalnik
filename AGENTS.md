@@ -19,6 +19,7 @@ Allowed:
 - A dedicated local adapter for user-supplied official IATE pipe-delimited CSV exports, with exact-header detection, concept grouping, bounded diagnostics, and explicit candidate selection
 - A separate persistent local translation memory for manually reviewed complete segments or deterministic sentence chunks, with conservative exact matching and explicit approval
 - Local diagnostic and replacement-preview PDF export into a new temporary file
+- An explicitly selected, isolated table-reconstruction pilot with an authoritative complete cell inventory, unchanged reviewed text, a separately versioned plan, and verified preservation outside the selected region. This intentionally replaces table appearance inside the selection and is never an automatic ordinary-export fallback.
 - Local FiraGO typography resolution with regular, bold, italic, and bold-italic faces
 - Local background patching over demonstrably uniform image regions without modifying image XObjects
 - Cell-level export for reliable digital tables with source matching, fit preflight, and partial-export diagnostics
@@ -51,6 +52,7 @@ Guardrails:
 - Preserve images and vector graphics, and skip ambiguous, overlapping, unaccepted or stale OCR, rotated, unsupported-table, or overflowing regions with a structured reason.
 - OCR source identity and removal stay inside the accepted bbox. For completely owned native OCR glyphs, a separate server-measured write region may use proven empty space without changing the accepted source or its approval. Image-only OCR remains confined to the accepted bbox. Neither path may cover icons, lines, neighboring text, cells, photographs, gradients, or textures, reconstruct an image, or rasterize a page.
 - Never resize table rows or columns, reconstruct ambiguous merged cells, alter borders/fills, or translate standalone technical values automatically.
+- The explicit reconstruction pilot may redistribute proven table rows and replace their graphics only within its selected region. It must reject missing content or ambiguous boundaries, retain shared image streams, remove old searchable table text, and disclose intentionally replaced graphics. This does not relax any ordinary-export guardrail.
 - Keep Droid Sans Fallback as a final glyph fallback, never download fonts at runtime, and never reuse an embedded source font without clear embedding rights and complete glyph coverage.
 - Never patch photographs, gradients, textures, icons, lines, image-only OCR text, or uncertain regions. Do not add inpainting or full-page rasterization.
 - Do not add payments, public registration, or remote document uploads.

@@ -11,7 +11,8 @@ from app.api.terminology_import import router as terminology_import_router
 from app.core.config import settings
 
 app = FastAPI(title="JUB/KOOP PDF Pipeline", version="0.1.0")
-PDF_EXPORT_PATHS = {"/api/pdf/export-translated", "/api/pdf/export-translated/plan"}
+PDF_EXPORT_PATHS = {"/api/pdf/export-translated", "/api/pdf/export-translated/plan",
+                    "/api/pdf/export-translated/reconstruction/preview", "/api/pdf/export-translated/reconstruction/download"}
 
 
 app.add_middleware(
@@ -21,7 +22,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition", "X-PDF-Export-Mode", "X-PDF-Replacements-Applied",
-                    "X-PDF-Typography-Profile", "X-PDF-Typography-Revision", "X-PDF-Source-Formatted"],
+                    "X-PDF-Typography-Profile", "X-PDF-Typography-Revision", "X-PDF-Source-Formatted",
+                    "X-PDF-Reconstruction-Token", "X-PDF-Reconstruction-Counts"],
 )
 
 

@@ -416,6 +416,12 @@ export async function downloadPdfExport(file: File, job: TranslationJob, mode: P
 }
 
 function postExportRequest(path: string, file: File, job: TranslationJob, mode: PdfExportMode, profile: PdfTypographyProfile): Promise<Response> {
+  const form = createPdfExportForm(file, job, mode, profile);
+  form.append("mode", mode);
+  return fetch(`${apiBaseUrl}${path}`, { method: "POST", body: form });
+}
+
+export function createPdfExportForm(file: File, job: TranslationJob, mode: PdfExportMode, profile: PdfTypographyProfile): FormData {
   const currentJob = JSON.parse(exportTranslationJob(job)) as TranslationJob;
   const blocked = currentJob.segments.filter((segment) => segment.status === "reviewed" && segment.current_qc?.status === "blocked");
   if (mode === FINAL_PDF_EXPORT_MODE && blocked.length) {
@@ -428,11 +434,10 @@ function postExportRequest(path: string, file: File, job: TranslationJob, mode: 
     typography_profile: profile,
     segments: currentJob.segments.filter(isTranslationUnitSegment),
   }));
-  form.append("mode", mode);
-  return fetch(`${apiBaseUrl}${path}`, { method: "POST", body: form });
+  return form;
 }
 
-async function exportError(response: Response): Promise<string> {
+export async function exportError(response: Response): Promise<string> {
   try {
     const payload = await response.json() as { detail?: string | { message?: string } };
     if (typeof payload.detail === "string") return payload.detail;

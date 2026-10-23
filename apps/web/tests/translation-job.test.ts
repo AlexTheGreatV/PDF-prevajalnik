@@ -10,6 +10,7 @@ import { TECHNICAL_RANGE_RULES_VERSION } from "../lib/technical-ranges";
 import {
   bindTranslationJobToAnalysis,
   recoverTranslationJobForAnalysis,
+  restoreVerifiedOcrItems,
   createTranslationJob,
   createTranslationChunks,
   editTranslation,
@@ -1662,6 +1663,37 @@ test("OCR recovery rejects another PDF or unproven block rectangle and never ado
   const moved=invalidateStaleOcrApprovals(recovered,[{...accepted,pdf_bbox:{...box,x0:box.x0+1},server_revision_id:"moved"}]);
   assert.equal(moved.segments[0].accepted_ocr_source?.revision_id,null);
   assert.deepEqual(moved.segments[0].source_bbox,box);
+});
+
+test("server-verified unchanged OCR survives fresh analysis and JSON round trips without a new review", () => {
+  const analysis=fixture();
+  const box=analysis.document!.pages[0].regions.find(r=>r.kind==="header")!.blocks[0].bbox;
+  const accepted={...acceptedOcr(),pdf_bbox:box};
+  const candidate={...accepted,status:"pending" as const,selected_text_source:"native" as const,effective_text:accepted.native_text,ocr_text:null,server_revision_id:null};
+  const original=createTranslationJob(analysis,[accepted],{source_language:"en",target_language:"sl"});
+  // Synthetic user actions, not approval of real document translations.
+  const approved={...original,segments:original.segments.map(s=>s.source_text_origin==="accepted_ocr"?reviewTranslation(editTranslation(s,"UPORABA")):s)};
+  const imported=importTranslationJob(exportTranslationJob(approved));
+  const expected=createTranslationJob(analysis,[candidate],{source_language:"en",target_language:"sl"});
+  const restored=restoreVerifiedOcrItems(imported,expected,[candidate],new Set([accepted.server_revision_id!]));
+  const rebound=recoverTranslationJobForAnalysis(imported,createTranslationJob(analysis,restored,{source_language:"en",target_language:"sl"}),restored);
+  const before=imported.segments.find(s=>s.source_text_origin==="accepted_ocr")!;
+  const after=rebound.segments.find(s=>s.segment_id===before.segment_id)!;
+  assert.equal(after.status,"reviewed");
+  assert.deepEqual(after.review_state,before.review_state);
+  assert.deepEqual(after.accepted_ocr_source,before.accepted_ocr_source);
+  assert.deepEqual(importTranslationJob(exportTranslationJob(rebound)).segments,rebound.segments);
+  assert.deepEqual(invalidateStaleOcrApprovals(rebound,restored).segments,rebound.segments);
+  const notReviewed=updateTranslationJobSegment(imported,before.segment_id,s=>editTranslation(s,"DRUGA UPORABA"));
+  const stillNotReviewed=recoverTranslationJobForAnalysis(notReviewed,createTranslationJob(analysis,restored,{source_language:"en",target_language:"sl"}),restored);
+  assert.equal(stillNotReviewed.segments.find(s=>s.segment_id===before.segment_id)!.status,"translated");
+  const edited=updateTranslationJobSegment(rebound,after.segment_id,s=>editTranslation(s,"DRUGA UPORABA"));
+  assert.equal(edited.segments.find(s=>s.segment_id===after.segment_id)!.review_state,null);
+  const unknown=restoreVerifiedOcrItems(imported,expected,[candidate],new Set());
+  const rejected=recoverTranslationJobForAnalysis(imported,expected,unknown);
+  assert.equal(rejected.segments.find(s=>s.segment_id===after.segment_id)!.status,"translated");
+  assert.throws(()=>restoreVerifiedOcrItems(imported,{...expected,document_identity:{...expected.document_identity!,sha256:"b".repeat(64)}},[candidate],new Set([accepted.server_revision_id!])));
+  assert.throws(()=>restoreVerifiedOcrItems(imported,expected,[{...candidate,pdf_bbox:{...box,x0:box.x0+1}}],new Set([accepted.server_revision_id!])));
 });
 
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });

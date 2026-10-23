@@ -1042,6 +1042,23 @@ export function recoverTranslationJobForAnalysis(imported: TranslationJob, expec
   } : segment) });
 }
 
+export function restoreVerifiedOcrItems(imported: TranslationJob, expected: TranslationJob,
+  ocrItems: OcrReviewItem[], verifiedRevisions: ReadonlySet<string>): OcrReviewItem[] {
+  // Prove the same PDF, native block, crop and source first using the existing
+  // fail-closed recovery rules. Verification never registers or approves a source.
+  recoverTranslationJobForAnalysis(imported, expected, ocrItems);
+  return ocrItems.map(item => {
+    const segment = imported.segments.find(segment => segment.source_text_origin === "accepted_ocr"
+      && segment.accepted_ocr_source?.review_id === item.id);
+    const proof = segment?.accepted_ocr_source;
+    if (!proof?.revision_id || !verifiedRevisions.has(proof.revision_id) || item.source !== "block"
+        || proof.source !== "block" || proof.reason !== item.reason || segment!.page_number !== item.page_number
+        || JSON.stringify(proof.bbox) !== JSON.stringify(item.pdf_bbox)) return item;
+    return { ...item, ocr_text: proof.accepted_text, effective_text: proof.accepted_text,
+      status: "accepted", selected_text_source: "ocr", server_revision_id: proof.revision_id };
+  });
+}
+
 function migrateSchemaOne(job: Record<string, unknown>): Record<string, unknown> {
   validateBaseJob(job);
   const glossary = (job.glossary as unknown[]).map((value, index) => migrateGlossaryEntry(value, index));

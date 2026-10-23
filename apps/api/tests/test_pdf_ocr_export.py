@@ -21,6 +21,36 @@ TRANSLATION = "Garancijsko obdobje"
 client = TestClient(app)
 
 
+@pytest.mark.parametrize("damage", [None, "unaccepted", "unknown", "document", "text", "bbox", "page", "id", "source", "reason"])
+def test_import_verification_never_registers_renews_or_approves_ocr(tmp_path: Path, damage):
+    source, bbox = _make_image_text_pdf(tmp_path / "verify.pdf")
+    values = dict(document_sha256=_hash(source), review_id="synthetic-import", page_number=1,
+        bbox=_bbox(bbox), text=OCR_TEXT, source="manual", reason="manual_selection")
+    if damage == "document":
+        values["document_sha256"] = "b" * 64
+    revision = ocr_review_registry.register(**values)
+    if damage != "unaccepted":
+        ocr_review_registry.accept(revision.revision_id)
+    candidate = {k: v for k, v in values.items() if k != "document_sha256"}
+    candidate.update(bbox=bbox, revision_id=revision.revision_id)
+    if damage == "unknown": candidate["revision_id"] = "unknown"
+    if damage == "text": candidate["text"] += " changed"
+    if damage == "bbox": candidate["bbox"] = {**bbox, "x0": bbox["x0"] + 1}
+    if damage == "page": candidate["page_number"] = 2
+    if damage == "id": candidate["review_id"] = "other-id"
+    if damage == "source": candidate["source"] = "block"
+    if damage == "reason": candidate["reason"] = "other-reason"
+    before = dict(ocr_review_registry._records)
+    response = client.post("/api/pdf/ocr-review/verify",
+        files={"file": (source.name, source.read_bytes(), "application/pdf")},
+        data={"sources": json.dumps({"sources": [candidate]})})
+    assert response.status_code == 200, response.text
+    result = response.json()["sources"][0]
+    assert result["valid"] is (damage is None)
+    assert (result["reason"] is None) is (damage is None)
+    assert ocr_review_registry._records == before
+
+
 @pytest.mark.parametrize("obstacle", ["none", "text", "same_span", "line", "image"])
 def test_native_ocr_write_space_does_not_change_accepted_source(tmp_path: Path, obstacle: str) -> None:
     source = tmp_path / "write-region.pdf"

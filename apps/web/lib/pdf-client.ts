@@ -1,5 +1,6 @@
 import type { OcrResponse, OcrStatus, PdfAnalysis, RenderResult } from "./pdf-types";
 import type { OcrReviewItem } from "./ocr-review";
+import type { TranslationJob } from "./translation-types";
 
 export const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -67,6 +68,29 @@ export async function registerAndAcceptOcrSource(file: File, item: OcrReviewItem
   const accepted = await parseApiResponse<{ revision_id: string; accepted: boolean }>(response);
   if (!accepted.accepted) throw new Error("Strežnik OCR revizije ni sprejel.");
   return accepted.revision_id;
+}
+
+export async function verifyImportedOcrSources(file: File, job: TranslationJob): Promise<Set<string>> {
+  const sources = job.segments.flatMap(segment => {
+    const proof = segment.accepted_ocr_source;
+    return segment.source_text_origin === "accepted_ocr" && proof?.revision_id ? [{
+      revision_id: proof.revision_id, review_id: proof.review_id, page_number: segment.page_number,
+      bbox: proof.bbox, text: proof.accepted_text, source: proof.source, reason: proof.reason,
+    }] : [];
+  });
+  if (!sources.length) return new Set();
+  if (sources.length > 100) throw new Error("Opravilo vsebuje preveč OCR-povezav za en varen uvoz.");
+  const form = new FormData();
+  form.append("file", file);
+  form.append("sources", JSON.stringify({ sources }));
+  const result = await parseApiResponse<{ sources: {revision_id: string; valid: boolean; reason: string | null}[] }>(
+    await fetchApi(`${apiBaseUrl}/api/pdf/ocr-review/verify`, form));
+  if (!Array.isArray(result.sources) || result.sources.length !== sources.length
+      || !result.sources.every((row, index) => row.revision_id === sources[index].revision_id && typeof row.valid === "boolean"
+        && (row.valid ? row.reason === null : typeof row.reason === "string"))) {
+    throw new Error("Strežnik ni potrdil istih OCR-povezav. Uvoz ni spremenil trenutnega opravila.");
+  }
+  return new Set(result.sources.filter(row => row.valid).map(row => row.revision_id));
 }
 
 async function fetchApi(url: string, body: FormData): Promise<Response> {

@@ -21,6 +21,8 @@ import {
 import type { PdfAnalysis } from "../lib/pdf-types";
 import type { TranslationJob, TranslationSegment } from "../lib/translation-types";
 import { DocumentCoverageSummary } from "./document-coverage-summary";
+import { TableReconstructionPanel } from "./table-reconstruction-panel";
+import { reconstructionRevision } from "../lib/table-reconstruction";
 
 const REASON_LABELS: Record<string, string> = {
   not_reviewed: "prevod ni potrjen",
@@ -75,6 +77,13 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
 }) {
   const [mode, setMode] = useState<PdfExportMode>("diagnostic");
   const [typographyProfile, setTypographyProfile] = useState<PdfTypographyProfile>("original");
+  const [reconstructionTable, setReconstructionTable] = useState("");
+  const [reconstructedState, setReconstructedState] = useState<{ revisionKey: string; value: PdfExportUiState } | null>(null);
+  const tableChoices = analysis.document?.pages.flatMap(page => page.regions.flatMap(region => region.blocks
+    .filter(block => block.table_provenance)
+    .map(block => ({ page_number: page.page_number, table_id: block.table_provenance!.table_id,
+      rows: block.table_provenance!.row_count, columns: block.table_provenance!.column_count })))) ?? [];
+  const selectedTable = effectiveTableChoice(tableChoices, reconstructionTable);
   const [planned, setPlanned] = useState<{ revisionKey: string; value: PdfExportPlan } | null>(null);
   const [busy, setBusy] = useState<"plan" | "download" | null>(null);
   const [error, setError] = useState<{ revisionKey: string; value: string; blockers?: TranslationSegment[] } | null>(null);
@@ -84,7 +93,8 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
   const busyRef = useRef(false);
   const effectiveMode = resolvePdfExportMode(simpleMode, mode);
   const effectiveProfile = effectiveMode === "diagnostic" ? "original" : typographyProfile;
-  const revisionKey = pdfTypographyRevisionKey(createCoverageRevisionKey({ analysis, ocrItems, job, mode: effectiveMode }), effectiveProfile);
+  const reconstruction = effectiveMode === "replacement_preview" ? selectedTable : null;
+  const revisionKey = reconstructionRevision(pdfTypographyRevisionKey(createCoverageRevisionKey({ analysis, ocrItems, job, mode: effectiveMode }), effectiveProfile), reconstruction);
   const revisionKeyRef = useRef(revisionKey);
   useLayoutEffect(() => {
     revisionKeyRef.current = revisionKey;
@@ -94,10 +104,14 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
   const currentError = currentRevisionValue(error, revisionKey);
   const downloadCompleted = downloadedRevisionKey === revisionKey;
   const diagnosticDownloadCompleted = diagnosticDownloadedRevisionKey === revisionKey;
+  const activeReconstruction = currentRevisionValue(reconstructedState, revisionKey);
+  const activePlan = reconstruction ? activeReconstruction?.plan ?? null : plan;
+  const activeDownloaded = reconstruction ? activeReconstruction?.downloadCompleted ?? false : downloadCompleted;
+  const activeApplied = reconstruction ? activeReconstruction?.appliedReplacements ?? 0 : downloadCompleted ? appliedReplacements : 0;
 
   useEffect(() => {
-    onStateChange?.({ plan, downloadCompleted, appliedReplacements: downloadCompleted ? appliedReplacements : 0 });
-  }, [appliedReplacements, downloadCompleted, onStateChange, plan]);
+    onStateChange?.({ plan: activePlan, downloadCompleted: activeDownloaded, appliedReplacements: activeApplied });
+  }, [activeApplied, activeDownloaded, activePlan, onStateChange]);
 
   async function prepare() {
     if (busyRef.current) return;
@@ -181,7 +195,14 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
       </select>
       {typographyProfile !== "original" && <small>Poenotenje lahko spremeni prileganje. Varno oblikovano izvorno besedilo ni prevedena vsebina.</small>}
     </label></div>}
-    <div className="translation-actions">
+    {effectiveMode !== "diagnostic" && tableChoices.length > 0 && <label className="reconstruction-choice">Rekonstruiraj tabelo
+      <select value={selectedTable ? reconstructionTable : ""} onChange={event => setReconstructionTable(event.target.value)}>
+        <option value="">Brez rekonstrukcije — običajne zamenjave</option>
+        {tableChoices.map(table => <option key={`${table.page_number}:${table.table_id}`} value={`${table.page_number}:${table.table_id}`}>Stran {table.page_number} · {table.rows} × {table.columns} · {table.table_id}</option>)}
+      </select>
+    </label>}
+    {reconstruction && <TableReconstructionPanel key={revisionKey} file={sourceFile} job={job} profile={effectiveProfile} selection={reconstruction} revision={revisionKey} onStateChange={setReconstructedState} />}
+    {!reconstruction && <><div className="translation-actions">
       {!plan && <button className="button" disabled={busy !== null || !job.document_identity} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi PDF"}</button>}
       {plan && <button className="button" disabled={downloadCompleted || diagnosticDownloadCompleted || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : downloadCompleted ? "PDF je prenesen" : diagnosticDownloadCompleted ? "Diagnostični PDF je prenesen" : effectiveMode === "diagnostic" ? "Prenesi diagnostični PDF" : "Prenesi prevedeni PDF"}</button>}
       {!simpleMode && plan && <button className="button secondary" disabled={busy !== null} onClick={() => void prepare()}>Znova preveri izvoz</button>}
@@ -273,8 +294,12 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
         <summary>Razlogi za preskok</summary>
         {[...plan.replacements, ...plan.ocr_replacements].filter((item) => !item.eligible).map((item) => <p key={item.segment_id}><strong>{item.segment_id}</strong>: {REASON_LABELS[item.skip_reason ?? ""] ?? item.skip_reason ?? "ni upravičen"}</p>)}
       </details>}
-    </div>}
+    </div>}</>}
   </section>;
+}
+
+function effectiveTableChoice(choices: { page_number: number; table_id: string }[], selected: string) {
+  return choices.find(table => `${table.page_number}:${table.table_id}` === selected) ?? null;
 }
 
 function ExportMetric({ label, value }: { label: string; value: number }) {

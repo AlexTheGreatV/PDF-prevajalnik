@@ -1,3 +1,4 @@
+import json
 import shutil
 import time
 import uuid
@@ -20,6 +21,7 @@ from app.models import OcrResponse, PdfAnalysis, RenderResult
 from app.pdf_export_models import (
     ExportMode, OcrReviewAcceptance, OcrReviewRegistration,
     OcrReviewRegistrationResult, PdfExportJob, PdfExportPlan,
+    OcrReviewVerifications,
 )
 from app.services.ocr import run_selective_ocr
 from app.services.pdf_analyzer import analyze_pdf
@@ -27,10 +29,52 @@ from app.services.pdf_renderer import render_pdf_pages_as_data_urls
 from app.services.pdf_exporter import ExportArtifact, PdfExportValidationError, export_translated_pdf, plan_pdf_export
 from app.services.pdf_document_typography import export_document_typography_pilot
 from app.services.ocr_review_registry import OCR_REVIEW_TTL_SECONDS, document_sha256, ocr_review_registry
+from app.services.pdf_table_reconstruction import TableReconstructionError
+from app.services.pdf_reconstruction_export import (
+    ReconstructionRequest, prepare_reconstruction_export, download_reconstruction_export,
+)
 
 router = APIRouter()
 PDF_MAGIC = b"%PDF-"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+@router.post("/export-translated/reconstruction/preview")
+async def reconstruction_preview(request: Request):
+    return await _reconstruction_request(request, download=False)
+
+
+@router.post("/export-translated/reconstruction/download")
+async def reconstruction_download(request: Request):
+    return await _reconstruction_request(request, download=True)
+
+
+async def _reconstruction_request(request: Request, *, download: bool):
+    try:
+        async with request.form(max_files=1, max_fields=2, max_part_size=settings.max_translation_job_bytes) as form:
+            file = form.get("file")
+            raw_job, raw_selection = form.get("translation_job"), form.get("selection")
+            if not isinstance(file, StarletteUploadFile) or not isinstance(raw_job, str) or not isinstance(raw_selection, str):
+                raise HTTPException(status_code=422, detail="Manjka PDF, opravilo ali izrecni izbor tabele.")
+            job = _parse_export_job(raw_job)
+            selection = ReconstructionRequest.model_validate_json(raw_selection)
+            with _processing_tempdir() as directory:
+                work = Path(directory)
+                source = await _save_upload(file, work)
+                if not download:
+                    return prepare_reconstruction_export(source, job, selection, work)
+                artifact, counts, _ = download_reconstruction_export(source, job, selection, work)
+                return Response(content=artifact.path.read_bytes(), media_type="application/pdf", headers={
+                    "Content-Disposition": "attachment; filename*=UTF-8''" + quote(Path(job.source_filename).stem + "-sl-delni-rekonstrukcija.pdf"),
+                    "X-PDF-Export-Mode": "replacement_preview",
+                    "X-PDF-Reconstruction-Token": selection.token,
+                    "X-PDF-Reconstruction-Counts": json.dumps(counts, separators=(",", ":")),
+                })
+    except (TableReconstructionError, PdfExportValidationError) as exc:
+        raise HTTPException(status_code=400, detail={"code": getattr(exc, "code", "table_reconstruction"),
+            "message": str(exc), **getattr(exc, "details", {})}) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="Izbor tabele ni veljaven; območje določi strežnik.") from exc
 
 
 @router.post("/ocr-review/register", response_model=OcrReviewRegistrationResult)
@@ -76,6 +120,24 @@ def accept_ocr_review_source(request: OcrReviewAcceptance) -> OcrReviewRegistrat
         revision_id=revision.revision_id, accepted=True,
         expires_in_seconds=max(0, int(revision.expires_at - time.monotonic())),
     )
+
+
+@router.post("/ocr-review/verify")
+async def verify_ocr_review_sources(file: UploadFile = File(...), sources: str = Form(...)) -> dict:
+    """Read existing acceptance only; never register, renew or approve client claims."""
+    try:
+        candidates = OcrReviewVerifications.model_validate_json(sources)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="OCR povezave niso veljavne.") from exc
+    with _processing_tempdir() as directory:
+        path = await _save_upload(file, Path(directory))
+        sha = document_sha256(path.read_bytes())
+        results = []
+        for candidate in candidates.sources:
+            reason = ocr_review_registry.validate(document_sha256=sha,
+                **candidate.model_dump(exclude={"bbox"}), bbox=candidate.bbox)
+            results.append({"revision_id": candidate.revision_id, "valid": reason is None, "reason": reason})
+        return {"sources": results}
 
 
 @router.post("/analyze", response_model=PdfAnalysis)

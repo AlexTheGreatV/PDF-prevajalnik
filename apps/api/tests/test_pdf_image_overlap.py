@@ -266,6 +266,51 @@ def test_complex_background_skip_keeps_both_source_layers(tmp_path: Path) -> Non
     assert _pixel_difference(before, after) < 0.01
 
 
+@pytest.mark.parametrize("image_last", [False, True])
+def test_mismatched_raster_text_cannot_be_erased_as_owned_native_glyphs(
+    tmp_path: Path, image_last: bool,
+) -> None:
+    source = tmp_path / "raster-copy.pdf"
+    with pymupdf.open() as raster_source:
+        page = raster_source.new_page(width=PAGE_SIZE[0], height=PAGE_SIZE[1])
+        page.insert_text(TEXT_POINT, SOURCE, fontsize=13, fontname="tiit")
+        raster = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False).tobytes("png")
+    with pymupdf.open() as document:
+        page = document.new_page(width=PAGE_SIZE[0], height=PAGE_SIZE[1])
+        if not image_last:
+            page.insert_image(page.rect, stream=raster)
+        page.insert_text(TEXT_POINT, SOURCE, fontsize=10, fontname="helv")
+        if image_last:
+            page.insert_image(page.rect, stream=raster)
+        document.save(source)
+
+    clip = pymupdf.Rect(20, 30, 280, 65)
+    before = _render_crop(source, clip)
+    with pymupdf.open(source) as scratch:
+        page = scratch[0]
+        native = page.search_for(SOURCE)[0]
+        page.add_redact_annot(native, fill=False, cross_out=False)
+        page.apply_redactions(images=0, graphics=0, text=0)
+        assert not page.get_text().strip()
+        # Native text removal leaves visible raster glyphs, not a blank background.
+        pixmap = page.get_pixmap(clip=clip, alpha=False)
+        pixels = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        assert pixels.getextrema()[0][0] < 128
+
+    artifact = export_translated_pdf(
+        source, PdfExportJob.model_validate(_job_payload(source)), "replacement_preview", tmp_path / "out"
+    )
+    item = artifact.plan.replacements[0]
+    assert not item.eligible and item.skip_reason == "image_overlap"
+    assert not item.background_patch_used
+    assert artifact.applied_replacements == 0
+    assert _image_hashes(artifact.path) == _image_hashes(source)
+    assert _pixel_difference(before, _render_crop(artifact.path, clip)) == 0
+    with pymupdf.open(artifact.path) as result:
+        assert SOURCE in result[0].get_text()
+        assert TRANSLATION not in result[0].get_text()
+
+
 def test_list_marker_is_not_in_patch_or_redaction(tmp_path: Path) -> None:
     source = tmp_path / "list.pdf"
     _make_layered_pdf(source, "white", text="- List item")

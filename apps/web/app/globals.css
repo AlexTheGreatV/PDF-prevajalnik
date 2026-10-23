@@ -1535,3 +1535,13 @@ pre {
     grid-template-columns: 1fr;
   }
 }
+/* Explicit table reconstruction retains the normal export's constrained layout. */
+.reconstruction-choice { display: grid; gap: 6px; margin: 12px 0; }
+.reconstruction-choice select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--text); }
+.reconstruction-previews { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 16px 0; }
+.reconstruction-previews figure { margin: 0; min-width: 0; }
+.reconstruction-previews figcaption { font-weight: 600; margin-bottom: 8px; }
+.reconstruction-previews img { display: block; width: 100%; height: auto; }
+.reconstruction-counts { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 8px 16px; }
+.reconstruction-counts dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 700px) { .reconstruction-previews { grid-template-columns: minmax(0, 1fr); } }

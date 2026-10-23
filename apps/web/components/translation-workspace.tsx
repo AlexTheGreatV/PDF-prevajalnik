@@ -1,12 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { verifyImportedOcrSources } from "../lib/pdf-client";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
 import { PdfExportPanel, type PdfExportUiState } from "./pdf-export-panel";
 import {
   recoverTranslationJobForAnalysis,
+  restoreVerifiedOcrItems,
   createTranslationJob,
   editTranslation,
   exportTranslationJob,
@@ -48,13 +50,16 @@ const FILTER_LABELS: Record<(typeof FILTERS)[number], string> = {
   all: "Vsi", pending: "Čakajo", translated: "Prevedeni", reviewed: "Potrjeni", failed: "Napake", skipped: "Preskočeni",
 };
 
-export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, missingTextPages }: {
+export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, missingTextPages, onRestoreOcrItems }: {
   analysis: PdfAnalysis;
   ocrItems: OcrReviewItem[];
   sourceFile: File;
   mode: WorkspaceMode;
   missingTextPages: number;
+  onRestoreOcrItems: (items: OcrReviewItem[]) => void;
 }) {
+  const importGeneration = useRef(0);
+  useLayoutEffect(() => { importGeneration.current += 1; return () => { importGeneration.current += 1; }; }, [analysis, ocrItems, sourceFile]);
   const importRef = useRef<HTMLInputElement | null>(null);
   const recordedGlossaryUsage = useRef(new Map<string, Set<string>>());
   const recordedTranslationMemoryUsage = useRef(new Map<string, Set<string>>());
@@ -221,9 +226,11 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
 
   async function importJob(file: File | null) {
     if (!file) return;
+    const generation = ++importGeneration.current;
     try {
       const imported = importTranslationJob(await file.text());
-      const expected = createTranslationJob(analysis, ocrItems, {
+      if (generation !== importGeneration.current) return;
+      const options = {
         source_language: imported.source_language,
         target_language: imported.target_language,
         glossary: imported.glossary,
@@ -231,8 +238,14 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
         translation_memory_set_hash: imported.translation_memory_set_hash,
         domain: imported.domain,
         created_at: imported.created_at,
-      });
-      const compatible = recoverTranslationJobForAnalysis(imported, expected, ocrItems);
+      };
+      const expected = createTranslationJob(analysis, ocrItems, options);
+      recoverTranslationJobForAnalysis(imported, expected, ocrItems);
+      const verified = await verifyImportedOcrSources(sourceFile, imported);
+      if (generation !== importGeneration.current) return;
+      const restoredItems = restoreVerifiedOcrItems(imported, expected, ocrItems, verified);
+      const compatible = recoverTranslationJobForAnalysis(imported, createTranslationJob(analysis, restoredItems, options), restoredItems);
+      if (restoredItems.some((item, index) => item !== ocrItems[index])) onRestoreOcrItems(restoredItems);
       setJob(compatible);
       setDocumentGlossary(compatible.glossary.filter((entry) => entry.scope === "document"));
       setSourceLanguage(imported.source_language);
@@ -242,9 +255,9 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
         ? "Opravilo je obnovljeno. Zastareli OCR zahteva ponovni pregled izreza in potrditev; drugi prevodi so ohranjeni."
         : "Prevajalsko opravilo je bilo uspešno uvoženo.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Uvoz prevajalskega opravila ni uspel.");
+      if (generation === importGeneration.current) setMessage(error instanceof Error ? error.message : "Uvoz prevajalskega opravila ni uspel.");
     } finally {
-      if (importRef.current) importRef.current.value = "";
+      if (generation === importGeneration.current && importRef.current) importRef.current.value = "";
     }
   }
 

@@ -65,7 +65,8 @@ class OcrReviewRegistry:
             self._records[revision_id] = accepted
             return accepted
 
-    def validate(self, *, revision_id: str, document_sha256: str, review_id: str, page_number: int, bbox: BBox, text: str) -> str | None:
+    def validate(self, *, revision_id: str, document_sha256: str, review_id: str, page_number: int, bbox: BBox, text: str,
+                 source: str | None = None, reason: str | None = None) -> str | None:
         now = time.monotonic()
         with self._lock:
             self._purge(now)
@@ -79,6 +80,8 @@ class OcrReviewRegistry:
             if record.document_sha256 != document_sha256:
                 return "document_mismatch"
             if record.review_id != review_id or record.page_number != page_number or record.text != text or not _same_bbox(record.bbox, bbox):
+                return "source_mismatch"
+            if (source is not None and source != record.source) or (reason is not None and reason != record.reason):
                 return "source_mismatch"
             return None
 

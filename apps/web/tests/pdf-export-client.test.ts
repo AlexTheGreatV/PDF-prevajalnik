@@ -18,8 +18,37 @@ import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, PdfKind } from "../lib/pdf-types";
 import type { TranslationJob } from "../lib/translation-types";
 import { editTranslation, reviewTranslation, updateTranslationJobSegment } from "../lib/translation-job";
+import { reconstructionRevision, validateReconstructionCounts, validateReconstructionDownload, type ReconstructionPreview } from "../lib/table-reconstruction";
 
 const tests: Promise<void>[] = [];
+test("reconstruction selection and content revisions reject late results without changing approvals", () => {
+  const selected = {page_number: 1, table_id: "table-a"};
+  const original = reconstructionRevision("content-and-profile-a", selected);
+  for (const changed of [reconstructionRevision("content-and-profile-b", selected),
+    reconstructionRevision("content-and-profile-a", null),
+    reconstructionRevision("content-and-profile-a", {...selected, table_id: "table-b"}),
+    reconstructionRevision("content-and-profile-a", {...selected, page_number: 2})]) {
+    assert.equal(isCurrentPdfExportRevision(original, changed), false);
+    assert.equal(currentRevisionValue({revisionKey: original, value: "old plan / success"}, changed), null);
+  }
+});
+test("reconstruction counts distinguish physical cells from translated units and verify the downloaded response", () => {
+  const counts = {ordinary_replacements: 2, reconstructed_cells: 4, reconstructed_translations: 2,
+    reconstructed_identical: 1, reconstructed_technical: 1, translated_units: 4,
+    preserved_identical: 2, not_applicable: 1, blocked: 3, total_units: 10};
+  assert.doesNotThrow(() => validateReconstructionCounts(counts));
+  assert.throws(() => validateReconstructionCounts({...counts, translated_units: 6}));
+  assert.throws(() => validateReconstructionCounts({...counts, total_units: 12}));
+  const preview = {ready: true, token: "current", counts} as ReconstructionPreview;
+  const headers = {"content-type": "application/pdf", "x-pdf-export-mode": "replacement_preview",
+    "content-disposition": "attachment; filename*=UTF-8''delni.pdf",
+    "x-pdf-reconstruction-token": "current", "x-pdf-reconstruction-counts": JSON.stringify(counts)};
+  assert.equal(validateReconstructionDownload(new Response(null, {headers}), preview), "delni.pdf");
+  assert.throws(() => validateReconstructionDownload(new Response(null, {headers: {...headers, "x-pdf-reconstruction-token": "previous"}}), preview));
+  assert.throws(() => validateReconstructionDownload(new Response(null, {headers: {...headers, "x-pdf-export-mode": "diagnostic"}}), preview));
+  assert.throws(() => validateReconstructionDownload(new Response(null, {headers: {...headers, "x-pdf-reconstruction-counts": "null"}}), preview));
+  assert.throws(() => validateReconstructionDownload(new Response(null, {headers: {...headers, "content-disposition": "attachment; filename*=UTF-8''..%2Fevil.pdf"}}), preview));
+});
 test("download must match typography revision and source formatting is not translation", () => {
   const profile = "document-role-typography-pilot-v1";
   const plan = { typography_revision: "a".repeat(64), typography_coverage: {source_formatted: 12} } as PdfExportPlan;

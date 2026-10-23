@@ -100,6 +100,14 @@ class OcrReviewRegistrationResult(BaseModel):
     expires_in_seconds: int
 
 
+class OcrReviewVerification(OcrReviewRegistration):
+    revision_id: str = Field(min_length=1, max_length=100)
+
+
+class OcrReviewVerifications(BaseModel):
+    sources: list[OcrReviewVerification] = Field(max_length=100)
+
+
 class OcrReviewAcceptance(BaseModel):
     revision_id: str = Field(min_length=1, max_length=100)
 
