@@ -102,6 +102,17 @@ class DocumentLine(BaseModel):
     bbox: BBox
     original_text: str
     spans: list[DocumentSpan] = Field(default_factory=list)
+    baseline_y: float | None = None
+
+
+class IndependentTextUnit(BaseModel):
+    unit_id: str
+    text: str
+    bbox: BBox
+    baseline_y: float
+    row_bbox: BBox
+    source_span_ids: list[str]
+    evidence: Literal["closed_vector_row"] = "closed_vector_row"
 
 
 class LineBoundary(BaseModel):
@@ -146,6 +157,7 @@ class DocumentBlock(BaseModel):
     original_text: str
     normalized_text: str
     lines: list[DocumentLine] = Field(default_factory=list)
+    independent_units: list[IndependentTextUnit] = Field(default_factory=list)
     line_boundaries: list[LineBoundary] = Field(default_factory=list)
     style: SpanStyle = Field(default_factory=SpanStyle)
     reading_order: int

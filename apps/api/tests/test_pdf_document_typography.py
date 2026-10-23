@@ -148,9 +148,9 @@ def test_source_table_values_preserve_content_graphics_and_group_size(tmp_path: 
     with pymupdf.open(source) as original,pymupdf.open(artifact.path) as result:
         assert original[0].get_drawings()==result[0].get_drawings()
         for text in ('Strength','20 L','Label','1200'):
-            assert text in result[0].get_text()
+            assert text in result[0].get_text().replace("\u00a0", " ")
         assert 'NEPOTRJENO' not in result[0].get_text()
-    assert {r.fitted_font_size for r in artifact.source_formatting if r.eligible}=={8.55}
+    assert {r.fitted_font_size for r in artifact.source_formatting if r.eligible}=={9.0}
 
 
 @pytest.mark.parametrize('damage',['missing','ambiguous','bbox'])
@@ -335,3 +335,83 @@ def test_source_symbol_definitions_keep_their_separate_physical_lines(tmp_path: 
         text = doc[0].get_text()
         assert '- = No use\nT = Test first' in text
         assert 'UNREVIEWED' not in text
+
+
+def _marked_fixture(path: Path, marker: str, text: str, separate: bool = False) -> PdfExportJob:
+    # Synthetic reviewed fixtures exercise writing, not human approval of documents.
+    with pymupdf.open() as doc:
+        page = doc.new_page(width=400, height=250)
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 10, 10), False)
+        pix.clear_with(255)
+        page.insert_image(page.rect, pixmap=pix)
+        if separate:
+            page.insert_text((40, 100), marker, fontsize=16, color=(1, 0, 0))
+            page.insert_text((52, 100), text, fontsize=10)
+        else:
+            page.insert_text((40, 100), marker + ' ' + text, fontsize=10)
+        doc.save(path)
+    job = _fixture_job_from_text(path, marker + ' ' + text)
+    job.segments[0].block_type = 'list_item'
+    job.segments[0].edited_translation = marker + ' Preverjeno besedilo.'
+    return job
+
+
+def _fixture_job_from_text(path: Path, text: str) -> PdfExportJob:
+    analysis = analyze_pdf(path)
+    with pymupdf.open(path) as doc:
+        bounds = pymupdf.Rect()
+        for block in doc[0].get_text('dict')['blocks']:
+            if block.get('lines'):
+                bounds |= pymupdf.Rect(block['bbox'])
+        width, height = doc[0].rect.width, doc[0].rect.height
+    return PdfExportJob(schema_version=10, source_filename=path.name,
+        document_identity={'sha256':analysis.sha256,'page_count':1,'document_model_version':analysis.document_model_version,
+            'pages':[{'page_number':1,'width':width,'height':height,'rotation':0}]},
+        segments=[PdfExportSegment(segment_id='synthetic',page_number=1,block_id='synthetic',block_type='paragraph',
+            source_text=text,source_text_origin='native',source_page_type='digital',source_rotation=0,
+            source_bbox=BBox(x0=bounds.x0,y0=bounds.y0,x1=bounds.x1,y1=bounds.y1),
+            edited_translation='Osnutek',status='reviewed')])
+
+
+@pytest.mark.parametrize('marker', ['*', '-'])
+@pytest.mark.parametrize('separate', [False, True])
+def test_profile_keeps_marker_once_and_body_on_source_baseline(tmp_path: Path, marker: str, separate: bool):
+    source = tmp_path / 'marked.pdf'
+    job = _marked_fixture(source, marker, 'A short source sentence.', separate)
+    before = job.model_dump_json()
+    result = export_document_typography_pilot(source, job, tmp_path / 'out')
+    item = result.translation_plan.replacements[0]
+    assert item.eligible, item.model_dump()
+    assert item.list_marker_preserved
+    with pymupdf.open(source) as original, pymupdf.open(result.path) as written:
+        raw = original[0].get_text('rawdict')
+        chars = [c for b in raw['blocks'] for l in b.get('lines',[]) for s in l['spans'] for c in s['chars']]
+        body_x = next(c['origin'][0] for c in chars if c['c'] == 'A')
+        spans = [s for b in written[0].get_text('dict')['blocks'] for l in b.get('lines',[]) for s in l['spans']]
+        target = next(s for s in spans if 'Preverjeno' in s['text'])
+        assert target['origin'][0] == pytest.approx(body_x, abs=.02)
+        assert target['origin'][1] == pytest.approx(100, abs=.02)
+        assert written[0].get_text().count(marker) == 1
+        assert written[0].get_text().count('Preverjeno besedilo.') == 1
+        assert 'A short source' not in written[0].get_text()
+    assert job.model_dump_json() == before
+
+
+@pytest.mark.parametrize('target', ['Kratka\nPrecej daljša oznaka', 'Združeni oznaki', 'Ena\nDve\nTri'])
+def test_sparse_source_labels_without_row_ownership_preserve_source(tmp_path: Path, target: str):
+    source = tmp_path / 'separate-rows.pdf'
+    with pymupdf.open() as doc:
+        page = doc.new_page(width=400, height=250)
+        page.insert_text((40, 100), 'Black', fontsize=10)
+        page.insert_text((40, 130), 'White', fontsize=10)
+        page.draw_line((30, 115), (200, 115))
+        doc.save(source)
+    job = _fixture_job_from_text(source, 'Black White')
+    job.segments[0].edited_translation = target
+    result = export_document_typography_pilot(source, job, tmp_path / 'out')
+    item = result.translation_plan.replacements[0]
+    assert not item.eligible
+    assert 'discrete_source_lines_require_ownership' in item.typography_warnings
+    with pymupdf.open(source) as original, pymupdf.open(result.path) as written:
+        assert written[0].get_text() == original[0].get_text()
+        assert written[0].get_drawings() == original[0].get_drawings()

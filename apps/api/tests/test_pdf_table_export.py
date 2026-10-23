@@ -66,7 +66,7 @@ def test_tight_table_baseline_overflow_preserves_source(tmp_path: Path, target: 
 
 def test_tight_table_baseline_does_not_reduce_small_source_font_or_hit_border(tmp_path: Path) -> None:
     source = tmp_path / "too-low-cell.pdf"
-    _make_baseline_table(source, row_height=8, font_size=5, baseline_offset=6)
+    _make_baseline_table(source, row_height=6, font_size=5, baseline_offset=5)
     artifact = export_translated_pdf(source, _job(source, translations={(0, 0): "Trdnost 2,5 MPa"}), "replacement_preview", tmp_path / "output")
     cell = artifact.plan.tables[0].cells[0]
     assert not cell.eligible
@@ -189,6 +189,33 @@ def test_regular_table_exports_cells_and_preserves_grid_and_fill(tmp_path: Path)
         assert "Lastnost" in text and "Vrednost" in text and "Material" in text
         assert "Properties" not in text and "Values" not in text
         assert "MS Polymer" in text
+
+
+@pytest.mark.parametrize("obstacle", ["none", "line", "partial_fill", "unreviewed"])
+def test_merged_caption_requires_exclusive_closed_fill_island(tmp_path: Path, obstacle: str) -> None:
+    source = tmp_path / "merged-caption.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=320, height=180)
+        page.draw_rect((20, 30, 300, 70), color=None, fill=(0.1, 0.2, 0.3))
+        for y in (30, 70, 110):page.draw_line((20, y), (300, y), color=(0, 0, 0))
+        for x in (20, 300):page.draw_line((x, 30), (x, 110), color=(0, 0, 0))
+        page.draw_line((160, 70), (160, 110), color=(0, 0, 0))
+        if obstacle == "line":page.draw_line((100, 35), (100, 65), color=(1, 1, 1))
+        elif obstacle == "partial_fill":page.draw_rect((110, 35, 140, 65), color=None, fill=(0.7, 0.1, 0.1))
+        page.insert_text((35, 52), "Properties", fontsize=9, color=(1, 1, 1))
+        page.insert_text((35, 92), "Material", fontsize=9)
+        page.insert_text((175, 92), "MS Polymer", fontsize=9)
+        document.save(source)
+    job = _job(source, translations={(0, 0): "Lastnosti"})
+    if obstacle == "unreviewed":job.segments[0].status = "translated"
+    artifact = export_translated_pdf(source, job, "replacement_preview", tmp_path / "output")
+    cell = artifact.plan.tables[0].cells[0]
+    assert cell.column_span == 2
+    assert cell.eligible is (obstacle == "none")
+    assert _drawing_signature(source) == _drawing_signature(artifact.path)
+    with pymupdf.open(artifact.path) as output:
+        assert ("Lastnosti" in output[0].get_text()) is (obstacle == "none")
+        assert "MS Polymer" in output[0].get_text()
 
 
 def test_header_typography_alignment_color_and_background_are_retained(tmp_path: Path) -> None:

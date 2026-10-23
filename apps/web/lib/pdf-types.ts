@@ -74,6 +74,17 @@ export type StructuredLine = {
   bbox: BBox;
   original_text: string;
   spans: StructuredSpan[];
+  baseline_y?: number | null;
+};
+
+export type IndependentTextUnit = {
+  unit_id: string;
+  text: string;
+  bbox: BBox;
+  baseline_y: number;
+  row_bbox: BBox;
+  source_span_ids: string[];
+  evidence: "closed_vector_row";
 };
 
 export type LineBoundary = {
@@ -196,6 +207,7 @@ export type StructuredBlock = {
   original_text: string;
   normalized_text: string;
   lines: StructuredLine[];
+  independent_units?: IndependentTextUnit[];
   line_boundaries: LineBoundary[];
   style: StructuredStyle;
   reading_order: number;

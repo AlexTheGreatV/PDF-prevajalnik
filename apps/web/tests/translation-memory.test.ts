@@ -6,6 +6,7 @@ import {
   createLatestTranslationMemoryRequestCoordinator,
   normalizeTranslationMemorySource,
   selectExactTranslationMemoryMatch,
+  translationMemoryDomainScopeLabel,
   type TranslationMemoryEntry,
 } from "../lib/translation-memory";
 import type { TranslationJob, TranslationSegment } from "../lib/translation-types";
@@ -30,6 +31,15 @@ test("normalization is conservative and platform independent", () => {
   assert.equal(normalizeTranslationMemorySource("  Cafe\u0301\r\nline  "), "Café\nline");
   assert.notEqual(normalizeTranslationMemorySource("TEXT."), normalizeTranslationMemorySource("text."));
   assert.notEqual(normalizeTranslationMemorySource("Text."), normalizeTranslationMemorySource("Text"));
+});
+
+test("domain scope explains exclusions without changing matching or widening access", () => {
+  const scoped = entry({ domain: "coatings" });
+  assert.match(translationMemoryDomainScopeLabel(""), /samo splošni vnosi/);
+  assert.match(translationMemoryDomainScopeLabel("coatings"), /področje coatings in splošni vnosi/);
+  assert.equal(selectExactTranslationMemoryMatch(scoped.source_text, "en", "sl", "", [scoped]).status, "none");
+  assert.equal(selectExactTranslationMemoryMatch(scoped.source_text, "en", "sl", "coatings", [scoped]).status, "match");
+  assert.equal(selectExactTranslationMemoryMatch(scoped.source_text, "en", "sl", "other", [scoped]).status, "none");
 });
 
 test("exact lookup excludes inactive entries and preserves number differences", () => {

@@ -58,11 +58,15 @@ class PdfImageOverlapAnalyzer:
         patch_clip: pymupdf.Rect | None = None,
         ignore_enclosing_drawings: bool = False,
         allow_opaque_vector_cover: bool = False,
+        allow_matching_rect_fills: bool = False,
     ) -> ImageOverlapAssessment:
-        images = _overlapping_images(page, rect)
+        coverage_rect = pymupdf.Rect(rect)
+        for patch in patch_rects or []:
+            coverage_rect |= patch
+        images = _overlapping_images(page, coverage_rect)
         if not images:
             return ImageOverlapAssessment("none", [], 0.0, None, None, 1.0, False, [], [], [], None)
-        if allow_opaque_vector_cover and _opaque_vector_fill_covers_images(page, rect):
+        if allow_opaque_vector_cover and _opaque_vector_fill_covers_images(page, coverage_rect):
             return ImageOverlapAssessment(
                 "none", [], 0.0, None, None, 1.0, False, [], [],
                 ["overlapping_image_hidden_by_opaque_vector_fill"], None,
@@ -87,11 +91,15 @@ class PdfImageOverlapAnalyzer:
             return self._uncertain(xrefs, overlap_ratio, "no_patchable_text_glyphs")
         if _intersects_other_text(page, rect, requested_patches):
             return self._complex(xrefs, overlap_ratio, "neighboring_text_in_patch_area")
-        if _intersects_drawing(page, clipped_patches, ignore_enclosing_drawings):
+        if not allow_matching_rect_fills and _intersects_drawing(page, clipped_patches, ignore_enclosing_drawings):
             return self._complex(xrefs, overlap_ratio, "vector_element_in_patch_area")
 
         try:
-            metric_values, color = self._measure(page, rect, requested_patches, glyph_rects)
+            # Source ownership remains bound to rect; sampling must cover ALL proposed ink.
+            if allow_matching_rect_fills and patch_clip is not None:
+                metric_values, color = self._measure(page, coverage_rect, requested_patches, glyph_rects, sample_clip=patch_clip)
+            else:
+                metric_values, color = self._measure(page, coverage_rect, requested_patches, glyph_rects)
         except (RuntimeError, ValueError, OSError):
             return self._uncertain(xrefs, overlap_ratio, "background_render_failed")
         metrics = PdfBackgroundMetrics(**metric_values)
@@ -124,30 +132,63 @@ class PdfImageOverlapAnalyzer:
                 [_bbox(item) for item in clipped_patches], [_bbox(item) for item in source_patches],
                 ["background_metrics_near_threshold"], "near_threshold",
             )
+        if allow_matching_rect_fills and _intersects_drawing(
+            page, clipped_patches, ignore_enclosing_drawings, matching_fill=color,
+        ):
+            return self._complex(xrefs, overlap_ratio, "vector_element_in_patch_area")
         return ImageOverlapAssessment(
             "simple_background", xrefs, round(overlap_ratio, 4), color, metrics, round(confidence, 4), True,
             [_bbox(item) for item in clipped_patches], [_bbox(item) for item in source_patches],
             ["image_layer_contains_visible_text"], None,
         )
 
-    def analyze_ocr_region(self, page: pymupdf.Page, rect: pymupdf.Rect) -> ImageOverlapAssessment:
-        """Assess a tight image-only OCR bbox without inferring or rebuilding surrounding graphics."""
-        images = _overlapping_images(page, rect)
+    def analyze_ocr_region(
+        self, page: pymupdf.Page, rect: pymupdf.Rect, *, write_rects: list[pymupdf.Rect] | None = None,
+    ) -> ImageOverlapAssessment:
+        """Assess accepted OCR over image text or completely owned native glyphs."""
+        patches = [rect, *(write_rects or [])]
+        coverage = pymupdf.Rect(rect)
+        for patch in patches:
+            if not page.rect.contains(patch):
+                return self._uncertain([], 0.0, "ocr_write_outside_page")
+            coverage |= patch
+        images = _overlapping_images(page, coverage)
         xrefs = sorted({int(info["xref"]) for info in images if info.get("xref")})
         scale = self.thresholds.dpi / 72
-        if rect.width * scale * rect.height * scale > 1_000_000:
+        if coverage.width * scale * coverage.height * scale > 1_000_000:
             return self._uncertain(xrefs, 0.0, "ocr_region_too_large_for_background_analysis")
+        native_glyphs = []
         if not images:
-            return self._uncertain([], 0.0, "ocr_region_has_no_image_layer")
+            for block in page.get_text("rawdict").get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        for char in span.get("chars", []):
+                            glyph = _rect(char["bbox"])
+                            if char.get("c", "").strip() and not (glyph & rect).is_empty:
+                                if not rect.contains(glyph):
+                                    return self._uncertain([], 0.0, "ocr_native_text_crosses_region")
+                                native_glyphs.append(glyph)
+                            elif char.get("c", "").strip() and any(
+                                not (glyph & patch).is_empty for patch in write_rects or []
+                            ):
+                                return self._complex([], 0.0, "neighboring_text_in_patch_area")
+            if not native_glyphs:
+                return self._uncertain([], 0.0, "ocr_region_has_no_image_layer")
         overlap_ratio = min(1.0, sum((_rect(info["bbox"]) & rect).get_area() for info in images) / max(rect.get_area(), 0.001))
-        if overlap_ratio < 0.98:
+        if images and overlap_ratio < 0.98:
             return self._uncertain(xrefs, overlap_ratio, "ocr_region_not_fully_image_backed")
-        if _intersects_other_text(page, rect, [rect]):
+        if write_rects and not native_glyphs:
+            return self._uncertain(xrefs, overlap_ratio, "ocr_write_expansion_requires_owned_native_glyphs")
+        if _intersects_other_text(page, rect, patches):
             return self._complex(xrefs, overlap_ratio, "neighboring_text_in_patch_area")
-        if _intersects_drawing(page, [rect]):
+        if _intersects_drawing(page, patches):
             return self._complex(xrefs, overlap_ratio, "vector_element_in_patch_area")
         try:
-            metric_values, color, has_large_graphic = self._measure_ocr_background(page, rect)
+            if native_glyphs:
+                metric_values, color = self._measure(page, coverage, patches, native_glyphs)
+                has_large_graphic = False
+            else:
+                metric_values, color, has_large_graphic = self._measure_ocr_background(page, rect)
         except (RuntimeError, ValueError, OSError):
             return self._uncertain(xrefs, overlap_ratio, "background_render_failed")
         metrics = PdfBackgroundMetrics(**metric_values)
@@ -174,7 +215,8 @@ class PdfImageOverlapAnalyzer:
             return ImageOverlapAssessment("uncertain", xrefs, round(overlap_ratio, 4), color, metrics, confidence, False, [_bbox(rect)], [], ["background_metrics_near_threshold"], "near_threshold")
         return ImageOverlapAssessment(
             "simple_background", xrefs, round(overlap_ratio, 4), color, metrics, round(confidence, 4), True,
-            [_bbox(rect)], [], ["accepted_ocr_uniform_background_checked"], None,
+            [_bbox(patch) for patch in patches], [_bbox(rect)] if native_glyphs else [],
+            ["accepted_native_ocr_uniform_background_checked" if native_glyphs else "accepted_ocr_uniform_background_checked"], None,
         )
 
     def _measure(
@@ -183,9 +225,12 @@ class PdfImageOverlapAnalyzer:
         rect: pymupdf.Rect,
         patches: list[pymupdf.Rect],
         glyph_rects: list[pymupdf.Rect],
+        *, sample_clip: pymupdf.Rect | None = None,
     ) -> tuple[dict[str, float | int | bool], str]:
         margin = self.thresholds.sample_ring_pt
         clip = pymupdf.Rect(rect.x0 - margin, rect.y0 - margin, rect.x1 + margin, rect.y1 + margin) & page.rect
+        if sample_clip is not None:
+            clip &= sample_clip
         pixmap = page.get_pixmap(clip=clip, dpi=self.thresholds.dpi, alpha=False)
         if pixmap.width < 3 or pixmap.height < 3 or pixmap.n < 3:
             raise RuntimeError("invalid background render")
@@ -203,7 +248,12 @@ class PdfImageOverlapAnalyzer:
         variances = [sum((pixel[index] - means[index]) ** 2 for pixel in samples) / len(samples) for index in range(3)]
         edge_image = image.convert("L").filter(ImageFilter.FIND_EDGES)
         edge_pixels = edge_image.load()
-        edge_density = sum(edge_pixels[x, y] >= 32 for x, y in sample_points) / len(sample_points)
+        # FIND_EDGES leaves the image frame unchanged. A white crop boundary
+        # is not an edge in the PDF; only the convolution's interior is valid.
+        edge_points = [(x, y) for x, y in sample_points if 0 < x < image.width-1 and 0 < y < image.height-1]
+        if not edge_points:
+            raise ValueError("no interior background edge samples")
+        edge_density = sum(edge_pixels[x, y] >= 32 for x, y in edge_points) / len(edge_points)
         texture_score = sum(_distance(pixel, means) > self.thresholds.texture_color_distance for pixel in samples) / len(samples)
         side_means = []
         for points in side_points:
@@ -339,15 +389,30 @@ def _intersects_other_text(page: pymupdf.Page, source_rect: pymupdf.Rect, patche
     return False
 
 
-def _intersects_drawing(page: pymupdf.Page, patches: list[pymupdf.Rect], ignore_enclosing: bool = False) -> bool:
+def _intersects_drawing(
+    page: pymupdf.Page, patches: list[pymupdf.Rect], ignore_enclosing: bool = False,
+    *, matching_fill: str | None = None,
+) -> bool:
     for drawing in page.get_drawings():
         drawing_rect = _rect(drawing["rect"])
+        if "s" in str(drawing.get("type", "")):
+            half = max(0.1, float(drawing.get("width") or 0.1)) / 2
+            drawing_rect = pymupdf.Rect(drawing_rect.x0-half, drawing_rect.y0-half, drawing_rect.x1+half, drawing_rect.y1+half)
         for patch in patches:
             if (drawing_rect & patch).is_empty:
                 continue
             if ignore_enclosing and drawing_rect.contains(patch):
                 continue
-            return True
+            if (matching_fill is not None and drawing.get("color") is None
+                    and drawing.get("fill") is not None
+                    and float(drawing.get("fill_opacity", 0.0)) >= 0.999
+                    and drawing.get("items") and all(item[0] == "re" for item in drawing["items"])):
+                expected = tuple(int(matching_fill[i:i+2], 16) for i in (1, 3, 5))
+                actual = tuple(round(channel * 255) for channel in drawing["fill"])
+                if len(actual) == 3 and max(abs(a-b) for a,b in zip(actual, expected)) <= 1:
+                    continue
+            if _drawing_items_intersect(drawing, patch):
+                return True
     return False
 
 
@@ -373,7 +438,12 @@ def _opaque_vector_fill_covers_images(page: pymupdf.Page, rect: pymupdf.Rect) ->
             and _rect(items[0][1]).contains(rect)
             and not any(
                 int(later.get("seqno", -1)) > int(drawing.get("seqno", -1))
-                and _drawing_items_intersect(later, rect)
+                  and _drawing_items_intersect(later, rect)
+                  and not (
+                      later.get("color") is None and later.get("fill") == drawing.get("fill")
+                      and float(later.get("fill_opacity", 0.0)) >= 0.999
+                      and later.get("items") and all(item[0] == "re" for item in later["items"])
+                  )
                 for later in drawings
             )
         ):

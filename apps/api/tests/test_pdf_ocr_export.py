@@ -21,6 +21,60 @@ TRANSLATION = "Garancijsko obdobje"
 client = TestClient(app)
 
 
+@pytest.mark.parametrize("obstacle", ["none", "text", "same_span", "line", "image"])
+def test_native_ocr_write_space_does_not_change_accepted_source(tmp_path: Path, obstacle: str) -> None:
+    source = tmp_path / "write-region.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=600, height=200)
+        page.insert_text((40, 60), "Warrantv period NEIGHBOR" if obstacle == "same_span" else "Warrantv period", fontsize=12)
+        bbox = dict(zip(("x0", "y0", "x1", "y1"), page.search_for("Warrantv period")[0]))
+        if obstacle == "text":
+            page.insert_text((125, 60), "NEIGHBOR", fontsize=12)
+        elif obstacle == "line":
+            page.draw_line((125, 40), (125, 75), color=(0, 0, 0))
+        elif obstacle == "image":
+            stream = io.BytesIO();Image.new("RGB", (40, 40), "navy").save(stream, format="PNG")
+            page.insert_image((125, 40, 160, 75), stream=stream.getvalue())
+        document.save(source)
+    payload = _job_payload(source, bbox)
+    payload["document_identity"]["pages"][0]["width"] = 600
+    target = "Dolgo garancijsko obdobje"
+    payload["segments"][0]["edited_translation"] = target
+    immutable = json.dumps(payload, sort_keys=True)
+    artifact = export_translated_pdf(source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "write"))
+    item = artifact.plan.ocr_replacements[0]
+    assert item.eligible is (obstacle == "none")
+    assert item.source_bbox.model_dump() == bbox
+    assert json.dumps(payload, sort_keys=True) == immutable
+    if item.eligible:
+        assert "verified_native_ocr_write_region" in item.typography_warnings
+        assert item.redaction_rects == [item.source_bbox]
+        assert item.fitted_bbox.x1 > bbox["x1"]
+    with pymupdf.open(artifact.path) as output:
+        assert (target in output[0].get_text()) is (obstacle == "none")
+        if obstacle in {"text", "same_span"}:assert "NEIGHBOR" in output[0].get_text()
+
+
+@pytest.mark.parametrize("reviewed", [False, True])
+def test_registered_native_ocr_correction_requires_separate_translation_review(tmp_path: Path, reviewed: bool) -> None:
+    source = tmp_path / "native-ocr.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=200)
+        page.insert_text((40, 60), "Warrantv period", fontsize=12)
+        bbox = dict(zip(("x0", "y0", "x1", "y1"), page.search_for("Warrantv period")[0]))
+        document.save(source)
+    # Synthetic review state, not approval of any real document translation.
+    payload = _job_payload(source, bbox)
+    payload["segments"][0]["edited_translation"] = "Jamstvo čšž"
+    payload["segments"][0]["status"] = "reviewed" if reviewed else "translated"
+    artifact = export_translated_pdf(source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "native"))
+    assert artifact.applied_replacements == int(reviewed)
+    with pymupdf.open(artifact.path) as output:
+        assert ("Jamstvo čšž" in output[0].get_text()) is reviewed
+        assert ("Warrantv period" in output[0].get_text()) is not reviewed
+    assert _hash(source) == payload["document_identity"]["sha256"]
+
+
 def test_api_registers_then_separately_accepts_verified_pdf_source(tmp_path: Path) -> None:
     source, bbox = _make_image_text_pdf(tmp_path / "api-register.pdf")
     candidate = {

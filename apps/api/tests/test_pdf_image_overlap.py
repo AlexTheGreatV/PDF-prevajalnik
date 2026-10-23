@@ -13,12 +13,78 @@ from app.pdf_export_models import PdfExportJob
 from app.services.document_segmenter import DOCUMENT_MODEL_VERSION
 from app.services.pdf_exporter import export_translated_pdf, plan_pdf_export
 from app.services.pdf_image_overlap import DEFAULT_THRESHOLDS, PdfImageOverlapAnalyzer
+from app.services import pdf_exporter
 
 
 SOURCE = "SOURCE DUPLICATE LONG"
 TRANSLATION = "PREVOD"
 TEXT_POINT = (30, 50)
 PAGE_SIZE = (300, 200)
+
+
+@pytest.mark.parametrize("shape", ["matching_fill", "contrast_fill", "stroke"])
+def test_proven_cell_sampling_ignores_only_matching_opaque_fill(shape: str) -> None:
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=200)
+        stream = io.BytesIO();Image.new("RGB", (300, 200), "white").save(stream, format="PNG")
+        page.insert_image(page.rect, stream=stream.getvalue())
+        if shape == "stroke":
+            page.draw_line((70, 35), (70, 65), color=(0, 0, 0))
+        else:
+            page.draw_rect((25, 35, 70, 65), color=None,
+                           fill=(1, 1, 1) if shape == "matching_fill" else (0, 0, 0))
+        page.insert_text((35, 55), "SAMPLE SOURCE", fontsize=10)
+        source = page.search_for("SAMPLE SOURCE")[0]
+        result = PdfImageOverlapAnalyzer().analyze(page, source,
+            patch_clip=pymupdf.Rect(25, 35, 150, 67), allow_matching_rect_fills=True)
+        assert result.safe_for_background_patch is (shape == "matching_fill")
+        if shape == "matching_fill":assert result.metrics.edge_density == 0
+
+
+def test_identical_nested_fills_keep_opaque_cover_but_other_colors_do_not() -> None:
+    from app.services.pdf_image_overlap import _opaque_vector_fill_covers_images
+    for color, expected in [((1, 1, 1), True), ((0, 0, 0), False)]:
+        with pymupdf.open() as document:
+            page = document.new_page(width=300, height=200)
+            stream = io.BytesIO();Image.new("RGB", (300, 200), "navy").save(stream, format="PNG")
+            page.insert_image(page.rect, stream=stream.getvalue())
+            page.draw_rect((25, 25, 180, 90), color=None, fill=(1, 1, 1))
+            page.draw_rect((25, 35, 70, 65), color=None, fill=color)
+            assert _opaque_vector_fill_covers_images(page, pymupdf.Rect(30, 30, 150, 70)) is expected
+
+
+@pytest.mark.parametrize("crossing", [False, True])
+def test_disjoint_vector_items_do_not_turn_their_envelope_into_ink(crossing: bool) -> None:
+    from app.services.pdf_image_overlap import _intersects_drawing
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=200)
+        shape = page.new_shape()
+        shape.draw_rect(pymupdf.Rect(20, 20, 30, 30))
+        shape.draw_rect(pymupdf.Rect(200, 100, 210, 110))
+        if crossing:
+            shape.draw_line((80, 60), (160, 60))
+        shape.finish(color=(0, 0, 0), width=1)
+        shape.commit()
+        assert _intersects_drawing(page, [pymupdf.Rect(90, 55, 150, 65)]) is crossing
+
+
+@pytest.mark.parametrize("obstacle", ["none", "line", "partial_glyph", "empty"])
+def test_accepted_native_ocr_requires_complete_glyphs_and_uniform_clear_background(obstacle: str) -> None:
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=200)
+        if obstacle != "empty":
+            page.insert_text((40, 60), "APPL1CATIONS", fontsize=10)
+            rect = page.search_for("APPL1CATIONS")[0]
+        else:
+            rect = pymupdf.Rect(40, 45, 115, 65)
+        if obstacle == "line":
+            page.draw_line((rect.x0, 55), (rect.x1, 55), color=(0, 0, 0))
+        elif obstacle == "partial_glyph":
+            rect.x0 += 1
+        assessment = PdfImageOverlapAnalyzer().analyze_ocr_region(page, rect)
+        assert assessment.safe_for_background_patch is (obstacle == "none")
+        if obstacle == "none":
+            assert assessment.redaction_rects and assessment.sampled_background_color == "#ffffff"
 
 
 @pytest.mark.parametrize("background", ["white", "solid", "jpeg"])
@@ -64,12 +130,51 @@ def test_neighboring_native_text_blocks_safe_expansion(tmp_path: Path) -> None:
 def test_expanded_bbox_that_leaves_safe_background_is_skipped(tmp_path: Path) -> None:
     source = tmp_path / "split.pdf"
     _make_layered_pdf(source, "split")
-    payload = _job_payload(source, translated_text="ZELO DOLG PREVOD, KI ZA PRILEGANJE POTREBUJE ŠIRŠE OBMOČJE")
+    # The actual ink, not just unused layout width, must reach the gradient.
+    payload = _job_payload(source, translated_text="RAZŠIRJENPREVODBREZPRELOMA")
     plan = plan_pdf_export(source, PdfExportJob.model_validate(payload), "diagnostic", tmp_path / "work")
     replacement = plan.replacements[0]
     assert replacement.background_patch_used is False
     assert replacement.skip_reason == "image_overlap"
     assert "expanded_background_not_safe" in replacement.image_overlap_warnings
+
+
+@pytest.mark.parametrize("glyph_hits_graphic", [False, True])
+def test_original_style_expansion_checks_written_glyphs_not_blank_html_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, glyph_hits_graphic: bool,
+) -> None:
+    source = tmp_path / "blank-leading.pdf"
+    _make_layered_pdf(source, "lower_band")
+    before_band = _render_crop(source, pymupdf.Rect(20, 66, 280, 95))
+    fit = pdf_exporter._fit_replacement
+
+    def measured_layout(page, item, replacements, typography):
+        fit(page, item, replacements, typography)
+        if not item.eligible:
+            return
+        # Synthetic placement fixture, not approval or relocation of real user text.
+        rect = pymupdf.Rect(30, 66 if glyph_hits_graphic else 35, 210, 100)
+        asset = pdf_exporter._asset_for(item, typography)
+        measurement = pdf_exporter._htmlbox_preflight(page.rect, rect, item, typography, asset, 1.0)
+        assert measurement[0] >= 0
+        pdf_exporter._accept_fit(item, rect, measurement, "expanded_bbox")
+
+    monkeypatch.setattr(pdf_exporter, "_fit_replacement", measured_layout)
+    artifact = export_translated_pdf(source, PdfExportJob.model_validate(_job_payload(source)),
+        "replacement_preview", tmp_path / "output")
+    item = artifact.plan.replacements[0]
+    with pymupdf.open(artifact.path) as document:
+        text = document[0].get_text()
+    assert _image_hashes(artifact.path) == _image_hashes(source)
+    assert _pixel_difference(before_band, _render_crop(artifact.path, pymupdf.Rect(20, 66, 280, 95))) == 0
+    if glyph_hits_graphic:
+        assert not item.eligible and item.skip_reason == "image_overlap"
+        assert SOURCE in text and TRANSLATION not in text
+    else:
+        assert artifact.applied_replacements == 1
+        assert item.eligible and item.background_patch_used
+        assert TRANSLATION in text and SOURCE not in text
+        pdf_exporter._verify_inserted_text(artifact.path, artifact.plan)
 
 
 def test_metrics_near_threshold_are_uncertain(tmp_path: Path) -> None:
@@ -89,6 +194,23 @@ def test_metrics_near_threshold_are_uncertain(tmp_path: Path) -> None:
         assessment = PdfImageOverlapAnalyzer(thresholds).analyze(document[0], rect)
     assert assessment.kind == "uncertain"
     assert assessment.metrics and assessment.metrics.near_threshold is True
+
+
+def test_expanded_glyph_sampling_includes_images_outside_source_bbox(tmp_path: Path) -> None:
+    source = tmp_path / "new-image.pdf"
+    _make_layered_pdf(source, "white")
+    with pymupdf.open(source) as document:
+        page = document[0]
+        image = _background("photo")
+        stream = io.BytesIO()
+        image.save(stream, format="PNG")
+        xref = page.insert_image(pymupdf.Rect(180, 20, 280, 100), stream=stream.getvalue())
+        rect = page.search_for(SOURCE)[0]
+        assert rect.x1 < 180
+        assessment = PdfImageOverlapAnalyzer().analyze(page, rect,
+            patch_rects=[pymupdf.Rect(185, 25, 260, 70)])
+        assert xref in assessment.overlapping_image_xrefs
+        assert not assessment.safe_for_background_patch
 
 
 def test_missing_render_is_uncertain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -204,6 +326,8 @@ def _background(kind: str) -> Image.Image:
         for x in range(350, image.width):
             value = round(255 - 120 * (x - 350) / (image.width - 350))
             draw.line((x, 0, x, image.height), fill=(value, 210, 235))
+    elif kind == "lower_band":
+        draw.rectangle((0, 130, 599, 200), fill=(20, 80, 160))
     elif kind == "photo":
         for y in range(0, image.height, 20):
             for x in range(0, image.width, 20):

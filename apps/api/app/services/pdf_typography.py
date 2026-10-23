@@ -125,7 +125,7 @@ class PdfTypographyResolver:
         font_style = "italic" if asset.italic else "normal"
         css_family = f"{FAMILY_NAME}-{asset.code}"
         escaped = _escape_without_font_ligatures(text)
-        body_css = "body {margin:0;padding:0;}" if use_full_table_interior else ""
+        body_css = "body,p {margin:0;padding:0;}" if use_full_table_interior else ""
         css = body_css + (
             f"@font-face {{font-family:'{css_family}';src:url('{asset.path.name}');font-weight:{weight};font-style:{font_style};}}"
             f"* {{font-family:'{css_family}';font-size:{style.font_size:.4f}pt;font-weight:{weight};font-style:{font_style};"

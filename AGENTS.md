@@ -49,7 +49,7 @@ Guardrails:
 - Keep translation diagnostics in the review UI and JSON metadata; never insert comments, warnings, or diagnostic text into the final translated document.
 - Never overwrite a source PDF. Export only reviewed, identity-matched, geometry-checked digital text blocks after fit preflight.
 - Preserve images and vector graphics, and skip ambiguous, overlapping, unaccepted or stale OCR, rotated, unsupported-table, or overflowing regions with a structured reason.
-- OCR export must remain inside the accepted bbox, must not cover icons, lines, neighboring text, cells, photographs, gradients, or textures, and must never reconstruct an image or rasterize a page.
+- OCR source identity and removal stay inside the accepted bbox. For completely owned native OCR glyphs, a separate server-measured write region may use proven empty space without changing the accepted source or its approval. Image-only OCR remains confined to the accepted bbox. Neither path may cover icons, lines, neighboring text, cells, photographs, gradients, or textures, reconstruct an image, or rasterize a page.
 - Never resize table rows or columns, reconstruct ambiguous merged cells, alter borders/fills, or translate standalone technical values automatically.
 - Keep Droid Sans Fallback as a final glyph fallback, never download fonts at runtime, and never reuse an embedded source font without clear embedding rights and complete glyph coverage.
 - Never patch photographs, gradients, textures, icons, lines, image-only OCR text, or uncertain regions. Do not add inpainting or full-page rasterization.

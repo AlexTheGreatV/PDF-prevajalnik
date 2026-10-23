@@ -34,6 +34,7 @@ import {
   createTranslationMemoryDraft,
   isTranslationMemorySnapshotStale,
   recordTranslationMemoryUsage,
+  translationMemoryDomainScopeLabel,
   type TranslationMemoryLoadState,
 } from "../lib/translation-memory";
 import { TranslationMemoryManager, type TranslationMemoryProposal } from "./translation-memory-manager";
@@ -269,10 +270,14 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
             </select>
           </label>
           <label>Področje (neobvezno)
-            <input value={translationDomain} onChange={(event) => setTranslationDomain(event.target.value)} disabled={Boolean(job)} placeholder="npr. construction_adhesives" />
+            <input value={translationDomain} onChange={(event) => setTranslationDomain(event.target.value)} disabled={Boolean(job)} placeholder="npr. construction_adhesives" aria-describedby="translation-memory-domain-scope" />
           </label>
         </div>
       </div>
+
+      <p id="translation-memory-domain-scope" className="translation-memory-domain-scope" role="status">
+        {translationMemoryDomainScopeLabel(job?.domain ?? translationDomain)}
+      </p>
 
       <div className="advanced-only">
         <GlossaryManager proposal={glossaryProposal} reloadRequest={glossaryReloadRequest} onProposalConsumed={() => setGlossaryProposal(null)} onApprovedEntriesChange={updatePersistentGlossary} />

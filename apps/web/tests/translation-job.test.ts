@@ -35,6 +35,33 @@ import { refreshTranslationProfileMetadata } from "../lib/translation-profile-ev
 import type { TranslationMemoryEntry } from "../lib/translation-memory";
 
 const tests: Promise<void>[] = [];
+test("closed vector row units have stable separate sources without shifting neighboring IDs", () => {
+  const analysis=fixture();
+  analysis.document_model_version=4;
+  const source=analysis.document!.pages[0].regions[1].blocks[0];
+  source.original_text="Black\nchocolate brown\nWhite";
+  source.normalized_text="Black chocolate brown White";
+  source.independent_units=["Black","chocolate brown","White"].map((text,index)=>({
+    unit_id:`line-${index}`,text,bbox:{x0:2,y0:20+index*20,x1:70,y1:30+index*20},
+    baseline_y:28+index*20,row_bbox:{x0:0,y0:15+index*20,x1:100,y1:35+index*20},
+    source_span_ids:[`span-${index}`],evidence:"closed_vector_row" as const,
+  }));
+  const options={source_language:"en",target_language:"sl"};
+  const job=createTranslationJob(analysis,[],options);
+  const children=job.segments.filter(s=>s.block_id==="p1-r2-b2");
+  assert.deepEqual(children.map(s=>s.source_text),["Black","chocolate brown","White"]);
+  assert.deepEqual(children.map(s=>s.segment_id),["p1-r2-b2-line-0","p1-r2-b2-line-1","p1-r2-b2-line-2"]);
+  assert.ok(children.every(s=>s.status!=="reviewed" && !s.review_state));
+  assert.equal(job.segments.find(s=>s.source_text==="Fast curing")!.segment_id,"p1-r2-b4");
+  assert.equal(source.original_text,"Black\nchocolate brown\nWhite");
+  assert.equal(exportTranslationJob(importTranslationJob(exportTranslationJob(job))),exportTranslationJob(job));
+  const legacy=structuredClone(job);
+  legacy.document_identity!.document_model_version=3;
+  const before=JSON.stringify(legacy);
+  assert.doesNotThrow(()=>importTranslationJob(exportTranslationJob(legacy)));
+  assert.throws(()=>validateTranslationJobCompatibility(legacy,job),/PDF ponovno analizirajte/);
+  assert.equal(JSON.stringify(legacy),before);
+});
 test("frontend QC matches shared server protected-data contract cases", () => {
   const cases: Array<{id:string;source:string;target:string;valid:boolean}> = JSON.parse(readFileSync(resolve(process.cwd(), "../api/tests/fixtures/protected-data-cases.json"), "utf8"));
   for (const row of cases) assert.equal(validateTranslationTechnicalIntegrity(row.source,row.target).valid,row.valid,row.id);

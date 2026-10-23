@@ -38,6 +38,80 @@ TRANSLATED_TEXT = "Varen prevod čšžČŠŽ."
 client = TestClient(app)
 
 
+@pytest.mark.parametrize("actual_overlap", [False, True])
+def test_overlapping_marker_boxes_require_disjoint_actual_writes(tmp_path: Path, actual_overlap: bool) -> None:
+    source = tmp_path / "source.pdf"
+    _make_pdf(source)
+    segment = PdfExportSegment.model_validate(_job_payload(source)["segments"][0])
+    items = []
+    for index, y in enumerate((40, 58)):
+        item = _new_replacement(segment.model_copy(update={"segment_id": f"list-{index}"}))
+        item.source_bbox = BBox(x0=20, y0=y-10, x1=180, y1=y+12)
+        item.list_marker_preserved = item.background_patch_used = True
+        item.redaction_rects = [BBox(x0=40, y0=y, x1=150, y1=y+8)]
+        item.patch_rects = [BBox(x0=39, y0=y-1, x1=151, y1=y+9)]
+        items.append(item)
+    if actual_overlap:
+        items[1].patch_rects[0] = items[0].patch_rects[0]
+    deferred = pdf_exporter._mark_overlap_conflicts(items)
+    if actual_overlap:
+        assert not deferred
+        assert all(item.skip_reason == "overlap_conflict" for item in items)
+    else:
+        assert deferred == [(items[0], items[1])]
+        assert all(item.skip_reason is None for item in items)
+
+
+@pytest.mark.parametrize("measurement", ["missing", "collision"])
+def test_deferred_marker_overlap_fails_closed_on_missing_or_colliding_glyphs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, measurement: str) -> None:
+    source = tmp_path / "deferred.pdf"
+    _make_pdf(source)
+    segment = PdfExportSegment.model_validate(_job_payload(source)["segments"][0])
+    items = [_new_replacement(segment.model_copy(update={"segment_id": str(i)})) for i in range(2)]
+    for i, item in enumerate(items):
+        item.source_bbox = BBox(x0=20, y0=30+18*i, x1=180, y1=52+18*i)
+        item.list_marker_preserved = item.background_patch_used = item.eligible = True
+        item.redaction_rects = [BBox(x0=40, y0=40+18*i, x1=150, y1=48+18*i)]
+    monkeypatch.setattr(pdf_exporter, "_replacement_glyph_rects", lambda *_: None if measurement == "missing" else [pymupdf.Rect(40, 40, 150, 80)])
+    with pymupdf.open(source) as document:
+        pdf_exporter._validate_deferred_pairs(document, [(items[0], items[1])], None)
+    assert all(not item.eligible and item.skip_reason == "overlap_conflict" for item in items)
+
+
+def test_right_aligned_short_heading_preserves_native_body_origin(tmp_path: Path) -> None:
+    source = tmp_path / "caption.pdf"
+    _make_pdf(source, source_text="Density:")
+    job = PdfExportJob.model_validate(_job_payload(source, "Density:", "Gostota:"))
+    item = plan_pdf_export(source, job, "replacement_preview", _work(tmp_path, "plan")).replacements[0]
+    assert item.eligible
+    item.block_type = "heading"
+    item.alignment = item.typography.alignment = "right"
+    item.fitted_bbox = BBox(x0=30, y0=25, x1=80, y1=65)
+    fonts = _work(tmp_path, "fonts")
+    typography = PdfTypographyResolver(fonts)
+    with pymupdf.open(source) as document:
+        page = document[0]
+        pdf_exporter._preserve_profile_source_inset(page, item, [item], typography)
+        assert item.eligible
+        native = pdf_exporter._line_geometry(pdf_exporter._source_body_lines(page, item)[0])
+        glyphs = pdf_exporter._replacement_glyph_rects(page, item, typography)
+        assert glyphs and glyphs[0].x0 == pytest.approx(native.bbox.x0, abs=0.05)
+
+
+def test_inline_star_uses_first_body_character_not_shared_span_origin(tmp_path: Path) -> None:
+    source = tmp_path / "star.pdf"
+    _make_pdf(source, source_text="* Source note")
+    segment = PdfExportSegment.model_validate(_job_payload(source, "* Source note", "* Opomba")["segments"][0])
+    item = _new_replacement(segment)
+    item.list_marker_preserved = True
+    with pymupdf.open(source) as document:
+        page = document[0]
+        body = pdf_exporter._line_geometry(pdf_exporter._source_body_lines(page, item)[0])
+        native = page.search_for("Source note")[0]
+        assert body.bbox.x0 == pytest.approx(native.x0, abs=0.01)
+        assert body.baseline_y == pytest.approx(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["origin"][1], abs=0.01)
+
+
 def test_export_accepts_schema_ten_review_metadata_without_changing_pdf_writer(tmp_path: Path) -> None:
     source = tmp_path / "schema-ten.pdf"
     _make_pdf(source)

@@ -15,9 +15,111 @@ from app.services.document_segmenter import (
     normalize_lines_with_boundaries,
     segment_pdf,
 )
+from app.services import document_segmenter as segmenter
 
 ZETTEX_FIXTURE = Path("local-fixtures/Zettex MS65 Panel Bond EN - TDS.pdf")
 OTTOSEAL_FIXTURE = Path("local-fixtures/OTTOSEAL-S110-EN-TDS.pdf")
+
+
+def _independent_rows_fixture(path, *, closed=True, wrapped=False):
+    with fitz.open() as doc:
+        page = doc.new_page(width=300,height=240)
+        ys = [50,70,90,110]
+        for y in ys:
+            page.draw_line((30,y),(250,y),width=.5)
+        if closed:
+            page.draw_line((30,50),(30,110),width=.5)
+            page.draw_line((250,50),(250,110),width=.5)
+        page.insert_text((40,65),'Black',fontsize=10)
+        page.insert_text((40,85),'chocolate brown',fontsize=10)
+        page.insert_text((40,105),'White',fontsize=10)
+        if wrapped:
+            page.insert_text((40,89),'continued phrase',fontsize=7)
+        doc.save(path)
+
+
+def _unrecognized_grid_analysis(path, monkeypatch):
+    # Exercise the bounded-row fallback when table detection has no table object.
+    monkeypatch.setattr(segmenter, '_extract_tables', lambda *a: [])
+    monkeypatch.setattr(segmenter, '_extract_gridless_tables', lambda *a: [])
+    return segment_pdf(path)
+
+
+def test_independent_closed_rows_keep_multiword_labels_and_stable_source_identity(tmp_path, monkeypatch):
+    path=tmp_path/'labels.pdf'
+    _independent_rows_fixture(path)
+    model=_unrecognized_grid_analysis(path,monkeypatch)
+    units=[u for p in model.pages for r in p.regions for b in r.blocks for u in b.independent_units]
+    assert [u.text for u in units] == ['Black','chocolate brown','White']
+    assert [u.baseline_y for u in units] == pytest.approx([65,85,105])
+    assert len({u.unit_id for u in units}) == 3
+    for unit in units:
+        assert unit.row_bbox.y0 < unit.bbox.y0 < unit.bbox.y1 < unit.row_bbox.y1
+        assert unit.source_span_ids
+    other=tmp_path/'different-name.pdf'
+    other.write_bytes(path.read_bytes())
+    again=_unrecognized_grid_analysis(other,monkeypatch)
+    assert again.model_dump() == model.model_dump()
+
+
+@pytest.mark.parametrize('closed,wrapped', [(False,False),(True,True)])
+def test_ambiguous_or_shared_row_never_produces_independent_units(tmp_path,monkeypatch,closed,wrapped):
+    path=tmp_path/'ambiguous.pdf'
+    _independent_rows_fixture(path,closed=closed,wrapped=wrapped)
+    model=_unrecognized_grid_analysis(path,monkeypatch)
+    assert not any(b.independent_units for p in model.pages for r in p.regions for b in r.blocks)
+    text=' '.join(b.normalized_text for p in model.pages for r in p.regions for b in r.blocks)
+    assert text.count('chocolate brown') == 1
+
+
+def test_wrapped_prose_keeps_its_translation_context(tmp_path):
+    path=tmp_path/'prose.pdf'
+    with fitz.open() as doc:
+        page=doc.new_page(width=300,height=240)
+        page.insert_text((40,80),'A complete source sentence\ncontinues on this visual line.',fontsize=10)
+        doc.save(path)
+    blocks=[b for p in segment_pdf(path).pages for r in p.regions for b in r.blocks]
+    assert len(blocks)==1
+    assert blocks[0].normalized_text=='A complete source sentence continues on this visual line.'
+    assert not blocks[0].independent_units
+
+
+def test_independent_row_export_preserves_row_values_and_rejects_stale_model(tmp_path,monkeypatch):
+    from app.pdf_export_models import PdfExportJob, PdfExportSegment
+    from app.services.pdf_analyzer import analyze_pdf
+    from app.services.pdf_exporter import export_translated_pdf, plan_pdf_export, PdfExportValidationError
+    path=tmp_path/'row-export.pdf'
+    _independent_rows_fixture(path)
+    model=_unrecognized_grid_analysis(path,monkeypatch)
+    analysis=analyze_pdf(path)
+    units=[u for p in model.pages for r in p.regions for b in r.blocks for u in b.independent_units]
+    # Reviewed status here is synthetic test setup, not approval of real content.
+    targets=['Črna','Čokoladno rjava','Bela']
+    job=PdfExportJob(schema_version=10,source_filename=path.name,
+        document_identity={'sha256':analysis.sha256,'page_count':1,'document_model_version':4,
+            'pages':[{'page_number':1,'width':300,'height':240,'rotation':0}]},
+        segments=[PdfExportSegment(segment_id=u.unit_id,block_id='synthetic',page_number=1,
+            block_type='paragraph',source_text=u.text,source_bbox=u.bbox,source_text_origin='native',
+            source_page_type='digital',source_rotation=0,edited_translation=target,status='reviewed')
+            for u,target in zip(units,targets)])
+    artifact=export_translated_pdf(path,job,'replacement_preview',tmp_path/'out')
+    assert artifact.applied_replacements==3
+    with fitz.open(path) as source, fitz.open(artifact.path) as written:
+        assert source[0].get_drawings()==written[0].get_drawings()
+        for unit,target in zip(units,targets):
+            assert written[0].search_for(target)
+            rect=written[0].search_for(target)[0]
+            assert unit.row_bbox.y0 < rect.y0 < rect.y1 < unit.row_bbox.y1
+        assert 'Black' not in written[0].get_text()
+    job.segments[0].status='translated'
+    plan=plan_pdf_export(path,job,'replacement_preview',tmp_path/'pending')
+    assert plan.replacements[0].skip_reason=='not_reviewed'
+    job.document_identity.document_model_version=3
+    before=job.model_dump_json()
+    for call in (plan_pdf_export,export_translated_pdf):
+        with pytest.raises(PdfExportValidationError,match='PDF ponovno analizirajte'):
+            call(path,job,'replacement_preview',tmp_path/'legacy')
+    assert job.model_dump_json()==before
 
 
 def test_normalization_preserves_units_and_symbols() -> None:

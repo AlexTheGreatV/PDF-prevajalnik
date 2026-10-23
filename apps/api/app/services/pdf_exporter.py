@@ -30,7 +30,7 @@ from app.pdf_export_models import (
     PdfTableExportSummary,
     SkipReason,
 )
-from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer
+from app.services.pdf_image_overlap import ImageOverlapAssessment, PdfImageOverlapAnalyzer, _drawing_items_intersect
 from app.services.document_segmenter import DOCUMENT_MODEL_VERSION, segment_pdf
 from app.services.pdf_table_export import DetectedTable, PdfTableAnalyzer, canonical_text, is_technical_value, parse_cell_position
 from app.services.pdf_typography import FontAsset, MAX_SOURCE_FONT_SIZE, MIN_SOURCE_FONT_SIZE, PdfTypographyResolver
@@ -129,7 +129,7 @@ def plan_pdf_export(
             document, job, typography, overlap_analyzer, authoritative_model,
         )
         replacements.extend(table_replacements)
-        _mark_overlap_conflicts([*replacements, *ocr_replacements])
+        deferred_pairs = _mark_overlap_conflicts([*replacements, *ocr_replacements])
         for replacement in replacements:
             if replacement.skip_reason is not None or replacement.resolution != "blocked_other":
                 continue
@@ -139,10 +139,12 @@ def plan_pdf_export(
             page = document[replacement.page_number - 1]
             _fit_replacement(page, replacement, replacements, typography)
             if replacement.eligible and replacement.background_patch_used:
-                _validate_expanded_patch_area(page, replacement, overlap_analyzer)
+                _validate_expanded_patch_area(page, replacement, overlap_analyzer, typography)
         for replacement in ocr_replacements:
             if replacement.skip_reason is None and replacement.resolution == "blocked_other":
-                _fit_ocr_replacement(document[replacement.page_number - 1], replacement, typography)
+                _fit_ocr_replacement(document[replacement.page_number - 1], replacement, typography,
+                                     replacements=[*replacements, *ocr_replacements], overlap_analyzer=overlap_analyzer)
+        _validate_deferred_pairs(document, deferred_pairs, typography)
         _refresh_table_status(tables)
 
     return PdfExportPlan(
@@ -257,7 +259,7 @@ def _plan_segment(
     replacement.color = style.color
     replacement.alignment = style.alignment
     replacement.line_height = style.line_height
-    replacement.original_line_count = line_count
+    replacement.original_line_count = len(_source_body_lines(page, replacement)) if replacement.list_marker_preserved else line_count
     replacement.font_weight = "bold" if style.bold else "regular"
     replacement.font_style = "italic" if style.italic else "normal"
     if asset is None:
@@ -654,11 +656,23 @@ def _plan_provenance_cell(
         ownership=provenance.ownership,
         provenance_block_reason=provenance.block_reason,
     )
+    island = _verified_cell_text_island(page, table, provenance, source_text)
+    if island is not None:
+        # Supplemental server-only write proof. Keep the analysis and client
+        # provenance unchanged so existing content identities cannot drift.
+        provenance = provenance.model_copy(update={
+            "ownership": "owned", "has_graphic_overlap": False, "block_reason": None,
+            "content_bbox": _bbox(island),
+        })
+        cell.content_bbox = _bbox(island)
+        cell.ownership = "owned"
+        cell.provenance_block_reason = None
+        cell.typography_warnings.append("verified_native_cell_text_island")
     if segment.status == "skipped" and not source_formatting:
         return _not_applicable(cell, "Celica ni prevajalska enota za PDF izvoz.")
     if provenance.ownership == "empty":
         return _not_applicable(cell, "Prazna celica ostane del strukturnega modela.")
-    if provenance.row_span != 1 or provenance.column_span != 1:
+    if (provenance.row_span != 1 or provenance.column_span != 1) and island is None:
         return _skip(cell, "merged_cell_ambiguous", "Združena celica nima podprtega nedvoumnega razpona.")
     if provenance.has_graphic_overlap:
         return _skip(cell, "graphic_cell", "Celica vsebuje grafični element, polnilo ali swatch.")
@@ -691,6 +705,7 @@ def _plan_provenance_cell(
         patch_clip=_rect(provenance.cell_bbox),
         ignore_enclosing_drawings=True,
         allow_opaque_vector_cover=True,
+        allow_matching_rect_fills=True,
     )
     _apply_overlap_assessment(cell, assessment)
     if assessment.kind != "none" and not assessment.safe_for_background_patch:
@@ -721,6 +736,53 @@ def _plan_provenance_cell(
     cell.font_family = asset.family
     cell.proposed_font = asset.family
     return cell
+
+
+def _verified_cell_text_island(
+    page: pymupdf.Page, table: TableProvenance, cell: TableCellProvenance, source_text: str,
+) -> pymupdf.Rect | None:
+    """Prove an exclusive native caption inside an explicit opaque rectangle."""
+    if (cell.block_reason not in {"merged_cell", "graphic_overlap"}
+            or cell.rotated_text or cell.cell_bbox is None or cell.source_bbox is None
+            or not cell.source_span_ids or len(cell.proven_edges) != 4):
+        return None
+    if any(set(other.source_span_ids) & set(cell.source_span_ids)
+           for other in table.cells if other.cell_id != cell.cell_id):
+        return None
+    source = _rect(cell.source_bbox)
+    container = _rect(cell.cell_bbox)
+    if not container.contains(source) or not _text_matches(source_text, page.get_text(clip=source)):
+        return None
+    candidates = []
+    for drawing in page.get_drawings():
+        items = drawing.get("items", [])
+        if (drawing.get("fill") is None or drawing.get("color") is not None
+                or float(drawing.get("fill_opacity", 0.0)) < 0.999
+                or len(items) != 1 or items[0][0] != "re"):
+            continue
+        rect = pymupdf.Rect(items[0][1])
+        if not container.contains(rect) or not rect.contains(source):
+            continue
+        if any(other.source_bbox is not None and other.cell_id != cell.cell_id
+               and _is_material_overlap(rect & _rect(other.source_bbox)) for other in table.cells):
+            continue
+        if any(not _contains_with_tolerance(source, span) and _is_material_overlap(rect & span)
+               for span in _text_span_rects(page)):
+            continue
+        inset = pymupdf.Rect(rect.x0+0.5, rect.y0+0.5, rect.x1-0.5, rect.y1-0.5)
+        if not inset.is_empty and not any(
+            int(other.get("seqno", -1)) > int(drawing.get("seqno", -1))
+            and _drawing_items_intersect(other, inset)
+            and not (
+                other.get("color") is None and other.get("fill") == drawing.get("fill")
+                and float(other.get("fill_opacity", 0.0)) >= 0.999
+                and len(other.get("items", [])) == 1 and other["items"][0][0] == "re"
+                and pymupdf.Rect(other["items"][0][1]).contains(inset)
+            )
+            for other in page.get_drawings()
+        ):
+            candidates.append(inset)
+    return min(candidates, key=lambda rect: rect.get_area(), default=None)
 
 
 def _is_empty_structural_table_cell(segment: PdfExportSegment) -> bool:
@@ -886,16 +948,22 @@ def _validate_expanded_patch_area(
     page: pymupdf.Page,
     replacement: PdfReplacement,
     analyzer: PdfImageOverlapAnalyzer,
+    typography: PdfTypographyResolver | None = None,
 ) -> None:
     original = _layout_rect(replacement)
     fitted = _rect(replacement.fitted_bbox)
     if fitted == original:
         return
+    glyphs = None
+    # Empty HTML leading is not painted by the writer, regardless of profile.
+    # Assess the measured glyphs, while retaining the original erasure patches.
+    if typography is not None:
+        glyphs = _replacement_glyph_rects(page, replacement, typography)
     assessment = analyzer.analyze(
         page,
-        fitted,
+        _rect(replacement.source_bbox) if glyphs else fitted,
         preserve_list_marker=replacement.block_type == "list_item",
-        patch_rects=[fitted],
+        patch_rects=glyphs or [fitted],
     )
     if not assessment.safe_for_background_patch or not _background_colors_close(replacement.background_color, assessment.sampled_background_color):
         replacement.background_patch_used = False
@@ -904,15 +972,24 @@ def _validate_expanded_patch_area(
         return
     replacement.background_metrics = assessment.metrics
     replacement.overlap_confidence = min(replacement.overlap_confidence, assessment.confidence)
+    if glyphs:
+        replacement.patch_rects.extend(assessment.patch_rects)
     replacement.image_overlap_warnings.append("expanded_background_checked")
 
 
-def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> None:
+def _source_write_regions(item: PdfReplacement) -> list[pymupdf.Rect]:
+    if item.list_marker_preserved and item.background_patch_used and item.redaction_rects:
+        return [_rect(r) for r in [*item.redaction_rects, *item.patch_rects]]
+    return [_rect(item.source_bbox)]
+
+
+def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> list[tuple[PdfReplacement, PdfReplacement]]:
     candidates = [
         item for item in replacements
         if item.skip_reason is None and item.source_bbox is not None and item.resolution == "blocked_other"
     ]
     conflicting: set[str] = set()
+    deferred = []
     for index, first in enumerate(candidates):
         first_rect = _rect(first.source_bbox)
         for second in candidates[index + 1 :]:
@@ -920,11 +997,68 @@ def _mark_overlap_conflicts(replacements: list[PdfReplacement]) -> None:
                 continue
             intersection = first_rect & _rect(second.source_bbox)
             if _is_material_overlap(intersection):
+                if (first.list_marker_preserved and second.list_marker_preserved
+                        and first.background_patch_used and second.background_patch_used
+                        and first.redaction_rects and second.redaction_rects
+                        and not any(_is_material_overlap(a & b)
+                                    for a in _source_write_regions(first) for b in _source_write_regions(second))):
+                    deferred.append((first, second))
+                    continue
                 conflicting.update((first.segment_id, second.segment_id))
     for replacement in candidates:
         if replacement.segment_id in conflicting:
             reason: SkipReason = "overlapping_table_replacement" if isinstance(replacement, PdfTableCellReplacement) else "overlap_conflict"
             _skip(replacement, reason, "Območje se prekriva z drugim replacementom.")
+    return deferred
+
+
+def _replacement_glyph_rects(page, item, typography) -> list[pymupdf.Rect] | None:
+    """Reproduce the accepted writer, not the whitespace of its layout rectangle."""
+    if item.original_bbox is None or item.fitted_bbox is None:
+        return None
+    asset = _asset_for(item, typography)
+    if "source_baseline_direct_write" in item.typography_warnings:
+        source = _replacement_source_line_geometry(page, item)
+        if source is None or item.scale is None:
+            return None
+        geometry = _direct_single_line_geometry(page.rect, source.bbox.x0, source.baseline_y, item, asset, item.scale)
+        glyphs = [geometry.bbox] if geometry else None
+    else:
+        html, css = typography.html_and_css(_rendered_translation(item), item.typography,
+            asset, use_full_table_interior=isinstance(item, PdfTableCellReplacement))
+        with pymupdf.open() as scratch:
+            target = scratch.new_page(width=page.rect.width, height=page.rect.height)
+            spare, scale = target.insert_htmlbox(_rect(item.fitted_bbox), html, css=css,
+                scale_low=0.0, archive=typography.archive)
+            if (spare < 0 or not _scale_meets_floor(scale, _accepted_writer_scale_floor(item))
+                    or not _written_text_matches(_rendered_translation(item), target.get_text())):
+                return None
+            glyphs = _text_span_rects(target)
+    return glyphs if glyphs and all(_inside(r, page.rect) for r in glyphs) else None
+
+
+def _validate_deferred_pairs(document, pairs, typography) -> None:
+    for first, second in pairs:
+        glyphs = [_replacement_glyph_rects(document[i.page_number-1], i, typography) if i.eligible else []
+                  for i in (first, second)]
+        regions = [[*_source_write_regions(i), *(g or [])] if i.eligible else []
+                   for i, g in zip((first, second), glyphs)]
+        # Retained markers are obstacles, not write regions: do not compare their
+        # oversized font boxes to one another when neither is being rewritten.
+        source_chars = []
+        for item in (first, second):
+            page = document[item.page_number-1]
+            source_chars.append([pymupdf.Rect(c['bbox']) for b in page.get_text('rawdict', clip=_rect(item.source_bbox)).get('blocks', [])
+                                 for line in b.get('lines', []) for span in line.get('spans', [])
+                                 for c in span.get('chars', []) if c.get('c', '').strip()])
+        conflict = (any(i.eligible and not g for i, g in zip((first, second), glyphs))
+                    or any(_is_material_overlap(a & b) for a in regions[0] for b in regions[1])
+                    or any(_is_material_overlap(a & b) for a in regions[0] for b in source_chars[1])
+                    or any(_is_material_overlap(a & b) for a in regions[1] for b in source_chars[0]))
+        if conflict:
+            for item in (first, second):
+                if item.eligible:
+                    _skip(item, "overlap_conflict", "Dejanski zapis ali brisanje posega v sosednjo alinejo.")
 
 
 def _is_material_overlap(intersection: pymupdf.Rect) -> bool:
@@ -942,50 +1076,118 @@ def _fit_replacement(
     replacements: list[PdfReplacement],
     typography: PdfTypographyResolver,
 ) -> None:
+    if getattr(typography, "typography_revision", None):
+        replacement.typography_warnings.append("profile_source_body_anchor")
+    if getattr(typography, "typography_revision", None) and _has_discrete_source_lines(page, replacement):
+        _skip(replacement, "overlap_conflict", "Ločenih izvornih vrstic brez dokazljivega lastništva celic ni dovoljeno ponovno razporediti.")
+        replacement.typography_warnings.append("discrete_source_lines_require_ownership")
+        return
     _fit_replacement_layout(page, replacement, replacements, typography)
-    if (replacement.eligible and "document_profile_fixed_size" in replacement.typography_warnings
+    if (replacement.eligible and (getattr(typography, "typography_revision", None) or replacement.list_marker_preserved
+            or (replacement.block_type == "heading" and replacement.original_line_count == 1))
             and "source_baseline_direct_write" not in replacement.typography_warnings):
         _preserve_profile_source_inset(page, replacement, replacements, typography)
 
 
+def _source_body_lines(page, replacement) -> list[dict]:
+    """Use character evidence for an inline marker, not its shared span origin."""
+    raw = page.get_text("rawdict", clip=_rect(replacement.source_bbox), sort=True)
+    result = []
+    first = True
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            chars = [char for span in line.get("spans", []) for char in span.get("chars", [])]
+            if first and replacement.list_marker_preserved:
+                while chars and (chars[0]["c"].isspace() or chars[0]["c"] in "-–—•▪◦*"):
+                    chars.pop(0)
+            if not any(c["c"].strip() for c in chars):
+                continue
+            first = False
+            spans = [{"text": c["c"], "origin": c["origin"], "bbox": c["bbox"]}
+                     for c in chars if c["c"].strip()]
+            result.append({"spans": spans, "dir": line.get("dir", (1, 0))})
+    return result
+
+
+def _replacement_source_line_geometry(page, replacement) -> _SingleLineGeometry | None:
+    if ("profile_source_body_anchor" not in replacement.typography_warnings and not replacement.list_marker_preserved
+            and replacement.original_line_count != 1):
+        return _single_source_line_geometry(page, _layout_rect(replacement))
+    lines = _source_body_lines(page, replacement)
+    return _line_geometry(lines[0]) if len(lines) == 1 else None
+
+
+def _has_discrete_source_lines(page, replacement) -> bool:
+    if isinstance(replacement, (PdfTableCellReplacement, PdfOcrReplacement)):
+        return False
+    lines = _source_body_lines(page, replacement)
+    geometry = [_line_geometry(line) for line in lines]
+    if len(geometry) < 2 or any(g is None for g in geometry):
+        return False
+    # Separated labels are not wrapped prose. A shared block bbox does not prove
+    # which row owns a translated label, even when the target has explicit breaks.
+    return any(b.baseline_y - a.baseline_y > 2 * replacement.requested_font_size
+               for a, b in zip(geometry, geometry[1:]))
+
+
 def _preserve_profile_source_inset(page, replacement, replacements, typography) -> None:
     original = _layout_rect(replacement)
-    lines = [line for block in page.get_text("dict", clip=original).get("blocks", [])
-             for line in block.get("lines", []) if any(s.get("text", "").strip() for s in line.get("spans", []))]
+    lines = _source_body_lines(page, replacement)
     if not lines:
         _skip(replacement, "overlap_conflict", "Izvornega zamika besedila ni mogoče potrditi.")
         return
-    source_x = next(span["origin"][0] for span in lines[0]["spans"] if span.get("text", "").strip())
-    # Preserve only a demonstrable inset (for example after a separate icon), not
-    # an inferred margin or a request to extend an ordinary paragraph to the left.
-    if source_x <= original.x0 + GEOMETRY_TOLERANCE:
+    source_first = _line_geometry(lines[0])
+    if source_first is None:
+        _skip(replacement, "overlap_conflict", "Izvorne osnovnice ni mogoče potrditi.")
         return
+    source_x = source_first.bbox.x0
+    # Measure the first body glyph and baseline, including markers sharing a span.
+    # The HTML box may include blank leading; only measured ink is allowed to move.
     asset = _asset_for(replacement, typography)
     rect = _rect(replacement.fitted_bbox)
     html, css = typography.html_and_css(_rendered_translation(replacement), replacement.typography, asset)
+    scale_floor = _accepted_writer_scale_floor(replacement)
     with pymupdf.open() as scratch:
         target = scratch.new_page(width=page.rect.width, height=page.rect.height)
-        spare, scale = target.insert_htmlbox(rect, html, css=css, scale_low=1.0, archive=typography.archive)
+        spare, scale = target.insert_htmlbox(rect, html, css=css, scale_low=scale_floor, archive=typography.archive)
         rendered = [line for block in target.get_text("dict").get("blocks", []) for line in block.get("lines", [])]
-    if spare < 0 or scale != 1.0 or not rendered:
+    if spare < 0 or not _scale_meets_floor(scale, scale_floor) or not rendered:
         _skip(replacement, "overlap_conflict", "Zamika oblikovanega besedila ni mogoče izmeriti.")
         return
-    delta_x = source_x - rendered[0]["spans"][0]["origin"][0]
-    if abs(delta_x) <= GEOMETRY_TOLERANCE:
+    first = _line_geometry(rendered[0])
+    if first is None:
+        _skip(replacement, "overlap_conflict", "Osnovnice oblikovanega besedila ni mogoče izmeriti.")
         return
-    candidate = pymupdf.Rect(rect.x0 + delta_x, rect.y0, rect.x1, rect.y1)
-    if candidate.x0 < min(rect.x0, original.x0) or candidate.width <= 0:
+    delta_x = source_x - first.bbox.x0
+    delta_y = source_first.baseline_y - first.baseline_y
+    if abs(delta_x) <= GEOMETRY_TOLERANCE and abs(delta_y) <= GEOMETRY_TOLERANCE:
+        return
+    right = rect.x1 + delta_x if replacement.alignment != "left" else rect.x1
+    candidate = pymupdf.Rect(rect.x0 + delta_x, rect.y0 + delta_y, right, rect.y1 + delta_y)
+    if not _inside(candidate, page.rect) or candidate.width <= 0:
         _skip(replacement, "overlap_conflict", "Zamik bi presegel preverjeno območje besedila.")
         return
-    fit = _htmlbox_preflight(page.rect, candidate, replacement, typography, asset, 1.0)
+    fit = _htmlbox_preflight(page.rect, candidate, replacement, typography, asset, scale_floor)
     if fit[0] < 0:
         _skip(replacement, "overflow", "Besedilo se ob ohranjenem izvornem zamiku ne prilega.", "overflow")
+        return
+    with pymupdf.open() as scratch:
+        target = scratch.new_page(width=page.rect.width, height=page.rect.height)
+        target.insert_htmlbox(candidate, html, css=css, scale_low=scale_floor, archive=typography.archive)
+        glyphs = _text_span_rects(target)
+    available = original | _safe_expansion(page, original, replacement, replacements)
+    obstacles = [r for r in _text_span_rects(page) if (r & _rect(replacement.source_bbox)).is_empty]
+    obstacles.extend(_vector_stroke_obstacles(page))
+    if (not glyphs or any(not _contains_with_tolerance(available, g) for g in glyphs)
+            or any(_is_material_overlap(g & o) for g in glyphs for o in obstacles)):
+        _skip(replacement, "overlap_conflict", "Zapis na izvorni osnovnici presega preverjeno območje ali seka sosednjo vsebino.")
         return
     _accept_fit(replacement, candidate, fit, replacement.fit_strategy)
     if not _align_single_line_around_vector_strokes(page, replacement, replacements, typography, asset):
         _skip(replacement, "overlap_conflict", "Besedila ob ohranjenem zamiku ni mogoče varno poravnati.")
         return
     replacement.typography_warnings.append("source_text_inset_preserved")
+    replacement.typography_warnings.append("source_first_baseline_preserved")
 
 
 def _fit_replacement_layout(
@@ -1041,8 +1243,10 @@ def _fit_ocr_replacement(
     page: pymupdf.Page,
     replacement: PdfOcrReplacement,
     typography: PdfTypographyResolver,
+    *, replacements: list[PdfReplacement] | None = None,
+    overlap_analyzer: PdfImageOverlapAnalyzer | None = None,
 ) -> None:
-    """Fit OCR translation only inside its accepted bbox; expansion is intentionally forbidden."""
+    """Keep OCR source/removal fixed; prove any extra native-text write space independently."""
     rect = _rect(replacement.original_bbox)
     asset = _asset_for(replacement, typography)
     exact = _htmlbox_preflight(page.rect, rect, replacement, typography, asset, 1.0)
@@ -1052,8 +1256,28 @@ def _fit_ocr_replacement(
     scaled = _htmlbox_preflight(page.rect, rect, replacement, typography, asset, minimum_scale)
     if scaled[0] >= 0 and scaled[1] + 0.0001 >= minimum_scale:
         return _accept_fit(replacement, rect, scaled, "scaled")
+    if ("accepted_native_ocr_uniform_background_checked" in replacement.image_overlap_warnings
+            and _fit_single_line_on_source_baseline(
+                page, rect, replacement, asset, minimum_scale,
+                geometry_guard=lambda glyph: rect.contains(glyph),
+            )):
+        replacement.typography_warnings.append("verified_native_ocr_source_baseline")
+        return
+    if ("accepted_native_ocr_uniform_background_checked" in replacement.image_overlap_warnings
+            and overlap_analyzer is not None):
+        available = _safe_expansion(page, rect, replacement, replacements or [replacement])
+        if _fit_single_line_on_source_baseline(
+            page, available, replacement, asset, minimum_scale,
+            geometry_guard=lambda glyph: available.contains(glyph),
+        ):
+            glyphs = _replacement_glyph_rects(page, replacement, typography)
+            assessment = overlap_analyzer.analyze_ocr_region(page, rect, write_rects=glyphs) if glyphs else None
+            if assessment is not None and assessment.safe_for_background_patch:
+                _apply_overlap_assessment(replacement, assessment)
+                replacement.typography_warnings.append("verified_native_ocr_write_region")
+                return
     replacement.fit_strategy = "overflow"
-    _skip(replacement, "overflow", "OCR prevod se ne prilega sprejetemu območju; območje se ne razširi.", "overflow")
+    _skip(replacement, "overflow", "OCR prevod se ne prilega dokazano varnemu območju za zapis.", "overflow")
 
 
 def _minimum_text_scale(replacement: PdfReplacement) -> float:
@@ -1172,7 +1396,9 @@ def _fit_table_cell(
     layouts = _balanced_table_layouts(replacement.translated_text)
     replacement.layout_text = layouts[0]
     exact = _htmlbox_preflight(page.rect, content, replacement, typography, asset, 1.0)
-    if exact[0] >= 0:
+    if _fit_table_single_line_on_source_baseline(page, replacement, asset, 1.0):
+        pass
+    elif exact[0] >= 0:
         _accept_fit(replacement, content, exact, "exact")
     else:
         if not _try_table_layouts(page, content, replacement, typography, asset, layouts[1:], 1.0, "exact"):
@@ -1189,23 +1415,47 @@ def _fit_table_cell(
                 _skip(replacement, "cell_overflow", "Prevod se ne prilega varnemu območju celice.", "overflow")
                 return
 
-    if replacement.background_patch_used:
+    glyphs = _replacement_glyph_rects(page, replacement, typography)
+    if glyphs and "source_baseline_direct_write" not in replacement.typography_warnings:
+        # HTML leading can put the font's measured ascent above the box. Move
+        # the complete line stack, never shrink it or extend the cell interior.
+        bounds = pymupdf.Rect(glyphs[0])
+        for glyph in glyphs[1:]:
+            bounds |= glyph
+        dy = max(0.0, content.y0 - bounds.y0)
+        if dy and bounds.y1 + dy <= content.y1:
+            rect = _rect(replacement.fitted_bbox)
+            replacement.fitted_bbox = _bbox(pymupdf.Rect(rect.x0, rect.y0 + dy, rect.x1, rect.y1 + dy))
+            glyphs = _replacement_glyph_rects(page, replacement, typography)
+    if not glyphs or any(not _contains_with_tolerance(content, g) for g in glyphs):
+        _skip(replacement, "cell_overflow", "Dejanski glifi ne ohranijo varnega odmika znotraj celice.", "overflow")
+        return
+    if replacement.background_patch_used or any(
+        not (pymupdf.Rect(info["bbox"]) & glyph).is_empty
+        for info in page.get_image_info() for glyph in glyphs
+    ):
         assessment = overlap_analyzer.analyze(
             page,
-            content,
-            patch_rects=[content],
-            patch_clip=_rect(replacement.cell_bbox),
+            _rect(replacement.source_bbox),
+            patch_rects=glyphs or [content],
+            patch_clip=content,
             ignore_enclosing_drawings=True,
             allow_opaque_vector_cover=True,
+            allow_matching_rect_fills=True,
         )
-        if not assessment.safe_for_background_patch or not _background_colors_close(
+        if assessment.kind == "none":
+            return
+        if not assessment.safe_for_background_patch or (replacement.background_patch_used and not _background_colors_close(
             replacement.background_color, assessment.sampled_background_color
-        ):
+        )):
             replacement.background_patch_used = False
             replacement.image_overlap_warnings.append("table_content_background_not_safe")
             _skip(replacement, "image_overlap", "Celotno območje preloma nima dokazljivo varnega ozadja.")
             return
+        if not replacement.background_patch_used:
+            _apply_overlap_assessment(replacement, assessment)
         replacement.background_metrics = assessment.metrics
+        replacement.patch_rects.extend(assessment.patch_rects)
         replacement.overlap_confidence = min(replacement.overlap_confidence, assessment.confidence)
         replacement.image_overlap_warnings.append("table_content_background_checked")
 
@@ -1333,7 +1583,7 @@ def _align_single_line_around_vector_strokes(
     if replacement.original_line_count != 1 or replacement.fitted_bbox is None or replacement.source_bbox is None:
         return True
     source_rect = _rect(replacement.source_bbox)
-    source = _single_source_line_geometry(page, source_rect)
+    source = _replacement_source_line_geometry(page, replacement)
     rendered = _single_rendered_line_geometry(page.rect, _rect(replacement.fitted_bbox), replacement, typography, asset)
     if source is None or rendered is None:
         return True
@@ -1403,7 +1653,7 @@ def _fit_single_line_on_source_baseline(
         or not 0 < minimum_scale <= 1
     ):
         return False
-    source = _single_source_line_geometry(page, _layout_rect(replacement))
+    source = _replacement_source_line_geometry(page, replacement)
     if source is None:
         return False
     fit_rect = _bounded_by_enclosing_vector_stroke(page, _layout_rect(replacement), fit_rect)
@@ -1718,7 +1968,7 @@ def _write_replacements(document: pymupdf.Document, plan: PdfExportPlan, typogra
             item.segment_id: geometry
             for item in page_items
             if "source_baseline_direct_write" in item.typography_warnings
-            and (geometry := _single_source_line_geometry(page, _layout_rect(item))) is not None
+            and (geometry := _replacement_source_line_geometry(page, item)) is not None
         }
         for item in page_items:
             redactions = item.redaction_rects if item.background_patch_used and item.redaction_rects else [item.original_bbox]

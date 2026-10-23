@@ -17,7 +17,7 @@ from app.services.pdf_image_overlap import PdfImageOverlapAnalyzer
 from app.services.pdf_typography import PdfTypographyResolver
 
 PROFILE_VERSION = "document-role-typography-pilot-v1"
-PROFILE_LAYOUT_REVISION = "measured-write-footprints-zero-margins-insets-definitions-v5"
+PROFILE_LAYOUT_REVISION = "source-line-anchors-cell-groups-v7"
 
 
 class DocumentTypographyResolver(PdfTypographyResolver):
@@ -57,11 +57,11 @@ class DocumentTypographyResolver(PdfTypographyResolver):
                 if proof is None:
                     self.exceptions[segment.segment_id] = "missing_table_provenance"
                     continue
-                role = "table_header" if bold else "table_label" if proof.column_index == 0 else "table_value"
-                bold = bold or role == "table_label"
+                role = "table_header" if bold or proof.column_span > 1 else "table_label" if proof.column_index == 0 else "table_value"
+                bold = bold or role == "table_header"
             elif style.font_size < 8:
                 role = "footnote"
-            size = round(style.font_size * (0.95 if role.startswith("table_") else 1.0), 3)
+            size = round(style.font_size, 3)
             size = max(size, 6.0)
             group = f"{role}:{style.font_size:g}:{int(bold)}:{int(style.italic)}:{style.color}"
             rule = {"group": group, "role": role, "font_family": "FiraGO", "font_size": size,
@@ -116,31 +116,8 @@ def _write_footprint(page, item, typography) -> list[pymupdf.Rect] | None:
     Redactions and patches remain occupied, even when no replacement glyph touches them.
     Failure to reproduce the accepted writer scale or text is not a geometric proof.
     """
-    if item.original_bbox is None or item.fitted_bbox is None:
-        return None
-    asset = exporter._asset_for(item, typography)
-    if "source_baseline_direct_write" in item.typography_warnings:
-        source = exporter._single_source_line_geometry(page, exporter._layout_rect(item))
-        if source is None or item.scale is None:
-            return None
-        geometry = exporter._direct_single_line_geometry(page.rect, source.bbox.x0,
-            source.baseline_y, item, asset, item.scale)
-        if geometry is None:
-            return None
-        glyphs = [geometry.bbox]
-    else:
-        html, css = typography.html_and_css(exporter._rendered_translation(item), item.typography,
-            asset, use_full_table_interior=isinstance(item, PdfTableCellReplacement))
-        with pymupdf.open() as scratch:
-            target = scratch.new_page(width=page.rect.width, height=page.rect.height)
-            spare, scale = target.insert_htmlbox(exporter._rect(item.fitted_bbox), html, css=css,
-                scale_low=0.0, archive=typography.archive)
-            if spare < 0 or not exporter._scale_meets_floor(scale, exporter._accepted_writer_scale_floor(item)):
-                return None
-            if not exporter._written_text_matches(exporter._rendered_translation(item), target.get_text()):
-                return None
-            glyphs = exporter._text_span_rects(target)
-    if not glyphs or any(not exporter._inside(rect, page.rect) for rect in glyphs):
+    glyphs = exporter._replacement_glyph_rects(page, item, typography)
+    if glyphs is None:
         return None
     redactions = item.redaction_rects if item.background_patch_used and item.redaction_rects else [item.original_bbox]
     patches = item.patch_rects if item.background_patch_used else []
@@ -233,7 +210,7 @@ def export_document_typography_pilot(
             else:
                 exporter._fit_replacement(page, item, candidates, typography)
                 if item.eligible and item.background_patch_used:
-                    exporter._validate_expanded_patch_area(page, item, analyzer)
+                    exporter._validate_expanded_patch_area(page, item, analyzer, typography)
         # A formatting attempt must not collide with either an approved translation or another formatting attempt.
         live = [r for r in [*plan.replacements, *plan.ocr_replacements, *formatting] if r.eligible]
         footprints = {id(r): _write_footprint(document[r.page_number - 1], r, typography) for r in live}

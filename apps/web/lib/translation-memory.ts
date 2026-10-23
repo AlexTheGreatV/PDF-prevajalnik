@@ -77,6 +77,12 @@ export function normalizeTranslationMemorySource(value: string): string {
   return value.normalize("NFC").replace(/\r\n?/g, "\n").trim();
 }
 
+export function translationMemoryDomainScopeLabel(domain: string): string {
+  return domain
+    ? `TM: področje ${domain} in splošni vnosi. Vnosi drugih področij niso vključeni.`
+    : "TM: področje ni izbrano; upoštevani so samo splošni vnosi. Področni vnosi niso vključeni.";
+}
+
 export function selectExactTranslationMemoryMatch(
   sourceText: string,
   sourceLanguage: string,

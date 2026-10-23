@@ -56,6 +56,23 @@ export function createTranslationJob(
     for (const region of [...page.regions].sort((a, b) => a.reading_order - b.reading_order)) {
       for (const block of [...region.blocks].sort((a, b) => a.reading_order - b.reading_order)) {
         const blockId = `p${page.page_number}-r${region.reading_order}-b${block.reading_order}`;
+        if (block.independent_units?.length) {
+          for (const unit of block.independent_units) {
+            const unitBlock: StructuredBlock = {
+              ...block, bbox: { ...unit.bbox }, original_text: unit.text, normalized_text: unit.text,
+              independent_units: [], line_boundaries: [],
+              lines: block.lines.filter((line) => line.spans.some((span) => unit.source_span_ids.includes(span.span_id))),
+            };
+            segments.push(createSegment(unit.text, {
+              segment_id: `${blockId}-${unit.unit_id}`, block_id: blockId, block_type: block.kind,
+              page_number: page.page_number, page_type: page.page_type, page_rotation: page.rotation,
+              region, block: unitBlock, source_origin: "native", source_bbox: unit.bbox,
+              source_language: options.source_language, target_language: options.target_language,
+              glossary, translation_memory: translationMemory, domain: options.domain ?? "", created_at,
+            }));
+          }
+          continue;
+        }
         if (block.kind === "table" && block.table_cells) {
           block.table_cells.forEach((row, rowIndex) => row.forEach((cell, columnIndex) => {
             const provenance = block.table_provenance?.cells.find((candidate) =>

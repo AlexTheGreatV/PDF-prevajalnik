@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,7 @@ from app.models import (
     DocumentPage,
     DocumentRegion,
     DocumentSpan,
+    IndependentTextUnit,
     LineBoundary,
     PdfKind,
     RegionKind,
@@ -27,7 +30,7 @@ from app.models import (
     TableProvenance,
 )
 
-DOCUMENT_MODEL_VERSION = 3
+DOCUMENT_MODEL_VERSION = 4
 TEXT_PAGE_THRESHOLD = 25
 
 LIST_MARKER_RE = re.compile(r"^\s*(?:[•\-\*\u2013\u2014]|\d+[\.)]|[A-Za-z][\.)])\s+")
@@ -50,6 +53,8 @@ class RawLine:
     column_index: int = 0
     rotated: bool = False
     decorative_list_marker: bool = False
+    baseline_y: float | None = None
+    independent_row: BBox | None = None
 
     @property
     def x0(self) -> float:
@@ -99,6 +104,7 @@ def segment_pdf(path: Path) -> DocumentModel:
 
     with fitz.open(path) as document:
         metadata = dict(document.metadata or {})
+        metadata["document_model_version"] = DOCUMENT_MODEL_VERSION
         metadata["pymupdf_version"] = fitz.VersionBind
         metadata["table_detection"] = "pymupdf_find_tables" if hasattr(fitz.Page, "find_tables") else "none"
 
@@ -112,6 +118,7 @@ def segment_pdf(path: Path) -> DocumentModel:
             for table_index, table in enumerate(sorted(tables, key=lambda item: (item.bbox.y0, item.bbox.x0))):
                 table.table_id = f"p{page_number}-t{table_index + 1}"
             lines = _prepare_lines(extracted_lines)
+            _mark_independent_rows(page, lines)
             images = _extract_images(page)
             text_chars = sum(len(line.original_text.strip()) for line in lines)
             page_kind = _classify_page(text_chars=text_chars, image_count=len(images))
@@ -218,6 +225,10 @@ def _extract_lines(page: fitz.Page, page_number: int) -> list[RawLine]:
                     region_kind="body",
                     rotated=tuple(round(float(value), 4) for value in line.get("dir", (1.0, 0.0))) != (1.0, 0.0),
                     decorative_list_marker=decorative_list_marker,
+                    baseline_y=(float(line['spans'][0]['origin'][1])
+                        if line.get('spans') and all('origin' in s for s in line['spans'])
+                        and max(s['origin'][1] for s in line['spans']) - min(s['origin'][1] for s in line['spans']) < 0.25
+                        else None),
                 )
             )
     return lines
@@ -267,6 +278,49 @@ def _is_list_marker_font(font: str | None) -> bool:
 
 def _prepare_lines(lines: list[RawLine]) -> list[RawLine]:
     return _merge_marker_lines(_merge_same_row_fragments(lines))
+
+
+def _mark_independent_rows(page: fitz.Page, lines: list[RawLine]) -> None:
+    """Require four vector boundaries and exclusive whole-line ownership, not proximity."""
+    horizontal: list[tuple[float, float, float]] = []
+    vertical: list[tuple[float, float, float]] = []
+    for drawing in page.get_drawings():
+        if drawing.get('color') is None and drawing.get('fill') is None:
+            continue
+        for item in drawing.get('items', []):
+            if item[0] == 're':
+                box = fitz.Rect(item[1])
+                # Only actual thin rules or stroked outlines supply boundaries.
+                if drawing.get('color') is None and min(box.width, box.height) > 0.75:
+                    continue
+                horizontal.extend([(box.y0, box.x0, box.x1), (box.y1, box.x0, box.x1)])
+                vertical.extend([(box.x0, box.y0, box.y1), (box.x1, box.y0, box.y1)])
+            elif item[0] == 'l' and drawing.get('color') is not None:
+                a, b = item[1], item[2]
+                if abs(a.y - b.y) < 0.1:
+                    horizontal.append((a.y, min(a.x,b.x), max(a.x,b.x)))
+                if abs(a.x - b.x) < 0.1:
+                    vertical.append((a.x, min(a.y,b.y), max(a.y,b.y)))
+    for line in lines:
+        if line.rotated or line.baseline_y is None:
+            continue
+        left = [x for x,y0,y1 in vertical if x < line.x0 and y0 <= line.y0 + .75 and y1 >= line.y1 - .75]
+        right = [x for x,y0,y1 in vertical if x > line.x1 and y0 <= line.y0 + .75 and y1 >= line.y1 - .75]
+        if not left or not right:
+            continue
+        x0,x1 = max(left),min(right)
+        top = [y for y,a,b in horizontal if y <= line.y0 and a <= x0 + .75 and b >= x1 - .75]
+        bottom = [y for y,a,b in horizontal if y >= line.y1 and a <= x0 + .75 and b >= x1 - .75]
+        if not top or not bottom:
+            continue
+        rect = fitz.Rect(x0,max(top),x1,min(bottom))
+        if len(_proven_vector_edges(page,rect)) != 4 or not _rect_contains_bbox(rect,line.bbox,0):
+            continue
+        occupants = [candidate for candidate in lines if not (fitz.Rect(
+            candidate.x0,candidate.y0,candidate.x1,candidate.y1) & rect).is_empty]
+        if len(occupants) != 1 or occupants[0] is not line:
+            continue
+        line.independent_row = _bbox(rect)
 
 
 def _merge_same_row_fragments(lines: list[RawLine]) -> list[RawLine]:
@@ -1139,7 +1193,7 @@ def _make_text_block(
     forced_kind: BlockKind | None = None,
 ) -> DocumentBlock:
     line_models = [
-        DocumentLine(bbox=line.bbox, original_text=line.original_text, spans=line.spans)
+        DocumentLine(bbox=line.bbox, original_text=line.original_text, spans=line.spans, baseline_y=line.baseline_y)
         for line in lines
     ]
     original_text = "\n".join(line.original_text for line in lines)
@@ -1148,12 +1202,23 @@ def _make_text_block(
     kind = forced_kind or _block_kind(lines, body_size)
     warnings = _warnings_for_text(original_text)
     warnings.extend(boundary.warning for boundary in line_boundaries if boundary.warning)
+    units: list[IndependentTextUnit] = []
+    if (kind == "paragraph" and len(lines) > 1 and all(line.independent_row is not None for line in lines)
+            and all(abs(line.independent_row.x0 - lines[0].independent_row.x0) < .75
+                    and abs(line.independent_row.x1 - lines[0].independent_row.x1) < .75 for line in lines)
+            and all(a.independent_row.y1 <= b.independent_row.y0 + .75 for a,b in zip(lines,lines[1:]))):
+        for line in lines:
+            payload = [line.page_number,line.original_text,line.bbox.model_dump(),[s.span_id for s in line.spans]]
+            identity = hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()[:20]
+            units.append(IndependentTextUnit(unit_id=f"line-{identity}",text=line.original_text,bbox=line.bbox,
+                baseline_y=line.baseline_y,row_bbox=line.independent_row,source_span_ids=[s.span_id for s in line.spans]))
     return DocumentBlock(
         kind=kind,
         bbox=_union_bbox([line.bbox for line in lines]),
         original_text=original_text,
         normalized_text=normalized_text,
         lines=line_models,
+        independent_units=units,
         line_boundaries=line_boundaries,
         style=style,
         reading_order=reading_order,
@@ -1255,6 +1320,8 @@ def _merge_lines(lines: list[RawLine], separator: str = " ") -> RawLine:
         column_index=ordered[0].column_index,
         rotated=any(line.rotated for line in ordered),
         decorative_list_marker=any(line.decorative_list_marker for line in ordered),
+        baseline_y=(ordered[0].baseline_y if all(line.baseline_y is not None for line in ordered)
+            and max(line.baseline_y for line in ordered)-min(line.baseline_y for line in ordered) < .25 else None),
     )
 
 
