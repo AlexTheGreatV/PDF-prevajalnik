@@ -6,6 +6,7 @@ import type { TranslationSegment } from "../lib/translation-types";
 
 export function GuidedTranslationReview({
   segment,
+  sourceWarning,
   position,
   total,
   onEdit,
@@ -13,6 +14,7 @@ export function GuidedTranslationReview({
   onNext,
 }: {
   segment: TranslationSegment;
+  sourceWarning?: string | null;
   position: number;
   total: number;
   onEdit: (text: string) => void;
@@ -46,6 +48,7 @@ export function GuidedTranslationReview({
       <span><strong>Avtomatski QC</strong>{qcLabel(segment)}</span>
     </div>
     {segment.needs_review && <p className="translation-warning">Ta prevod zahteva ročni pregled.</p>}
+    {sourceWarning && <p className="translation-warning" role="note">{sourceWarning} <a href="#ocr-review">Preglej OCR območje</a></p>}
     {segment.current_qc?.findings.map((finding, index) => <p className={finding.severity === "blocking" ? "translation-error" : "translation-warning"} key={`${finding.code}-${finding.glossary_entry_id ?? index}`}>{finding.message}</p>)}
     {segment.error && <p className="translation-error">{segment.error}</p>}
     <div className="translation-row-actions">

@@ -1,5 +1,19 @@
 import type { BrowserOcrResult, BrowserOcrSegmentationMode, OcrBBox } from "./browser-ocr-provider";
 import type { PdfAnalysis, StructuredBlock, StructuredPage } from "./pdf-types";
+import type { TranslationSegment } from "./translation-types";
+
+export function nativeSourceReviewWarning(
+  segment: Pick<TranslationSegment, "source_text_origin" | "source_bbox" | "source_text" | "page_number" | "block_id">,
+  items: OcrReviewItem[],
+): string | null {
+  if (segment.source_text_origin !== "native" || !segment.source_bbox) return null;
+  const sameText = (text: string) => text.replace(/\s+/g, " ").trim();
+  const candidate = items.some(item => item.source === "block" && item.page_number === segment.page_number
+    && item.linked_block_reading_order !== undefined && segment.block_id.endsWith(`-b${item.linked_block_reading_order}`)
+    && sameText(item.native_text) === sameText(segment.source_text)
+    && (["x0", "y0", "x1", "y1"] as const).every(key => item.pdf_bbox[key] === segment.source_bbox![key]));
+  return candidate ? "Sumljiv izvor: pred potrditvijo prevoda preglejte OCR izrez. Uspešen QC zaščitenih podatkov ne potrjuje pravilnosti izvora." : null;
+}
 
 export type OcrReviewStatus = "pending" | "processing" | "suggested" | "accepted" | "rejected" | "failed" | "needs_review";
 export type OcrTextSource = "native" | "ocr";

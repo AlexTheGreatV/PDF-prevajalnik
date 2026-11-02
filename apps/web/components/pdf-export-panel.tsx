@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 
 import { createCoverageRevisionKey } from "../lib/document-coverage";
 import type { OcrReviewItem } from "../lib/ocr-review";
@@ -23,6 +23,9 @@ import type { TranslationJob, TranslationSegment } from "../lib/translation-type
 import { DocumentCoverageSummary } from "./document-coverage-summary";
 import { TableReconstructionPanel } from "./table-reconstruction-panel";
 import { reconstructionRevision } from "../lib/table-reconstruction";
+import { renderPdf } from "../lib/pdf-client";
+import { createPdfPreviewGate, type PdfPreviewState } from "../lib/pdf-preview";
+import { createPdfExportSettings, restorePdfExportSettings, type PdfExportSettings } from "../lib/pdf-export-settings";
 
 const REASON_LABELS: Record<string, string> = {
   not_reviewed: "prevod ni potrjen",
@@ -66,7 +69,7 @@ export type PdfExportUiState = {
   appliedReplacements: number;
 };
 
-export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode = false, onStateChange, onNavigateSegment }: {
+export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode = false, onStateChange, onNavigateSegment, onPreviewChange, onSettingsChange }: {
   sourceFile: File;
   job: TranslationJob;
   analysis: PdfAnalysis;
@@ -74,10 +77,13 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
   simpleMode?: boolean;
   onStateChange?: (state: PdfExportUiState) => void;
   onNavigateSegment?: (segmentId: string) => void;
+  onPreviewChange: (state: PdfPreviewState | null) => void;
+  onSettingsChange: (settings: PdfExportSettings) => void;
 }) {
   const [mode, setMode] = useState<PdfExportMode>("diagnostic");
-  const [typographyProfile, setTypographyProfile] = useState<PdfTypographyProfile>("original");
-  const [reconstructionTable, setReconstructionTable] = useState("");
+  const restoredSettings = restorePdfExportSettings(analysis, job.export_settings);
+  const typographyProfile = restoredSettings.profile;
+  const reconstructionTable = restoredSettings.selection ? `${restoredSettings.selection.page_number}:${restoredSettings.selection.table_id}` : "";
   const [reconstructedState, setReconstructedState] = useState<{ revisionKey: string; value: PdfExportUiState } | null>(null);
   const tableChoices = analysis.document?.pages.flatMap(page => page.regions.flatMap(region => region.blocks
     .filter(block => block.table_provenance)
@@ -91,15 +97,14 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
   const [appliedReplacements, setAppliedReplacements] = useState(0);
   const [diagnosticDownloadedRevisionKey, setDiagnosticDownloadedRevisionKey] = useState<string | null>(null);
   const busyRef = useRef(false);
+  const previewGate = useRef(createPdfPreviewGate());
+  const artifact = useRef<{ revisionKey: string; blob: Blob; filename: string; applied: number } | null>(null);
+  const [artifactReady, setArtifactReady] = useState<string | null>(null);
   const effectiveMode = resolvePdfExportMode(simpleMode, mode);
   const effectiveProfile = effectiveMode === "diagnostic" ? "original" : typographyProfile;
   const reconstruction = effectiveMode === "replacement_preview" ? selectedTable : null;
   const revisionKey = reconstructionRevision(pdfTypographyRevisionKey(createCoverageRevisionKey({ analysis, ocrItems, job, mode: effectiveMode }), effectiveProfile), reconstruction);
   const revisionKeyRef = useRef(revisionKey);
-  useLayoutEffect(() => {
-    revisionKeyRef.current = revisionKey;
-    return () => { revisionKeyRef.current = ""; };
-  }, [revisionKey]);
   const plan = currentRevisionValue(planned, revisionKey);
   const currentError = currentRevisionValue(error, revisionKey);
   const downloadCompleted = downloadedRevisionKey === revisionKey;
@@ -114,6 +119,7 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
   }, [activeApplied, activeDownloaded, activePlan, onStateChange]);
 
   async function prepare() {
+    if (restoredSettings.error) return;
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy("plan");
@@ -123,24 +129,66 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
     setAppliedReplacements(0);
     setDiagnosticDownloadedRevisionKey(null);
     const requestRevision = revisionKey;
+    const ticket = previewGate.current.begin();
+    artifact.current = null;
+    setArtifactReady(null);
+    if (effectiveMode === "replacement_preview") onPreviewChange({ status: "updating" });
     try {
       const preparedPlan = await preparePdfExport(sourceFile, job, effectiveMode, effectiveProfile);
       if (effectiveProfile !== "original" && preparedPlan.typography_coverage?.profile !== effectiveProfile) {
         throw new Error("Načrt ne uporablja izbranega tipografskega profila.");
       }
-      if (!isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) return;
+      if (!previewGate.current.isCurrent(ticket) || !isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) return;
       setPlanned({ revisionKey: requestRevision, value: preparedPlan });
+      if (effectiveMode === "replacement_preview") {
+        const count = preparedPlan.summary.eligible + preparedPlan.ocr_summary.eligible_regions;
+        if (!count) throw new Error("Ni potrjenih, QC uspešnih in geometrijsko primernih zamenjav. Nepotrjeni prevodi ostanejo v izvirniku.");
+        const result = await downloadPdfExport(sourceFile, job, effectiveMode, effectiveProfile);
+        validatePdfTypographyDownload(result, effectiveProfile, preparedPlan);
+        validatePdfExportDownload(result, effectiveMode, count);
+        const rendered = await renderPdf(new File([result.blob], result.filename, { type: "application/pdf" }));
+        if (!previewGate.current.isCurrent(ticket) || !isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) return;
+        artifact.current = { revisionKey: requestRevision, blob: result.blob, filename: result.filename, applied: result.applied_replacements };
+        setArtifactReady(requestRevision);
+        onPreviewChange({ status: "ready", pages: rendered.pages, refresh: () => void prepare() });
+      }
     } catch (caught) {
-      if (isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) setError({
+      if (previewGate.current.isCurrent(ticket) && isCurrentPdfExportRevision(requestRevision, revisionKeyRef.current)) {
+        if (effectiveMode === "replacement_preview") onPreviewChange({ status: "blocked", message: caught instanceof Error ? caught.message : "Predogled ni uspel.", refresh: () => void prepare() });
+        setError({
         revisionKey: requestRevision,
         value: caught instanceof Error ? caught.message : "Načrta izvoza ni bilo mogoče pripraviti.",
         blockers: caught instanceof PdfExportQcError ? caught.blockers : undefined,
-      });
+        });
+      }
     } finally {
-      busyRef.current = false;
-      setBusy(null);
+      if (previewGate.current.isCurrent(ticket)) {
+        busyRef.current = false;
+        setBusy(null);
+      }
     }
   }
+
+  useLayoutEffect(() => {
+    const gate = previewGate.current;
+    revisionKeyRef.current = revisionKey;
+    gate.invalidate();
+    busyRef.current = false;
+    artifact.current = null;
+    if (restoredSettings.error) onPreviewChange({ status: "blocked", message: restoredSettings.error });
+    else if (!reconstruction) onPreviewChange({ status: "stale", refresh: effectiveMode === "replacement_preview" ? () => void prepare() : undefined,
+      message: effectiveMode === "diagnostic" ? "Za aktualni prevedeni predogled izberite Končni prevedeni PDF. Diagnostični PDF je ločen izvoz." : undefined });
+    return () => { revisionKeyRef.current = ""; gate.invalidate(); onPreviewChange(null); };
+    // The revision encodes the complete job, OCR, mode, profile and selection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revisionKey, onPreviewChange]);
+  const refreshPreview = useEffectEvent(() => { void prepare(); });
+  const hasReconstruction = reconstruction !== null;
+  useEffect(() => {
+    if (effectiveMode !== "replacement_preview" || hasReconstruction || restoredSettings.error) return;
+    const timer = setTimeout(() => refreshPreview(), 600);
+    return () => clearTimeout(timer);
+  }, [revisionKey, effectiveMode, hasReconstruction, restoredSettings.error]);
 
   async function download() {
     if (busyRef.current) return;
@@ -152,6 +200,17 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
     setDiagnosticDownloadedRevisionKey(null);
     const requestRevision = revisionKey;
     try {
+      if (effectiveMode === "replacement_preview") {
+        const ready = artifact.current;
+        if (!ready || ready.revisionKey !== requestRevision) throw new Error("Najprej posodobite predogled trenutnega opravila in nastavitev.");
+        const url = URL.createObjectURL(ready.blob);
+        const anchor = document.createElement("a");
+        anchor.href = url; anchor.download = ready.filename; anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setAppliedReplacements(ready.applied);
+        setDownloadedRevisionKey(requestRevision);
+        return;
+      }
       const result = await downloadPdfExport(sourceFile, job, effectiveMode, effectiveProfile);
       validatePdfTypographyDownload(result, effectiveProfile, plan);
       const expectedReplacements = (plan?.summary.eligible ?? 0) + (plan?.ocr_summary.eligible_regions ?? 0);
@@ -189,23 +248,30 @@ export function PdfExportPanel({ sourceFile, job, analysis, ocrItems, simpleMode
       </div>
     </div>
     {effectiveMode !== "diagnostic" && <div className="translation-languages"><label>Oblikovanje PDF-ja
-      <select value={typographyProfile} onChange={(event) => setTypographyProfile(event.target.value as PdfTypographyProfile)}>
+      <select value={typographyProfile} onChange={(event) => onSettingsChange(createPdfExportSettings(analysis, event.target.value as PdfTypographyProfile, restoredSettings.selection))}>
         <option value="original">Ohrani izvorne sloge</option>
         <option value="document-role-typography-pilot-v1">Poenoti tipografske skupine</option>
       </select>
       {typographyProfile !== "original" && <small>Poenotenje lahko spremeni prileganje. Varno oblikovano izvorno besedilo ni prevedena vsebina.</small>}
     </label></div>}
     {effectiveMode !== "diagnostic" && tableChoices.length > 0 && <label className="reconstruction-choice">Rekonstruiraj tabelo
-      <select value={selectedTable ? reconstructionTable : ""} onChange={event => setReconstructionTable(event.target.value)}>
+      <select value={selectedTable ? reconstructionTable : ""} onChange={event => onSettingsChange(createPdfExportSettings(analysis, typographyProfile,
+        tableChoices.find(table => `${table.page_number}:${table.table_id}` === event.target.value) ?? null))}>
         <option value="">Brez rekonstrukcije — običajne zamenjave</option>
         {tableChoices.map(table => <option key={`${table.page_number}:${table.table_id}`} value={`${table.page_number}:${table.table_id}`}>Stran {table.page_number} · {table.rows} × {table.columns} · {table.table_id}</option>)}
       </select>
     </label>}
-    {reconstruction && <TableReconstructionPanel key={revisionKey} file={sourceFile} job={job} profile={effectiveProfile} selection={reconstruction} revision={revisionKey} onStateChange={setReconstructedState} />}
+    {restoredSettings.error && <p role="alert" className="translation-error">{restoredSettings.error}</p>}
+    {effectiveMode !== "diagnostic" && !reconstruction && tableChoices.length > 0 && <p className="translation-warning">
+      Rekonstrukcija ni izbrana. Običajni izvoz ohrani blokirane celice in lahko pusti tabelo delno prevedeno z različnimi slogi.
+      Za celovito tabelo jo izrecno izberite pri »Rekonstruiraj tabelo« in preglejte novi predogled; izbor ne potrdi prevodov.
+      {job.export_settings === undefined && <> Opravilo nima shranjenih izvoznih nastavitev; prejšnjega izbora ne ugibamo.</>}
+    </p>}
+    {reconstruction && !restoredSettings.error && <TableReconstructionPanel key={revisionKey} file={sourceFile} job={job} profile={effectiveProfile} selection={reconstruction} revision={revisionKey} onStateChange={setReconstructedState} onPreviewChange={onPreviewChange} />}
     {!reconstruction && <><div className="translation-actions">
-      {!plan && <button className="button" disabled={busy !== null || !job.document_identity} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi PDF"}</button>}
-      {plan && <button className="button" disabled={downloadCompleted || diagnosticDownloadCompleted || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : downloadCompleted ? "PDF je prenesen" : diagnosticDownloadCompleted ? "Diagnostični PDF je prenesen" : effectiveMode === "diagnostic" ? "Prenesi diagnostični PDF" : "Prenesi prevedeni PDF"}</button>}
-      {!simpleMode && plan && <button className="button secondary" disabled={busy !== null} onClick={() => void prepare()}>Znova preveri izvoz</button>}
+      {!plan && <button className="button" disabled={busy !== null || !job.document_identity || !!restoredSettings.error} onClick={() => void prepare()}>{busy === "plan" ? "Preverjam izvoz …" : "Pripravi PDF"}</button>}
+      {plan && <button className="button" disabled={downloadCompleted || diagnosticDownloadCompleted || plan.summary.eligible + plan.ocr_summary.eligible_regions === 0 || busy !== null || (effectiveMode === "replacement_preview" && artifactReady !== revisionKey)} onClick={() => void download()}>{busy === "download" ? "Pripravljam datoteko …" : downloadCompleted ? "PDF je prenesen" : diagnosticDownloadCompleted ? "Diagnostični PDF je prenesen" : effectiveMode === "diagnostic" ? "Prenesi diagnostični PDF" : "Prenesi prevedeni PDF"}</button>}
+      {plan && <button className="button secondary" disabled={busy !== null} onClick={() => void prepare()}>Posodobi predogled in načrt</button>}
     </div>
     <div className="translation-state-grid" aria-label="Stanje PDF izvoza">
       <span><strong>Izvoz</strong>{currentError ? "Neuspešno" : downloadCompleted ? "Uspešno" : plan ? (plan.summary.eligible + plan.ocr_summary.eligible_regions > 0 ? "Primerno za varen delni izvoz" : "Blokirano") : "Načrt ni pripravljen"}</span>

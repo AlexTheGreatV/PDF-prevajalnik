@@ -195,6 +195,7 @@ export type TranslationSegment = {
 
 export type TranslationJob = {
   schema_version: 10;
+  export_settings?: import("./pdf-export-settings").PdfExportSettings;
   source_filename: string;
   source_language: string;
   target_language: string;

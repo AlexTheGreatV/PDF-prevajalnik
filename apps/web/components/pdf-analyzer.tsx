@@ -11,6 +11,9 @@ import { ManualRegionSelector, type SelectionBox } from "./manual-region-selecto
 import { useOcrQueue } from "./use-ocr-queue";
 import { OcrReviewList, reasonLabel } from "./ocr-review-list";
 import { TranslationWorkspace } from "./translation-workspace";
+import { DocumentPdfPreview } from "./document-pdf-preview";
+import type { PdfPreviewState } from "../lib/pdf-preview";
+import { LocalEnvironmentSummary } from "./local-environment";
 import { recognizeBestVariant, cropImageToCanvas, ensureImageReady } from "../lib/ocr-canvas";
 import { analyzePdf, registerAndAcceptOcrSource, renderPdf } from "../lib/pdf-client";
 import type { PdfAnalysis, RenderResult, StructuredBlock } from "../lib/pdf-types";
@@ -58,6 +61,7 @@ export function PdfAnalyzer() {
   const [file, setFile] = useState<File | null>(null);
   const [analysis, setAnalysis] = useState<PdfAnalysis | null>(null);
   const [renderResult, setRenderResult] = useState<RenderResult | null>(null);
+  const [exportPreview, setExportPreview] = useState<PdfPreviewState | null>(null);
   const [state, setState] = useState<ProcessingState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -134,6 +138,7 @@ export function PdfAnalyzer() {
     selectionGeneration.current += 1;
     setPreparedSelection(null);
     setFile(nextFile);
+    setExportPreview(null);
     setAnalysis(null);
     setRenderResult(null);
     setVisibleBlocks({});
@@ -162,6 +167,7 @@ export function PdfAnalyzer() {
     }
 
     setState("analyzing");
+    setExportPreview(null);
     setError(null);
     setAnalysis(null);
     setRenderResult(null);
@@ -301,6 +307,7 @@ export function PdfAnalyzer() {
         <button className={workspaceMode === "simple" ? "active" : ""} aria-pressed={workspaceMode === "simple"} onClick={() => changeWorkspaceMode("simple")}>Enostavni način</button>
         <button className={workspaceMode === "advanced" ? "active" : ""} aria-pressed={workspaceMode === "advanced"} onClick={() => changeWorkspaceMode("advanced")}>Napredni način</button>
       </nav>
+      {workspaceMode === "advanced" && <LocalEnvironmentSummary />}
       <section
         className={`dropzone${isDragging ? " is-dragging" : ""}`}
         onDragOver={(event) => {
@@ -446,26 +453,9 @@ export function PdfAnalyzer() {
       {analysis?.document && file && (
         <div className="analysis-workbench">
           <div className="analysis-workbench-main">
-            <TranslationWorkspace key={analysis.sha256} analysis={analysis} ocrItems={ocrItems} sourceFile={file} mode={workspaceMode} missingTextPages={missingTextPages} onRestoreOcrItems={setOcrItems} />
+            <TranslationWorkspace key={analysis.sha256} analysis={analysis} ocrItems={ocrItems} sourceFile={file} mode={workspaceMode} missingTextPages={missingTextPages} onRestoreOcrItems={setOcrItems} onPreviewChange={setExportPreview} />
           </div>
-          <aside className="document-side-preview" aria-label="Predogled PDF dokumenta">
-            <h2>Predogled PDF</h2>
-            {analysis.pages.map((page) => {
-              const preview = renderPagesByNumber.get(page.page_number);
-              return preview ? (
-                <figure id={`pdf-preview-page-${page.page_number}`} key={page.page_number}>
-                  <figcaption>Stran {page.page_number}</figcaption>
-                  <Image
-                    src={preview.path}
-                    alt={`Predogled strani ${page.page_number}`}
-                    width={preview.width_px ?? 850}
-                    height={preview.height_px ?? 1100}
-                    unoptimized
-                  />
-                </figure>
-              ) : null;
-            })}
-          </aside>
+          <DocumentPdfPreview original={renderResult} current={exportPreview} />
         </div>
       )}
 

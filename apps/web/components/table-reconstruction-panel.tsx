@@ -4,10 +4,13 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TranslationJob } from "../lib/translation-types";
 import type { PdfTypographyProfile, PdfExportPlan } from "../lib/pdf-export-client";
 import { prepareReconstruction, downloadReconstruction, type ReconstructionPreview, type ReconstructionSelection } from "../lib/table-reconstruction";
+import { renderPdf } from "../lib/pdf-client";
+import { createPdfPreviewGate, type PdfPreviewState } from "../lib/pdf-preview";
 
-export function TableReconstructionPanel({ file, job, profile, selection, revision, onStateChange }: {
+export function TableReconstructionPanel({ file, job, profile, selection, revision, onStateChange, onPreviewChange }: {
   file: File; job: TranslationJob; profile: PdfTypographyProfile; selection: ReconstructionSelection; revision: string;
   onStateChange: (state: { revisionKey: string; value: { plan: PdfExportPlan | null; downloadCompleted: boolean; appliedReplacements: number } }) => void;
+  onPreviewChange: (state: PdfPreviewState | null) => void;
 }) {
   const [preview, setPreview] = useState<ReconstructionPreview | null>(null);
   const [busy, setBusy] = useState(false);
@@ -15,7 +18,23 @@ export function TableReconstructionPanel({ file, job, profile, selection, revisi
   const [downloaded, setDownloaded] = useState(false);
   const live = useRef(revision);
   const running = useRef(false);
-  useLayoutEffect(() => { live.current = revision; return () => { live.current = ""; }; }, [revision]);
+  const gate = useRef(createPdfPreviewGate());
+  const artifact = useRef<{ filename: string; blob: Blob } | null>(null);
+  useLayoutEffect(() => {
+    const currentGate = gate.current;
+    live.current = revision;
+    currentGate.invalidate();
+    artifact.current = null;
+    onPreviewChange({ status: "stale", refresh: () => void run(false) });
+    return () => { live.current = ""; currentGate.invalidate(); onPreviewChange(null); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revision, onPreviewChange]);
+  useEffect(() => {
+    const timer = setTimeout(() => { void run(false); }, 600);
+    return () => clearTimeout(timer);
+    // A new instance is keyed by the complete export revision.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revision]);
   useEffect(() => {
     onStateChange({ revisionKey: revision, value: { plan: preview?.ordinary_plan ?? null,
       downloadCompleted: downloaded, appliedReplacements: downloaded ? preview?.counts?.translated_units ?? 0 : 0 } });
@@ -26,9 +45,11 @@ export function TableReconstructionPanel({ file, job, profile, selection, revisi
     running.current = true;
     setBusy(true); setError(null); setDownloaded(false);
     const current = revision;
+    const ticket = gate.current.begin();
     try {
       if (download && preview?.ready) {
-        const result = await downloadReconstruction(file, job, profile, selection, preview);
+        const result = artifact.current;
+        if (!result) throw new Error("Najprej posodobite predogled rekonstrukcije.");
         if (live.current !== current) return;
         const url = URL.createObjectURL(result.blob);
         const anchor = document.createElement("a");
@@ -36,12 +57,25 @@ export function TableReconstructionPanel({ file, job, profile, selection, revisi
         setTimeout(() => URL.revokeObjectURL(url), 1000);
         setDownloaded(true);
       } else {
+        artifact.current = null;
+        onPreviewChange({ status: "updating" });
         setPreview(null);
         const value = await prepareReconstruction(file, job, profile, selection);
-        if (live.current === current) setPreview(value);
+        if (live.current !== current || !gate.current.isCurrent(ticket)) return;
+        setPreview(value);
+        if (!value.ready) {
+          onPreviewChange({ status: "blocked", message: value.issues.join(" "), refresh: () => void run(false) });
+          return;
+        }
+        const result = await downloadReconstruction(file, job, profile, selection, value);
+        const rendered = await renderPdf(new File([result.blob], result.filename, { type: "application/pdf" }));
+        if (live.current !== current || !gate.current.isCurrent(ticket)) return;
+        artifact.current = result;
+        onPreviewChange({ status: "ready", pages: rendered.pages, refresh: () => void run(false) });
       }
     } catch (caught) {
-      if (live.current === current) {
+      if (live.current === current && gate.current.isCurrent(ticket)) {
+        onPreviewChange({ status: "blocked", message: caught instanceof Error ? caught.message : "Rekonstrukcija ni uspela.", refresh: () => void run(false) });
         setError(caught instanceof Error ? caught.message : "Rekonstrukcija ni uspela.");
         // A download consumes its token even on failure. No stale success or retry with it.
         if (download) setPreview(null);
@@ -81,7 +115,7 @@ export function TableReconstructionPanel({ file, job, profile, selection, revisi
             {item.warnings.map(warning => <p key={warning}>{warning}</p>)}
           </div>)}
       </details>}
-      {preview.ready && <button className="button" disabled={busy || downloaded} onClick={() => void run(true)}>{downloaded ? "Delni PDF je prenesen" : "Prenesi prevedeni PDF z rekonstruirano tabelo"}</button>}
+      {preview.ready && <button className="button" disabled={busy || downloaded || !artifact.current} onClick={() => void run(true)}>{downloaded ? "Delni PDF je prenesen" : "Prenesi prevedeni PDF z rekonstruirano tabelo"}</button>}
       {downloaded && <p role="status">Preverjeni delni PDF je prenesen. Števci veljajo za izvedeni izvoz.</p>}
     </>}
     <p>To je delni dokument. Grafična glava, slikovni napisi in pravna noga niso samodejno prevedeni. Stari rastrski podatki lahko ostanejo v ohranjenih slikovnih resursih; to ni varnostna redakcija.</p>

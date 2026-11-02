@@ -1007,6 +1007,10 @@ export function bindTranslationJobToAnalysis(imported: TranslationJob, expected:
   };
 }
 
+export function hasUnresolvedOcrSources(job: TranslationJob): boolean {
+  return job.segments.some((segment) => segment.source_text_origin === "accepted_ocr" && !segment.accepted_ocr_source?.revision_id);
+}
+
 export function recoverTranslationJobForAnalysis(imported: TranslationJob, expected: TranslationJob, ocrItems: OcrReviewItem[]): TranslationJob {
   // Recovery is deliberately narrower than ordinary import: an authoritative native
   // block and a fresh OCR candidate must prove the same document, page and rectangle.

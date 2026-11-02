@@ -4,6 +4,7 @@ import type { BrowserOcrResult, OcrBBox } from "../lib/browser-ocr-provider";
 import type { PdfAnalysis, StructuredBlock, StructuredPage } from "../lib/pdf-types";
 import {
   acceptOcrResult,
+  nativeSourceReviewWarning,
   actionableWarningReasons,
   applyOcrSuggestion,
   browserResultToAttempt,
@@ -418,6 +419,20 @@ test("forbids external OCR runtime URLs", async () => {
     "https://unpkg.com/tesseract.js/dist/worker.min.js",
   ]);
   assert.deepEqual(external, ["https://unpkg.com/tesseract.js/dist/worker.min.js"]);
+});
+
+test("native source warnings use the current analysis candidate, not target wording or provider QC", () => {
+  const item = createOcrReviewItems(analysis())[0];
+  const source = { source_text_origin: "native" as const, source_bbox: item.pdf_bbox,
+    source_text: item.native_text, page_number: item.page_number, block_id: `p${item.page_number}-r1-b${item.linked_block_reading_order}` };
+  const before = JSON.stringify(source);
+  assert.match(nativeSourceReviewWarning(source, [item])!, /Sumljiv izvor/);
+  assert.equal(JSON.stringify(source), before);
+  assert.equal(nativeSourceReviewWarning({ ...source, source_text_origin: "accepted_ocr" }, [item]), null);
+  assert.equal(nativeSourceReviewWarning(source, []), null);
+  assert.equal(nativeSourceReviewWarning({ ...source, page_number: source.page_number + 1 }, [item]), null);
+  assert.equal(nativeSourceReviewWarning({ ...source, source_bbox: { ...item.pdf_bbox, x0: item.pdf_bbox.x0 + 1 } }, [item]), null);
+  assert.equal(nativeSourceReviewWarning({ ...source, source_text: "Different source" }, [item]), null);
 });
 
 void Promise.all(pendingTests).catch((error: unknown) => {

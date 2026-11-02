@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createPdfExportSettings, restorePdfExportSettings } from "../lib/pdf-export-settings";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { OcrReviewItem } from "../lib/ocr-review";
@@ -11,6 +12,7 @@ import {
   bindTranslationJobToAnalysis,
   recoverTranslationJobForAnalysis,
   restoreVerifiedOcrItems,
+  hasUnresolvedOcrSources,
   createTranslationJob,
   createTranslationChunks,
   editTranslation,
@@ -36,6 +38,45 @@ import { refreshTranslationProfileMetadata } from "../lib/translation-profile-ev
 import type { TranslationMemoryEntry } from "../lib/translation-memory";
 
 const tests: Promise<void>[] = [];
+test("JSON preserves explicit typography and table choice without persisting an authorization token or changing reviews", () => {
+  const analysis = fixture();
+  const table = analysis.document!.pages[0].regions[1].blocks.find(block => block.kind === "table")!;
+  table.table_provenance = {table_id: "synthetic-table", bbox: table.bbox, row_count: 2, column_count: 2,
+    geometry_evidence: "vector_grid", cells: [], warnings: []};
+  let job = createTranslationJob(analysis, [], {source_language: "en", target_language: "sl"});
+  // Synthetic fixture approval only; never an approval of a real user's text.
+  const reviewedId = job.segments.find(segment => segment.source_text === "Fast curing")!.segment_id;
+  job = updateTranslationJobSegment(job, reviewedId, segment => reviewTranslation(editTranslation(segment, "Hitro utrjevanje")));
+  const before = JSON.stringify(job.segments);
+  const settings = createPdfExportSettings(analysis, "document-role-typography-pilot-v1", {page_number: 1, table_id: "synthetic-table"});
+  const restored = importTranslationJob(exportTranslationJob({...job, export_settings: settings}));
+  assert.deepEqual(restored.export_settings, settings);
+  assert.equal(JSON.stringify(restored.segments), before);
+  assert.equal(restored.segments.find(segment => segment.segment_id === reviewedId)!.status, "reviewed");
+  assert.equal(restorePdfExportSettings(analysis, restored.export_settings).selection?.table_id, "synthetic-table");
+  assert.equal(restorePdfExportSettings(analysis, restored.export_settings).error, null);
+  assert.equal(JSON.stringify(settings).includes('"token"'), false);
+  assert.equal(restorePdfExportSettings(analysis, undefined).selection, null);
+});
+test("restored reconstruction fails closed for another PDF, model, page, table or geometry while preserving translations", () => {
+  const analysis = fixture();
+  const table = analysis.document!.pages[0].regions[1].blocks.find(block => block.kind === "table")!;
+  table.table_provenance = {table_id: "synthetic-table", bbox: table.bbox, row_count: 2, column_count: 2,
+    geometry_evidence: "vector_grid", cells: [], warnings: []};
+  const settings = createPdfExportSettings(analysis, "original", {page_number: 1, table_id: "synthetic-table"});
+  for (const changed of [{...analysis, sha256: "different"}, {...analysis, document_model_version: 999}]) {
+    assert.ok(restorePdfExportSettings(changed, settings).error);
+    assert.equal(restorePdfExportSettings(changed, settings).selection, null);
+  }
+  for (const selection of [{...settings.reconstruction!, page_number: 2}, {...settings.reconstruction!, table_id: "other"},
+    {...settings.reconstruction!, geometry_binding: "forged"}]) {
+    assert.ok(restorePdfExportSettings(analysis, {...settings, reconstruction: selection}).error);
+  }
+  const changed = structuredClone(analysis);
+  changed.document!.pages[0].regions[1].blocks.find(block => block.kind === "table")!.bbox.x1 += 1;
+  assert.ok(restorePdfExportSettings(changed, settings).error);
+  assert.ok(restorePdfExportSettings(analysis, {...settings, version: 99}).error);
+});
 test("closed vector row units have stable separate sources without shifting neighboring IDs", () => {
   const analysis=fixture();
   analysis.document_model_version=4;
@@ -1682,6 +1723,10 @@ test("server-verified unchanged OCR survives fresh analysis and JSON round trips
   assert.equal(after.status,"reviewed");
   assert.deepEqual(after.review_state,before.review_state);
   assert.deepEqual(after.accepted_ocr_source,before.accepted_ocr_source);
+  assert.equal(hasUnresolvedOcrSources(rebound),false);
+  const historicalWarning={...rebound,segments:rebound.segments.map(s=>({...s,warnings:[...s.warnings,"ocr_recovery_required"]}))};
+  assert.equal(hasUnresolvedOcrSources(historicalWarning),false);
+  assert.deepEqual(historicalWarning.segments.find(s=>s.segment_id===after.segment_id)!.review_state,before.review_state);
   assert.deepEqual(importTranslationJob(exportTranslationJob(rebound)).segments,rebound.segments);
   assert.deepEqual(invalidateStaleOcrApprovals(rebound,restored).segments,rebound.segments);
   const notReviewed=updateTranslationJobSegment(imported,before.segment_id,s=>editTranslation(s,"DRUGA UPORABA"));
@@ -1691,6 +1736,7 @@ test("server-verified unchanged OCR survives fresh analysis and JSON round trips
   assert.equal(edited.segments.find(s=>s.segment_id===after.segment_id)!.review_state,null);
   const unknown=restoreVerifiedOcrItems(imported,expected,[candidate],new Set());
   const rejected=recoverTranslationJobForAnalysis(imported,expected,unknown);
+  assert.equal(hasUnresolvedOcrSources(rejected),true);
   assert.equal(rejected.segments.find(s=>s.segment_id===after.segment_id)!.status,"translated");
   assert.throws(()=>restoreVerifiedOcrItems(imported,{...expected,document_identity:{...expected.document_identity!,sha256:"b".repeat(64)}},[candidate],new Set([accepted.server_revision_id!])));
   assert.throws(()=>restoreVerifiedOcrItems(imported,expected,[{...candidate,pdf_bbox:{...box,x0:box.x0+1}}],new Set([accepted.server_revision_id!])));

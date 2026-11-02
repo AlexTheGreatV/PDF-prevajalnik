@@ -32,6 +32,55 @@ No external AI services are called in this milestone. Documents stay local.
 
 ## Local Backend Setup
 
+### Persistent Local Acceptance Profile
+
+The named `fresh-user-test` profile uses existing, ignored glossary/TM databases under
+`local-data/profiles/fresh-user-test/`, not temporary review databases. It is a
+separate test collection; edits and usage are not merged into production.
+Before changing its data, back up the glossary, TM and durable OCR evidence together.
+With the API stopped, run:
+
+```powershell
+./.venv/Scripts/python.exe apps/api/scripts/local_test_data.py --backup
+./apps/api/scripts/start_local_test.ps1 -ConfigurationOnly
+```
+
+The backup command uses SQLite's backup API for each database and records paths,
+schema, integrity/FK checks and hashes in an ignored profile backup manifest.
+Each database snapshot is consistent, including WAL contents; stopping the API
+also prevents changes between the three snapshots. A missing OCR database is
+reported without creating one or importing evidence from another profile.
+Never copy an active WAL database as an ordinary file.
+
+After building the frontend, with ports 8000 and 3001 free, run from the root:
+
+```powershell
+./apps/api/scripts/start_local_test.ps1
+```
+
+The launcher uses the project `.venv`, the existing local HPLT CPU/INT8 model,
+and `next start`. It refuses missing databases/models and occupied ports; it
+does not download, create empty databases, stop other processes or overwrite
+jobs. `-ApiOnly` starts only the API when an existing frontend is retained.
+Advanced mode shows the actual database paths and profile reported by the API.
+The launcher pins all three paths, including `OCR_DATABASE_PATH`, to this profile
+independently of the working directory or inherited OCR environment setting.
+Retain the same profile and paths after restart. Never move OCR acceptances from
+a review profile into `fresh-user-test`; a legacy job without evidence in the
+selected profile needs explicit source review.
+
+For a fresh English technical sheet, explicitly select English, Slovenian and
+the `technical_datasheets` domain before preparing the translation. An empty
+domain intentionally excludes domain-specific TM entries. Imported jobs keep
+their own snapshots; editing a job does not teach the persistent glossary/TM.
+
+To return to production, stop these two explicitly identified test processes
+and start the usual local API with `LOCAL_DATA_PROFILE=production` and absolute
+`GLOSSARY_DATABASE_PATH` / `TRANSLATION_MEMORY_DATABASE_PATH` pointing at the
+two databases directly under `local-data/`. Do not merge or replace databases.
+Check Advanced mode before translating. Existing browser jobs are not updated
+by changing the running API or its collection.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -192,6 +241,20 @@ Services:
 - `POST /api/translation/providers/local/translate`
 
 Both PDF endpoints accept multipart form data with a `file` field. Render also accepts an optional `dpi` field.
+
+## Durable Local OCR Acceptance
+
+An explicit OCR source acceptance is stored in a separate local SQLite database.
+By default its path follows `GLOSSARY_DATABASE_PATH` and `LOCAL_DATA_PROFILE`;
+`OCR_DATABASE_PATH` can override the path, but records remain profile-scoped.
+Keep this database and its journals/backups out of Git. Registration tokens expire
+after 30 minutes, while an accepted source revision remains verifiable after token
+expiry and restart.
+Verification binds the server record to the PDF hash, page, exact region, text and
+revision. A JSON reference alone is not evidence, and legacy jobs without a durable
+record still require review. OCR acceptance never approves its translation.
+The local API and filesystem are trusted local components, not authenticated user
+identity services; no reviewer identity is inferred from a stored acceptance.
 
 ## Project Layout
 

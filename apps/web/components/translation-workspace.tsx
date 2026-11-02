@@ -3,12 +3,14 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { verifyImportedOcrSources } from "../lib/pdf-client";
 import type { OcrReviewItem } from "../lib/ocr-review";
+import { nativeSourceReviewWarning } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
 import { PdfExportPanel, type PdfExportUiState } from "./pdf-export-panel";
 import {
   recoverTranslationJobForAnalysis,
   restoreVerifiedOcrItems,
+  hasUnresolvedOcrSources,
   createTranslationJob,
   editTranslation,
   exportTranslationJob,
@@ -43,6 +45,7 @@ import { TranslationMemoryManager, type TranslationMemoryProposal } from "./tran
 import { isTranslationUnitSegment } from "../lib/translation-units";
 import { determineGuidedStep, type WorkspaceMode } from "../lib/guided-workflow";
 import { GuidedTranslationReview } from "./guided-translation-review";
+import type { PdfPreviewState } from "../lib/pdf-preview";
 
 type TranslationFilter = "all" | Exclude<TranslationStatus, "translating">;
 const FILTERS: TranslationFilter[] = ["all", "pending", "translated", "reviewed", "failed", "skipped"];
@@ -50,13 +53,14 @@ const FILTER_LABELS: Record<(typeof FILTERS)[number], string> = {
   all: "Vsi", pending: "Čakajo", translated: "Prevedeni", reviewed: "Potrjeni", failed: "Napake", skipped: "Preskočeni",
 };
 
-export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, missingTextPages, onRestoreOcrItems }: {
+export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, missingTextPages, onRestoreOcrItems, onPreviewChange }: {
   analysis: PdfAnalysis;
   ocrItems: OcrReviewItem[];
   sourceFile: File;
   mode: WorkspaceMode;
   missingTextPages: number;
   onRestoreOcrItems: (items: OcrReviewItem[]) => void;
+  onPreviewChange: (state: PdfPreviewState | null) => void;
 }) {
   const importGeneration = useRef(0);
   useLayoutEffect(() => { importGeneration.current += 1; return () => { importGeneration.current += 1; }; }, [analysis, ocrItems, sourceFile]);
@@ -251,7 +255,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
       setSourceLanguage(imported.source_language);
       setTargetLanguage(imported.target_language);
       setTranslationDomain(imported.domain);
-      setMessage(compatible.segments.some((segment) => segment.warnings.includes("ocr_recovery_required"))
+      setMessage(hasUnresolvedOcrSources(compatible)
         ? "Opravilo je obnovljeno. Zastareli OCR zahteva ponovni pregled izreza in potrditev; drugi prevodi so ohranjeni."
         : "Prevajalsko opravilo je bilo uspešno uvoženo.");
     } catch (error) {
@@ -358,6 +362,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
           {isTranslationMemorySnapshotStale(job, translationMemoryHash) && <p className="translation-warning">Prevajalski spomin je bil po pripravi opravila spremenjen. Odprti prevodi ostajajo nespremenjeni; nov posnetek se uporabi šele ob izrecni ponovni pripravi.</p>}
           {mode === "simple" && guidedSegment && <GuidedTranslationReview
             segment={guidedSegment}
+            sourceWarning={nativeSourceReviewWarning(guidedSegment, ocrItems)}
             position={guidedReviewIndex % reviewableSegments.length + 1}
             total={reviewableSegments.length}
             onEdit={(text) => updateSegment(guidedSegment.segment_id, (current) => editTranslation(current, text))}
@@ -371,10 +376,12 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
             ocrItems={ocrItems}
             simpleMode={mode === "simple"}
             onStateChange={setExportState}
+            onPreviewChange={onPreviewChange}
+            onSettingsChange={(settings) => setJob(current => current ? { ...current, export_settings: settings } : current)}
             onNavigateSegment={(id) => { setFilter("all"); setQcFocusId(id); document.getElementById(`translation-${id}`)?.focus(); }}
           />}
           {mode === "simple" && qcFocusId && job.segments.filter((segment) => segment.segment_id === qcFocusId).map((segment) => <TranslationSegmentRow
-            key={segment.segment_id} segment={segment}
+              key={segment.segment_id} segment={segment} sourceWarning={nativeSourceReviewWarning(segment, ocrItems)}
             onEdit={(text) => updateSegment(segment.segment_id, (current) => editTranslation(current, text))}
             onReview={() => updateSegment(segment.segment_id, reviewTranslation)}
             onReset={() => updateSegment(segment.segment_id, resetTranslation)}
@@ -387,7 +394,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
           </div>
           <div className="translation-segments advanced-only">
             {visibleSegments.map((segment) => (
-              <TranslationSegmentRow key={segment.segment_id} segment={segment}
+                <TranslationSegmentRow key={segment.segment_id} segment={segment} sourceWarning={nativeSourceReviewWarning(segment, ocrItems)}
                 onEdit={(text) => updateSegment(segment.segment_id, (current) => editTranslation(current, text))}
                 onReview={() => updateSegment(segment.segment_id, reviewTranslation)}
                 onReset={() => updateSegment(segment.segment_id, resetTranslation)}
@@ -403,7 +410,8 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
   );
 }
 
-function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, onPropose, onProposeMemory }: {
+function TranslationSegmentRow({ segment, sourceWarning, onEdit, onReview, onReset, onRetry, onPropose, onProposeMemory }: {
+  sourceWarning?: string | null;
   segment: TranslationSegment; onEdit: (text: string) => void; onReview: () => void; onReset: () => void; onRetry: () => void; onPropose: () => void; onProposeMemory: () => void;
 }) {
   return (
@@ -427,6 +435,7 @@ function TranslationSegmentRow({ segment, onEdit, onReview, onReset, onRetry, on
       {segment.translation_memory_entry_id && <div className="translation-origin">Prevajalski spomin: {segment.translation_memory_entry_id} · rev. {segment.translation_memory_revision} · exact</div>}
       {segment.model_id && <div className="translation-origin">Model: {segment.model_id}</div>}
       {segment.needs_review && <p className="translation-warning">Potreben je ročni pregled.</p>}
+      {sourceWarning && <p className="translation-warning" role="note">{sourceWarning} <a href="#ocr-review">Preglej OCR območje</a></p>}
       {segment.source_text_origin === "accepted_ocr" && !segment.accepted_ocr_source?.revision_id && <p className="translation-warning">Prevod je shranjen, vendar OCR-povezava ni potrjena. <a href="#ocr-review-list">Preglej izvorni izrez in ponovno potrdi OCR</a>. Nato ločeno potrdi prevod te različice.</p>}
       {segment.current_qc?.findings.map((finding, index) => <p className={finding.severity === "blocking" ? "translation-error" : "translation-warning"} key={`${finding.code}-${finding.glossary_entry_id ?? index}`}>{finding.message}</p>)}
       {(segment.warnings.length > 0 || segment.placeholder_attempts.length > 0) && <details className="translation-history">

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createPdfPreviewGate } from "../lib/pdf-preview";
 
 import { calculateDocumentCoverage, createCoverageRevisionKey } from "../lib/document-coverage";
 import {
@@ -21,6 +22,35 @@ import { editTranslation, reviewTranslation, updateTranslationJobSegment } from 
 import { reconstructionRevision, validateReconstructionCounts, validateReconstructionDownload, type ReconstructionPreview } from "../lib/table-reconstruction";
 
 const tests: Promise<void>[] = [];
+test("preview rejects late successes and failures, including A -> B -> A and repeated requests", async () => {
+  const gate = createPdfPreviewGate();
+  const old = gate.begin();
+  gate.invalidate(); // Translation, approval, OCR, profile or reconstruction changed.
+  assert.equal(gate.isCurrent(old), false);
+  const latest = gate.begin();
+  await Promise.resolve();
+  assert.equal(gate.isCurrent(old), false);
+  assert.equal(gate.isCurrent(latest), true);
+  const repeat = gate.begin();
+  assert.equal(gate.isCurrent(latest), false);
+  assert.equal(gate.isCurrent(repeat), true);
+  gate.invalidate(); // Component unmounted or source PDF changed.
+  assert.equal(gate.isCurrent(repeat), false);
+});
+test("preview revision invalidation includes source, translation, review, OCR and both export settings", () => {
+  const base = { analysis: { sha256: "pdf-a" } as PdfAnalysis, job: { segments: [] } as unknown as TranslationJob,
+    ocrItems: [] as OcrReviewItem[], mode: "replacement_preview" };
+  const key = (input: typeof base, profile: "original" | "document-role-typography-pilot-v1" = "original", table: string | null = null) =>
+    reconstructionRevision(pdfTypographyRevisionKey(createCoverageRevisionKey(input), profile), table ? {page_number: 1, table_id: table} : null);
+  const original = key(base);
+  for (const changed of [
+    key({...base, analysis: {...base.analysis, sha256: "pdf-b"}}),
+    key({...base, job: {...base.job, segments: [{edited_translation: "new"}] } as TranslationJob}),
+    key({...base, job: {...base.job, segments: [{status: "reviewed"}] } as TranslationJob}),
+    key({...base, ocrItems: [{id: "ocr", server_revision_id: "new"}] as OcrReviewItem[]}),
+    key(base, "document-role-typography-pilot-v1"), key(base, "original", "table-a"),
+  ]) assert.equal(currentRevisionValue({revisionKey: original, value: "old PDF"}, changed), null);
+});
 test("reconstruction selection and content revisions reject late results without changing approvals", () => {
   const selected = {page_number: 1, table_id: "table-a"};
   const original = reconstructionRevision("content-and-profile-a", selected);
