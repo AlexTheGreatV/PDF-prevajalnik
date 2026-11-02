@@ -25,7 +25,7 @@ Allowed:
 - Cell-level export for reliable digital tables with source matching, fit preflight, and partial-export diagnostics
 - Selective export of explicitly accepted OCR regions after separate translation review, immutable PDF identity checks, and uniform-background preflight
 - Versioned provider-independent Slovenian translation rules with explicit automation limits, source hashes, rule provenance, and manual quality checks
-- OCR review revisions are held for 30 minutes in one API process. They are intentionally lost on restart, are not shared between workers, and a missing record must block export rather than trust client data.
+- Pending OCR registrations expire after 30 minutes in one API process. Only explicit source acceptance persists the same revision UUID in the profile-scoped local SQLite OCR acceptance repository, with actual UTC acceptance metadata. Accepted references survive registration expiry and restart, but JSON alone is never evidence. Validate the persistent current revision, profile, PDF hash, page, exact bbox/text, review ID, source and reason on verification/export; unavailable storage must fail closed. Never migrate legacy in-memory acceptance automatically, invent a reviewer, or treat source acceptance as translation approval. A new pending registration does not supersede an accepted reference until explicitly accepted. Keep OCR databases, journals, WAL/SHM files and backups out of Git.
 
 Guardrails:
 

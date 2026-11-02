@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import tempfile
 from typing import Any, Literal
 
@@ -12,6 +13,7 @@ PROJECT_ROOT = API_ROOT.parents[1] if API_ROOT.name == "api" and API_ROOT.parent
 
 class Settings(BaseSettings):
     app_env: str = "local"
+    local_data_profile: str = "default"
     cors_origins: list[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
@@ -30,6 +32,16 @@ class Settings(BaseSettings):
     local_translation_compute_type: str = "int8"
     glossary_database_path: Path = Path("local-data/glossary.sqlite3")
     translation_memory_database_path: Path = Path("local-data/translation-memory.sqlite3")
+    ocr_database_path: Path | None = None
+
+    @property
+    def resolved_ocr_database_path(self) -> Path:
+        if self.ocr_database_path is not None:
+            value = self.ocr_database_path
+            return value if value.is_absolute() else (PROJECT_ROOT / value).resolve()
+        # The SQL namespace also isolates profiles when an explicit path is shared.
+        profile = hashlib.sha256(self.local_data_profile.encode("utf-8")).hexdigest()[:16]
+        return self.glossary_database_path.with_name(f"{self.glossary_database_path.stem}-ocr-acceptance-{profile}.sqlite3")
 
     @property
     def max_pdf_export_request_bytes(self) -> int:

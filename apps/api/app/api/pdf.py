@@ -1,4 +1,5 @@
 import json
+import math
 import shutil
 import time
 import uuid
@@ -29,6 +30,7 @@ from app.services.pdf_renderer import render_pdf_pages_as_data_urls
 from app.services.pdf_exporter import ExportArtifact, PdfExportValidationError, export_translated_pdf, plan_pdf_export
 from app.services.pdf_document_typography import export_document_typography_pilot
 from app.services.ocr_review_registry import OCR_REVIEW_TTL_SECONDS, document_sha256, ocr_review_registry
+from app.services.ocr_acceptance_repository import OcrAcceptanceStorageError
 from app.services.pdf_table_reconstruction import TableReconstructionError
 from app.services.pdf_reconstruction_export import (
     ReconstructionRequest, prepare_reconstruction_export, download_reconstruction_export,
@@ -37,6 +39,10 @@ from app.services.pdf_reconstruction_export import (
 router = APIRouter()
 PDF_MAGIC = b"%PDF-"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def _ocr_storage_unavailable(exc: OcrAcceptanceStorageError) -> HTTPException:
+    return HTTPException(status_code=503, detail={"code": "ocr_storage_unavailable", "message": str(exc)})
 
 
 @router.post("/export-translated/reconstruction/preview")
@@ -70,6 +76,8 @@ async def _reconstruction_request(request: Request, *, download: bool):
                     "X-PDF-Reconstruction-Token": selection.token,
                     "X-PDF-Reconstruction-Counts": json.dumps(counts, separators=(",", ":")),
                 })
+    except OcrAcceptanceStorageError as exc:
+        raise _ocr_storage_unavailable(exc) from exc
     except (TableReconstructionError, PdfExportValidationError) as exc:
         raise HTTPException(status_code=400, detail={"code": getattr(exc, "code", "table_reconstruction"),
             "message": str(exc), **getattr(exc, "details", {})}) from exc
@@ -91,7 +99,7 @@ async def register_ocr_review_source(file: UploadFile = File(...), source: str =
                     raise HTTPException(status_code=400, detail="OCR območje kaže na neobstoječo stran.")
                 page = document[candidate.page_number - 1]
                 rect = pymupdf.Rect(candidate.bbox.x0, candidate.bbox.y0, candidate.bbox.x1, candidate.bbox.y1)
-                if rect.is_empty or rect.is_infinite or not page.rect.contains(rect):
+                if not all(math.isfinite(value) for value in candidate.bbox.model_dump().values()) or rect.is_empty or rect.is_infinite or not page.rect.contains(rect):
                     raise HTTPException(status_code=400, detail="OCR območje ni znotraj preverjene strani PDF-ja.")
         except HTTPException:
             raise
@@ -113,7 +121,10 @@ async def register_ocr_review_source(file: UploadFile = File(...), source: str =
 
 @router.post("/ocr-review/accept", response_model=OcrReviewRegistrationResult)
 def accept_ocr_review_source(request: OcrReviewAcceptance) -> OcrReviewRegistrationResult:
-    revision = ocr_review_registry.accept(request.revision_id)
+    try:
+        revision = ocr_review_registry.accept(request.revision_id)
+    except OcrAcceptanceStorageError as exc:
+        raise _ocr_storage_unavailable(exc) from exc
     if revision is None:
         raise HTTPException(status_code=409, detail="OCR revizija ne obstaja več ali ni aktualna.")
     return OcrReviewRegistrationResult(
@@ -134,8 +145,11 @@ async def verify_ocr_review_sources(file: UploadFile = File(...), sources: str =
         sha = document_sha256(path.read_bytes())
         results = []
         for candidate in candidates.sources:
-            reason = ocr_review_registry.validate(document_sha256=sha,
-                **candidate.model_dump(exclude={"bbox"}), bbox=candidate.bbox)
+            try:
+                reason = ocr_review_registry.validate(document_sha256=sha,
+                    **candidate.model_dump(exclude={"bbox"}), bbox=candidate.bbox)
+            except OcrAcceptanceStorageError as exc:
+                raise _ocr_storage_unavailable(exc) from exc
             results.append({"revision_id": candidate.revision_id, "valid": reason is None, "reason": reason})
         return {"sources": results}
 
@@ -208,6 +222,8 @@ async def plan_translated_export(
                         raise PdfExportValidationError("typography_mode", "Poenotena tipografija zahteva končni način izvoza.")
                     return export_document_typography_pilot(path, job, temp_path, plan_only=True).translation_plan
                 return plan_pdf_export(path, job, mode, temp_path)
+            except OcrAcceptanceStorageError as exc:
+                raise _ocr_storage_unavailable(exc) from exc
             except PdfExportValidationError as exc:
                 raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc), **exc.details}) from exc
             except Exception as exc:
@@ -232,6 +248,8 @@ async def translated_export(
                 else:
                     artifact = export_translated_pdf(path, job, mode, temp_path)
                 content = artifact.path.read_bytes()
+            except OcrAcceptanceStorageError as exc:
+                raise _ocr_storage_unavailable(exc) from exc
             except PdfExportValidationError as exc:
                 raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc), **exc.details}) from exc
             except Exception as exc:
