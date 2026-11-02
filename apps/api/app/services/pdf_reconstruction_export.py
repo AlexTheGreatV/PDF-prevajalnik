@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import secrets
@@ -114,18 +115,65 @@ def _outside_job(job: PdfExportJob, plan: TableReconstructionPlan) -> PdfExportJ
     for segment in outside.segments:
         if (segment.page_number == plan.selection.page_number and segment.source_bbox
                 and not (exporter._rect(segment.source_bbox) & region).is_empty):
-            raise TableReconstructionError("ordinary_source_intersects_reconstruction")
+            raise TableReconstructionError(f"ordinary_source_intersects_reconstruction:{segment.segment_id}")
     return outside
 
 
-def _assert_outside(plan: PdfExportPlan, reconstruction: TableReconstructionPlan, formatting=()):
+def _reserved_region_unchanged(source: Path | None, base_pdf: Path | None, reconstruction: TableReconstructionPlan) -> bool:
+    """Prove that a saved ordinary export left the complete reserved region intact."""
+    if source is None or base_pdf is None:
+        return False
     region = exporter._rect(reconstruction.replacement_region)
+    try:
+        if exporter._sha256(source) != reconstruction.selection.source_sha256:
+            return False
+        with pymupdf.open(source) as before, pymupdf.open(base_pdf) as after:
+            number = reconstruction.selection.page_number - 1
+            if len(before) != len(after) or not 0 <= number < len(before):
+                return False
+            left, right = before[number], after[number]
+            if (region.is_empty or region.is_infinite or region.width * region.height * 4 > 4_000_000
+                    or not left.rect.contains(region)):
+                return False
+            for attribute in ("rect", "mediabox", "cropbox", "rotation", "transformation_matrix",
+                              "rotation_matrix", "derotation_matrix"):
+                if getattr(left, attribute) != getattr(right, attribute):
+                    return False
+
+            def characters(page):
+                # Inspect whole-page character boxes, including boundary-crossing
+                # and invisible text that a clipped extraction or raster can miss.
+                return Counter((char["c"], tuple(char["origin"]), tuple(char["bbox"]))
+                    for block in page.get_text("rawdict").get("blocks", [])
+                    for line in block.get("lines", []) for span in line.get("spans", [])
+                    for char in span.get("chars", []) if char["c"].strip()
+                    and not (pymupdf.Rect(char["bbox"]) & region).is_empty)
+
+            if characters(left) != characters(right):
+                return False
+            a = left.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=region, alpha=False)
+            b = right.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=region, alpha=False)
+            return (a.irect == b.irect and a.n == b.n and a.samples == b.samples)
+    except (OSError, RuntimeError, ValueError, IndexError):
+        return False
+
+
+def _assert_outside(plan: PdfExportPlan, reconstruction: TableReconstructionPlan, formatting=(),
+                    *, source: Path | None = None, base_pdf: Path | None = None):
+    region = exporter._rect(reconstruction.replacement_region)
+    layout_intersections = []
     for item in [*plan.replacements, *plan.ocr_replacements, *formatting]:
         if not item.eligible or item.page_number != reconstruction.selection.page_number:
             continue
-        boxes = [item.original_bbox, item.fitted_bbox, *item.redaction_rects, *item.patch_rects]
+        if item.original_bbox is None or item.fitted_bbox is None:
+            raise TableReconstructionError(f"ordinary_write_intersects_reconstruction:{item.segment_id}")
+        boxes = [item.original_bbox, *item.redaction_rects, *item.patch_rects]
         if any(box and not (exporter._rect(box) & region).is_empty for box in boxes):
-            raise TableReconstructionError("ordinary_write_intersects_reconstruction")
+            raise TableReconstructionError(f"ordinary_write_intersects_reconstruction:{item.segment_id}")
+        if item.fitted_bbox and not (exporter._rect(item.fitted_bbox) & region).is_empty:
+            layout_intersections.append(item.segment_id)
+    if layout_intersections and not _reserved_region_unchanged(source, base_pdf, reconstruction):
+        raise TableReconstructionError(f"ordinary_write_intersects_reconstruction:{','.join(layout_intersections)}")
 
 
 def prepare_reconstruction_export(source: Path, job: PdfExportJob, request: ReconstructionRequest, work: Path) -> dict:
@@ -166,11 +214,11 @@ def prepare_reconstruction_export(source: Path, job: PdfExportJob, request: Reco
     if job.typography_profile == "original":
         base = exporter.export_translated_pdf(source, outside, "replacement_preview", work / "ordinary")
         ordinary = base.plan
-        _assert_outside(ordinary, initial)
+        _assert_outside(ordinary, initial, source=source, base_pdf=base.path)
     else:
         base = export_document_typography_pilot(source, outside, work / "ordinary")
         ordinary = base.translation_plan
-        _assert_outside(ordinary, initial, base.source_formatting)
+        _assert_outside(ordinary, initial, base.source_formatting, source=source, base_pdf=base.path)
     selection = selection.model_copy(update={"base_pdf_sha256": exporter._sha256(base.path)})
     plan = plan_table_reconstruction(source, base.path, job, selection, work / "reconstruction")
     result = export_table_reconstruction(source, base.path, job, plan, work / "reconstruction")

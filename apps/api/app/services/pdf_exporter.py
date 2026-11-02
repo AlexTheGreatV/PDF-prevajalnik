@@ -1803,7 +1803,9 @@ def _single_rendered_line_geometry(
     with pymupdf.open() as scratch:
         page = scratch.new_page(width=page_rect.width, height=page_rect.height)
         spare, scale = page.insert_htmlbox(rect, html_text, css=css, scale_low=0.0, archive=typography.archive)
-        if spare < 0 or replacement.scale is None or not _scale_meets_floor(scale, replacement.scale):
+        # HTML preflight and the final writer can converge on slightly different
+        # scales. Measure the writer's actual baseline using its accepted floor.
+        if spare < 0 or replacement.scale is None or not _scale_meets_floor(scale, _accepted_writer_scale_floor(replacement)):
             return None
         lines = [
             line

@@ -739,6 +739,70 @@ def test_multiline_style_and_safe_expansion_do_not_cross_neighbor(tmp_path: Path
     assert multiline_plan.replacements[0].original_line_count == 2
 
 
+@pytest.mark.parametrize("row_gap", [18.96, 20.0])
+def test_standalone_rows_preserve_baselines_and_neighbor_graphics(tmp_path: Path, row_gap: float) -> None:
+    source = tmp_path / "standalone-rows.pdf"
+    labels = ("Black", "White", "Beige", "Brown", "Grey")
+    targets = ("Črna", "Bela", "Bež", "Rjava", "Siva")
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=220)
+        for index, label in enumerate(labels):
+            page.insert_text((40, 70 + index * row_gap), label, fontsize=8.52)
+        page.draw_rect((130, 60, 150, 165), color=None, fill=(0.3, 0.5, 0.7))
+        document.save(source)
+    before = _hash(source)
+    payload = _job_payload(source, labels[0], targets[0])
+    payload["segments"] = []
+    for index, (label, target) in enumerate(zip(labels, targets)):
+        segment = _job_payload(source, label, target)["segments"][0]
+        segment.update(segment_id=f"row-{index}", block_id=f"block-{index}", source_style=None)
+        payload["segments"].append(segment)
+    artifact = export_translated_pdf(
+        source, PdfExportJob.model_validate(payload), "replacement_preview", _work(tmp_path, "rows"),
+    )
+    assert artifact.applied_replacements == len(labels)
+    assert _hash(source) == before
+    with pymupdf.open(source) as original, pymupdf.open(artifact.path) as output:
+        for item, label, target in zip(artifact.plan.replacements, labels, targets):
+            native = pdf_exporter._single_source_line_geometry(original[0], original[0].search_for(label)[0])
+            written = pdf_exporter._single_source_line_geometry(output[0], output[0].search_for(target)[0])
+            assert written.baseline_y == pytest.approx(native.baseline_y, abs=0.01)
+            assert label not in output[0].get_text()
+            assert item.block_type == "paragraph"
+        assert [{k: v for k, v in drawing.items() if k != "seqno"} for drawing in original[0].get_drawings()] == [
+            {k: v for k, v in drawing.items() if k != "seqno"} for drawing in output[0].get_drawings()
+        ]
+        clip = pymupdf.Rect(129, 59, 151, 166)
+        assert original[0].get_pixmap(clip=clip).samples == output[0].get_pixmap(clip=clip).samples
+
+
+@pytest.mark.parametrize("height, accepted", [(17.686798095703125, True), (10.0, False)])
+def test_baseline_measurement_uses_actual_writer_floor(tmp_path: Path, height: float, accepted: bool) -> None:
+    source = tmp_path / "writer-scale.pdf"
+    _make_pdf(source, source_text="Label")
+    work = _work(tmp_path, "measurement")
+    typography = PdfTypographyResolver(work)
+    with pymupdf.open(source) as document:
+        page = document[0]
+        segment = PdfExportSegment.model_validate(_job_payload(source, "Label", "Oznaka")["segments"][0])
+        item = pdf_exporter._plan_segment(document, segment, typography, pdf_exporter.PdfImageOverlapAnalyzer())
+        item.requested_font_size = item.typography.font_size = 8.52
+        asset = pdf_exporter._asset_for(item, typography)
+        rect = pymupdf.Rect(40, 40, 101.45111083984375, 40 + height)
+        result = pdf_exporter._htmlbox_preflight(page.rect, rect, item, typography, asset, 0.75 if accepted else 0.0)
+        pdf_exporter._accept_fit(item, rect, result, "scaled")
+        geometry = pdf_exporter._single_rendered_line_geometry(page.rect, rect, item, typography, asset)
+        assert (geometry is not None) is accepted
+        if accepted:
+            html, css = typography.html_and_css(item.translated_text, item.typography, asset)
+            with pymupdf.open() as scratch:
+                writer = scratch.new_page(width=page.rect.width, height=page.rect.height)
+                _, scale = writer.insert_htmlbox(rect, html, css=css, scale_low=0.0, archive=typography.archive)
+                assert pdf_exporter._minimum_text_scale(item) <= scale < item.scale - 1e-9
+                written = pdf_exporter._single_source_line_geometry(writer, rect)
+                assert geometry.baseline_y == pytest.approx(written.baseline_y, abs=0.01)
+
+
 def test_single_line_expansion_keeps_source_baseline_clear_of_vector_rule(tmp_path: Path) -> None:
     source = tmp_path / "ruled-row.pdf"
     source_text = "Pieces per pallet"

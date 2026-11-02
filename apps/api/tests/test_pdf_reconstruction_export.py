@@ -11,6 +11,12 @@ from app.models import BBox
 from app.pdf_export_models import PdfExportSegment, AcceptedOcrSource
 from app.services.ocr_review_registry import ocr_review_registry
 from app.services.pdf_reconstruction_export import reconstruction_previews
+from app.services import pdf_exporter as exporter
+from app.services.pdf_reconstruction_export import _assert_outside, _outside_job
+from app.services.pdf_table_reconstruction import (
+    TableReconstructionError, TableReconstructionSelection, inspect_reconstruction_table, plan_table_reconstruction,
+)
+from app.services.pdf_typography import PdfTypographyResolver
 from test_pdf_table_reconstruction import fixture
 
 
@@ -118,7 +124,75 @@ def test_alias_cannot_write_selected_content_through_ordinary_path(tmp_path: Pat
     alias.table_cell_provenance = None
     job.segments.append(alias)
     response = post(source, job, selection)
-    assert response.status_code == 400 and "ordinary_source_intersects_reconstruction" in response.text
+    assert response.status_code == 400 and "ordinary_source_intersects_reconstruction:alias" in response.text
+
+
+def _blank_layout_overlap(tmp_path: Path):
+    source, job, _ = setup(tmp_path)
+    table_id = job.segments[0].table_cell_provenance.table_id
+    inventory = inspect_reconstruction_table(source, 1, table_id)
+    selection = TableReconstructionSelection(enabled=True, source_sha256=inventory["source_sha256"],
+        base_pdf_sha256=inventory["source_sha256"], page_number=1, table_id=table_id,
+        inventory_sha256=inventory["inventory_sha256"])
+    initial = plan_table_reconstruction(source, source, job, selection, tmp_path / "initial")
+    work = tmp_path / "ordinary"
+    ordinary = exporter.plan_pdf_export(source, _outside_job(job, initial), "replacement_preview", work)
+    item = next(r for r in ordinary.replacements if r.segment_id == "outside")
+    # A right-aligned caption: the box overlaps the table's right edge, while
+    # the actual writer puts every glyph well to the right of the selection.
+    item.alignment = item.typography.alignment = "right"
+    exporter._accept_fit(item, pymupdf.Rect(270, 45, 590, 85), (0, 1, 1), "exact")
+    base = tmp_path / "ordinary.pdf"
+    with pymupdf.open(source) as document:
+        assert exporter._write_replacements(document, ordinary, PdfTypographyResolver(work)) == 1
+        document.save(base)
+    exporter._verify_inserted_text(base, ordinary)
+    return source, base, ordinary, initial, item
+
+
+def test_blank_layout_overlap_requires_unchanged_saved_region(tmp_path: Path):
+    source, base, ordinary, initial, item = _blank_layout_overlap(tmp_path)
+    region = exporter._rect(initial.replacement_region)
+    assert not (exporter._rect(item.fitted_bbox) & region).is_empty
+    with pymupdf.open(source) as document:
+        glyphs = exporter._replacement_glyph_rects(document[0], item, PdfTypographyResolver(tmp_path / "ordinary"))
+        assert glyphs and all((g & region).is_empty for g in glyphs)
+    _assert_outside(ordinary, initial, source=source, base_pdf=base)
+
+
+@pytest.mark.parametrize("damage", ["original", "patch", "redaction", "missing_bbox", "missing_source",
+    "missing_base", "unreadable_base", "glyph", "invisible_glyph", "pixels", "matrix"])
+def test_layout_overlap_blocks_real_writes_and_missing_proof(tmp_path: Path, damage: str):
+    source, base, ordinary, initial, item = _blank_layout_overlap(tmp_path)
+    hit = BBox(x0=30, y0=60, x1=40, y1=70)
+    if damage == "original":
+        item.original_bbox = hit
+    elif damage == "patch":
+        item.patch_rects.append(hit)
+    elif damage == "redaction":
+        item.redaction_rects.append(hit)
+    elif damage == "missing_bbox":
+        item.fitted_bbox = None
+    elif damage == "missing_source":
+        source = None
+    elif damage == "missing_base":
+        base = None
+    elif damage == "unreadable_base":
+        base = tmp_path / "absent.pdf"
+    else:
+        changed = tmp_path / "changed.pdf"
+        with pymupdf.open(base) as document:
+            if damage in {"glyph", "invisible_glyph"}:
+                document[0].insert_text((30, 80), "intrusion", fontsize=9,
+                                        render_mode=3 if damage == "invisible_glyph" else 0)
+            elif damage == "pixels":
+                document[0].draw_rect((30, 75, 45, 80), color=None, fill=(1, 0, 0))
+            else:
+                document[0].set_rotation(180)
+            document.save(changed)
+        base = changed
+    with pytest.raises(TableReconstructionError, match="ordinary_write_intersects_reconstruction:outside"):
+        _assert_outside(ordinary, initial, source=source, base_pdf=base)
 
 
 @pytest.mark.parametrize("expires", [False, True])
