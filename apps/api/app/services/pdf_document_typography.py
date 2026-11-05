@@ -17,7 +17,7 @@ from app.services.pdf_image_overlap import PdfImageOverlapAnalyzer
 from app.services.pdf_typography import PdfTypographyResolver
 
 PROFILE_VERSION = "document-role-typography-pilot-v1"
-PROFILE_LAYOUT_REVISION = "source-style-heading-label-groups-v9"
+PROFILE_LAYOUT_REVISION = "source-style-heading-label-groups-v10"
 
 
 class DocumentTypographyResolver(PdfTypographyResolver):

@@ -480,3 +480,72 @@ def test_only_same_proven_uniform_patch_margins_may_overlap(tmp_path, collision,
     if collision=='erasure':b[0]=pymupdf.Rect(0,7,10,20)
     if collision=='unproven':right.image_overlap_kind='complex_background'
     assert document_typography._formatting_footprints_conflict(left,right,a,b) is expected
+
+
+@pytest.mark.parametrize("font,size,kind", [("hebo",9,"heading"),("helv",8.52,"paragraph")])
+def test_single_line_band_captions_preserve_each_source_anchor_precisely(tmp_path: Path, font, size, kind):
+    source = tmp_path / "band-captions.pdf"
+    baselines = [90, 160]
+    with pymupdf.open() as doc:
+        page = doc.new_page(width=400, height=240)
+        for text, y in zip(["First caption", "Second caption"], baselines):
+            page.draw_rect(pymupdf.Rect(30,y-12,280,y+9),color=None,fill=(.05,.15,.25))
+            page.insert_text((40,y),text,fontname=font,fontsize=size,color=(1,1,1))
+        doc.save(source)
+    job = _fixture_job_from_text(source, "First caption")
+    # Reviewed statuses here are synthetic writer inputs, never real document approval.
+    with pymupdf.open(source) as doc:
+        job.segments = [job.segments[0].model_copy(update={
+            "segment_id":f"caption-{i}","block_id":f"caption-{i}","block_type":kind,
+            "source_text":text,"edited_translation":target,
+            "source_bbox":BBox(x0=r.x0,y0=r.y0,x1=r.x1,y1=r.y1)})
+            for i,(text,target) in enumerate([("First caption","Prva oznaka"),("Second caption","Druga oznaka")])
+            for r in [doc[0].search_for(text)[0]]]
+    before = job.model_dump_json()
+    result = export_document_typography_pilot(source,job,tmp_path/"out")
+    assert result.translated_written == 2
+    with pymupdf.open(source) as original,pymupdf.open(result.path) as written:
+        spans = [s for b in written[0].get_text("dict")["blocks"] for line in b.get("lines",[]) for s in line["spans"]]
+        for text,y in zip(["Prva oznaka","Druga oznaka"],baselines):
+            span = next(s for s in spans if s["text"] == text)
+            assert span["origin"] == pytest.approx((40,y),abs=.02)
+            assert span["size"] == pytest.approx(size,abs=.001)
+            assert written[0].get_text().count(text) == 1
+        canonical = lambda page:[{k:v for k,v in d.items() if k != "seqno"} for d in page.get_drawings()]
+        assert canonical(original[0]) == canonical(written[0])
+    assert job.model_dump_json() == before
+
+
+@pytest.mark.parametrize("offset", [.1,.332,.38,-.332])
+def test_sub_geometry_tolerance_html_anchor_is_still_visually_aligned(tmp_path: Path, offset):
+    source=tmp_path/"small-anchor-offset.pdf"
+    with pymupdf.open() as doc:
+        page=doc.new_page(width=400,height=240)
+        page.insert_text((40,90),"Caption",fontsize=9,fontname="hebo")
+        doc.save(source)
+    job=_fixture_job_from_text(source,"Caption")
+    job.segments[0].block_type="heading"
+    job.segments[0].edited_translation="Oznaka"
+    plan=export_document_typography_pilot(source,job,tmp_path/"plan",plan_only=True).translation_plan
+    item=plan.replacements[0]
+    (tmp_path/"fonts").mkdir()
+    with pymupdf.open(source) as doc:
+        typography=DocumentTypographyResolver(tmp_path/"fonts",doc,job)
+        asset=exporter._asset_for(item,typography)
+        item.typography_warnings=[w for w in item.typography_warnings if w != "source_baseline_direct_write"]
+        rect=pymupdf.Rect(40,70,240,110)
+        fit=exporter._htmlbox_preflight(doc[0].rect,rect,item,typography,asset,1.)
+        exporter._accept_fit(item,rect,fit,"expanded_bbox")
+        measured=exporter._single_rendered_line_geometry(doc[0].rect,rect,item,typography,asset)
+        rect=rect+(40-measured.bbox.x0,90-offset-measured.baseline_y,
+                   40-measured.bbox.x0,90-offset-measured.baseline_y)
+        fit=exporter._htmlbox_preflight(doc[0].rect,rect,item,typography,asset,1.)
+        exporter._accept_fit(item,rect,fit,"expanded_bbox")
+        before=exporter._single_rendered_line_geometry(doc[0].rect,rect,item,typography,asset)
+        assert before.baseline_y == pytest.approx(90-offset,abs=.001)
+        exporter._preserve_profile_source_inset(doc[0],item,[item],typography)
+        assert item.eligible
+        actual=exporter._single_rendered_line_geometry(doc[0].rect,exporter._rect(item.fitted_bbox),item,typography,asset)
+        assert actual.baseline_y == pytest.approx(90,abs=.02)
+        assert actual.bbox.x0 == pytest.approx(40,abs=.02)
+        assert item.scale == 1.

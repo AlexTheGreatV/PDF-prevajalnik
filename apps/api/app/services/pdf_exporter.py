@@ -41,6 +41,8 @@ LOGGER = logging.getLogger(__name__)
 
 MIN_FONT_SIZE = 6.0
 GEOMETRY_TOLERANCE = 0.5
+# Visual anchoring is stricter than collision/containment geometry.
+SINGLE_LINE_ANCHOR_TOLERANCE = 0.02
 OVERLAP_TOLERANCE = 0.1
 HEADING_MIN_SCALE = 0.85
 BODY_MIN_SCALE = 0.75
@@ -1171,7 +1173,11 @@ def _preserve_profile_source_inset(page, replacement, replacements, typography) 
         return
     delta_x = source_x - first.bbox.x0
     delta_y = source_first.baseline_y - first.baseline_y
-    if abs(delta_x) <= GEOMETRY_TOLERANCE and abs(delta_y) <= GEOMETRY_TOLERANCE:
+    anchor_tolerance = (SINGLE_LINE_ANCHOR_TOLERANCE
+        if len(lines) == len(rendered) == 1
+        and "document_profile_fixed_size" in replacement.typography_warnings
+        else GEOMETRY_TOLERANCE)
+    if abs(delta_x) <= anchor_tolerance and abs(delta_y) <= anchor_tolerance:
         return
     right = rect.x1 + delta_x if replacement.alignment != "left" else rect.x1
     candidate = pymupdf.Rect(rect.x0 + delta_x, rect.y0 + delta_y, right, rect.y1 + delta_y)
