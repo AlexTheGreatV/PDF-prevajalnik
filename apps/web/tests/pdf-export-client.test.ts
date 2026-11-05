@@ -658,4 +658,13 @@ test("temperature QC allows shared units in the actual export request without by
   } finally { globalThis.fetch = fetchBefore; }
 });
 
+
+test("unreviewed export exclusions are not labelled as confirmed geometry failures", () => {
+  const current=job();current.segments=[segment({status:"reviewed"}),segment({segment_id:"other",status:"translated"})];
+  const coverage=calculateDocumentCoverage({analysis:analysis(["digital"]),ocrItems:[],job:current,
+    plan:plan([{segment_id:"p1-r1-b1",page_number:1,eligible:false,skip_reason:"image_overlap",resolution:"blocked_image_safety"},
+      {segment_id:"other",page_number:1,eligible:false,skip_reason:"not_reviewed",resolution:"blocked_other"}]),downloadCompleted:false});
+  assert.ok(coverage.pages[0].warnings.includes("Potrjeni segmenti, ki niso varno izvozljivi: 1."));
+  assert.ok(!coverage.pages[0].warnings.some(w=>w.includes("izvozljivi: 2")));
+});
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });

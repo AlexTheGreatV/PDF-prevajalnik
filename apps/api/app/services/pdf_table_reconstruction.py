@@ -291,7 +291,7 @@ def plan_table_reconstruction(
                         or segment.source_text != text):
                     raise TableReconstructionError("unreviewed_or_stale_cell")
                 if not unchanged_value:
-                    exporter._require_technical_integrity(segment, text)
+                    exporter._require_technical_integrity(segment, text, source, page_number=page.number + 1, source_bbox=cell.source_bbox.model_dump(), source_kind="native")
                 sizes.extend(typography.source_font_sizes(page, _rect(cell.source_bbox)))
             source_cells.append((cell, segment, text))
         if len(table_segments) != sum(bool(text.strip()) for _, _, text in source_cells):

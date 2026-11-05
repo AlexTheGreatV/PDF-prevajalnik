@@ -3,6 +3,7 @@ import type { OcrReviewItem } from "./ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "./pdf-types";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
+import { proposeSiMeasurements, reviewedUnitTarget, SI_RULES_VERSION } from "./si-measurements";
 import {
   createTranslationContentRevision,
   createTranslationContentRevisionFromValues,
@@ -212,6 +213,95 @@ export function createTranslationJob(
       : { translation_profile: null, quality_checklist: [] }),
   };
   return finalizeTranslationJob(job);
+}
+
+type TranslationMemoryRefreshOptions = {
+  source_language: string;
+  domain: string;
+  entries: TranslationMemoryEntry[];
+  active_set_hash: string;
+};
+
+export function previewMeasurementNormalization(job: TranslationJob) {
+  return { input_identity: JSON.stringify(job), changes: job.target_language !== "sl" ? [] : job.segments.flatMap(segment => {
+    if (segment.skip_reason || !segment.edited_translation.trim()) return [];
+    const proposed = proposeSiMeasurements(segment.edited_translation);
+    let after = segment.edited_translation;
+    for (const change of [...proposed.changes].reverse()) after = after.slice(0, change.start) + change.after + after.slice(change.end);
+    const reviewedCorrection = reviewedUnitTarget(segment.source_text, {
+      document_sha256: job.document_identity?.sha256 ?? "", segment_id: segment.segment_id, page_number: segment.page_number, source_bbox: segment.source_bbox, source_kind: segment.source_text_origin === "native" ? "native" : "accepted_ocr", record: job.reviewed_unit_correction,
+    });
+    if (reviewedCorrection !== null) after = reviewedCorrection;
+    return after === segment.edited_translation ? [] : [{ segment_id: segment.segment_id, source: segment.source_text,
+      before: segment.edited_translation, after, reviewed: segment.status === "reviewed", adjustments: proposed.changes,
+      reviewed_correction: reviewedCorrection !== null }];
+  }) };
+}
+
+export function applyMeasurementNormalization(job: TranslationJob, preview: ReturnType<typeof previewMeasurementNormalization>) {
+  if (preview.input_identity !== JSON.stringify(job)) throw new Error("Predlog merskega zapisa je zastarel. Ponovno preglejte spremembe.");
+  // Recompute from current content, never treat client-provided replacements as rules.
+  const current = previewMeasurementNormalization(job);
+  return finalizeTranslationJob({ ...job, segments: job.segments.map(segment => {
+    const change = current.changes.find(item => item.segment_id === segment.segment_id);
+    if (!change) return segment;
+    return { ...editTranslation(segment, change.after), translation_rules_version: SI_RULES_VERSION,
+      translation_rule_adjustments: [...(segment.translation_rule_adjustments ?? []), ...(change.reviewed_correction ? [{
+        rule_id: "reviewed_unit_symbol_correction" as const, rule_version: "reviewed-unit-symbol-v1", kind: "measurement" as const,
+        source_text: change.before, replacement_text: change.after,
+        evidence_sha256: job.reviewed_unit_correction!.evidence_sha256, approval_note: job.reviewed_unit_correction!.approval_note,
+      }] : change.adjustments.map(item => ({
+        rule_id: "technical_unit_spacing" as const, rule_version: item.rule_id, kind: "unit_spacing" as const,
+        source_text: item.before, replacement_text: item.after,
+      }))) ] };
+  }) });
+}
+
+export function previewTranslationMemoryRefresh(job: TranslationJob, options: TranslationMemoryRefreshOptions) {
+  const result = refreshTranslationMemoryContext(job, options);
+  return {
+    input_identity: JSON.stringify([job, options]),
+    changes: result.changed_segment_ids.map(id => {
+      const before = job.segments.find(segment => segment.segment_id === id)!;
+      const after = result.job.segments.find(segment => segment.segment_id === id)!;
+      return { segment_id: id, page_number: before.page_number, source: before.source_text,
+        before: before.edited_translation, after: after.edited_translation };
+    }),
+  };
+}
+
+export function applyTranslationMemoryRefresh(job: TranslationJob, options: TranslationMemoryRefreshOptions,
+  preview: ReturnType<typeof previewTranslationMemoryRefresh>) {
+  if (preview.input_identity !== JSON.stringify([job, options])) {
+    throw new Error("Pregled sprememb TM je zastarel. Najprej znova preglejte predvidene spremembe.");
+  }
+  return refreshTranslationMemoryContext(job, options);
+}
+
+export function refreshTranslationMemoryContext(job: TranslationJob, options: TranslationMemoryRefreshOptions): { job: TranslationJob; changed_segment_ids: string[] } {
+  if (!["auto", "en", "de", "sl"].includes(options.source_language)) throw new Error("Izvorni jezik ni podprt.");
+  const changed: string[] = [];
+  const domain = options.domain.trim();
+  const entries = options.entries.map(entry => ({ ...entry }));
+  const segments = job.segments.map(segment => {
+    const current = { ...segment, source_language: options.source_language };
+    // Context changes are not permission to replace reviewed or manually edited text.
+    if (segment.status === "reviewed" || segment.translation_origin === "manual"
+      || segment.edited_translation !== segment.translated_text || segment.skip_reason
+      || segment.translation_origin === "glossary") return current;
+    // Probe through the ordinary exact lookup and technical-integrity check.
+    // A missing, conflicting or unsafe match leaves the current text untouched.
+    const candidate = applyExactTranslationMemory({ ...current, translation_origin: null }, entries, domain);
+    if (candidate.translation_origin !== "translation_memory") return current;
+    if (candidate.edited_translation !== segment.edited_translation) changed.push(segment.segment_id);
+    return { ...candidate, review_state: null, model_id: null, provider_id: null,
+      warnings: segment.warnings.includes("translation_memory_exact_match") ? segment.warnings : candidate.warnings };
+  });
+  return {
+    job: finalizeTranslationJob({ ...job, source_language: options.source_language, domain,
+      translation_memory_snapshot: entries, translation_memory_set_hash: options.active_set_hash, segments }),
+    changed_segment_ids: changed,
+  };
 }
 
 export function invalidateStaleOcrApprovals(job: TranslationJob, ocrItems: OcrReviewItem[]): TranslationJob {
@@ -582,11 +672,72 @@ export async function translateJobBatch(
       return assembleSegment(segment, segment.chunks.map((chunk) => byChunk.get(chunk.chunk_id) ?? chunk), true);
     });
   }
-  const translatedById = new Map(translated.map((segment) => [segment.segment_id, segment]));
+  translated = await retryMissingPreferredTerms(translated, glossary, provider, job, signal);
+  if (signal?.aborted) return job;
+  const freshIds = new Set(job.segments.filter(segment => ["pending", "failed"].includes(segment.status)
+    && !segment.skip_reason).map(segment => segment.segment_id));
+  const generated = new Map(translated.map(segment => [segment.segment_id, segment]));
+  const proposals = withGlossary.segments.map(segment => generated.get(segment.segment_id) ?? segment);
+  const projection = { ...job, segments: proposals.filter(segment => freshIds.has(segment.segment_id)) };
+  const normalized = applyMeasurementNormalization(projection, previewMeasurementNormalization(projection));
+  const freshById = new Map(normalized.segments.map(segment => [segment.segment_id, segment]));
+  // Only new proposals are formatted. Existing manual edits and reviews stay untouched.
+  const translatedById = new Map(proposals.map(segment => {
+    const formatted = freshById.get(segment.segment_id);
+    return [segment.segment_id, !formatted || formatted.edited_translation === segment.edited_translation ? segment : {
+      ...formatted, translated_text: formatted.edited_translation, translation_origin: segment.translation_origin,
+      model_id: segment.model_id, provider_id: segment.provider_id,
+    }];
+  }));
   return finalizeTranslationJob({
     ...withGlossary,
     segments: withGlossary.segments.map((segment) => translatedById.get(segment.segment_id) ?? segment),
   });
+}
+
+async function retryMissingPreferredTerms(segments: TranslationSegment[], glossary: GlossaryEntry[], provider: TranslationProvider,
+  job: TranslationJob, signal?: AbortSignal): Promise<TranslationSegment[]> {
+  const output: TranslationSegment[] = [];
+  for (const segment of segments) {
+    if (signal?.aborted) return segments;
+    const terms = [...new Map(segment.glossary_matches.filter(m => m.mode === "preferred" && m.target_term.trim())
+      .map(m => [m.glossary_id, m])).values()];
+    if (segment.status !== "translated" || segment.translation_origin === "translation_memory"
+        || !terms.some(m => !containsTerm(segment.edited_translation, m.target_term)) || terms.length > 8) {
+      output.push(segment); continue;
+    }
+    const protectedValue = protectForTranslation(segment.source_text, glossary, "primary_tk");
+    const candidates: string[] = []; let selected: string | null = null; let reason = "no_verified_candidate";
+    try {
+      const request: TranslationRequest = { segment_id: `${segment.segment_id}-terms-1`, text: protectedValue.protected_text,
+        context: { segment_id: segment.segment_id, page_number: segment.page_number, block_type: segment.block_type,
+          glossary_matches: terms, domain: job.domain, terminology_retry: true } };
+      const results = await provider.translateBatch([request], { source_language: job.source_language, target_language: job.target_language, signal });
+      if (signal?.aborted) return segments;
+      const result = results.length === 1 && results[0].segment_id === request.segment_id ? results[0] : null;
+      if (!result || result.error || result.reached_decoding_limit) reason = result?.error?.code ?? "invalid_retry_response";
+      else {
+        for (const raw of [...new Set([result.translated_text, ...(result.alternative_translations ?? [])].filter((x): x is string => typeof x === "string"))].slice(0, 4)) {
+          try { candidates.push(restoreProtectedTokens(raw, protectedValue.tokens)); } catch { /* Unusable placeholder candidate is never applied. */ }
+        }
+        const valid = candidates.filter(text => terms.every(m => containsTerm(text, m.target_term))
+          && validateTranslationTechnicalIntegrity(segment.source_text, text).valid);
+        // A whole-segment model rewrite must not silently replace approved exact-TM chunks.
+        if (segment.chunks.some(c => c.translation_memory_entry_id)) reason = "review_required_for_memory_alignment";
+        else if (valid.length) { selected = valid[0]; reason = "preferred_terms_and_integrity_verified"; }
+      }
+    } catch (error) { reason = signal?.aborted ? "cancelled" : error instanceof Error ? error.message : "retry_failed"; }
+    if (signal?.aborted) return segments;
+    const attempt = { source_text: segment.source_text, before: segment.edited_translation, before_chunks: structuredClone(segment.chunks), candidates, selected,
+      terms: terms.map(m => ({ source_term: m.source_term, target_term: m.target_term })), reason, mode: "full_segment_beam4" as const };
+    const history = [...(segment.terminology_attempts ?? []), attempt];
+    output.push(selected === null ? { ...segment, terminology_attempts: history } : {
+      ...segment, translated_text: selected, edited_translation: selected, status: "translated", needs_review: true, review_state: null,
+      terminology_attempts: history, chunks: [], translation_origin: "provider",
+      warnings: [...new Set([...segment.warnings, "contextual_terminology_retry_applied"])],
+    });
+  }
+  return output;
 }
 
 type PreparedChunk = { chunk: TranslationChunk; request: TranslationRequest; tokens: ProtectedToken[] };
@@ -956,6 +1107,21 @@ export function importTranslationJob(value: string): TranslationJob {
   const migrated = migrateSchemaTen(migrateSchemaNine(migrateSchemaEight(migrateSchemaSeven(migratedSix))));
   if (!isRecord(migrated) || migrated.schema_version !== TRANSLATION_JOB_SCHEMA_VERSION) throw new Error("Različica prevajalskega opravila ni podprta.");
   validateJobShape(migrated);
+  // A saved JSON is history, not authority for a source-unit correction.
+  // The workspace reloads the single pinned server record independently.
+  delete migrated.reviewed_unit_correction;
+  for (const segment of (migrated as unknown as TranslationJob).segments) {
+    if (segment.terminology_attempts !== undefined && (!Array.isArray(segment.terminology_attempts)
+      || segment.terminology_attempts.length > 100 || segment.terminology_attempts.some(a => !a || a.mode !== "full_segment_beam4"
+        || (a.before_chunks !== undefined && (!Array.isArray(a.before_chunks) || a.before_chunks.length > 1000
+          || a.before_chunks.some(c => !c || typeof c.chunk_id !== "string" || typeof c.source_text !== "string")))
+        || typeof a.source_text !== "string" || typeof a.before !== "string" || typeof a.reason !== "string"
+        || !(a.selected === null || typeof a.selected === "string") || !Array.isArray(a.candidates) || a.candidates.length > 4
+        || a.candidates.some(c => typeof c !== "string") || !Array.isArray(a.terms) || a.terms.length > 8
+        || a.terms.some(t => typeof t?.source_term !== "string" || typeof t?.target_term !== "string")))) {
+      throw new Error("Zgodovina terminološkega ponovnega prevoda ni veljavna.");
+    }
+  }
   return finalizeTranslationJob(migrated as TranslationJob);
 }
 
@@ -1023,6 +1189,16 @@ export function recoverTranslationJobForAnalysis(imported: TranslationJob, expec
   const comparable = { ...expected, segments: expected.segments.map((native) => {
     const old = byId.get(native.segment_id);
     const provenance = old?.accepted_ocr_source;
+    if (old?.source_text_origin === "accepted_ocr" && provenance && native.source_text_origin === "accepted_ocr"
+        && native.accepted_ocr_source && old.source_text === native.source_text
+        && JSON.stringify(old.source_bbox) === JSON.stringify(native.source_bbox)
+        && JSON.stringify({ ...provenance, revision_id: null }) === JSON.stringify({ ...native.accepted_ocr_source, revision_id: null })
+        && provenance.revision_id !== native.accepted_ocr_source.revision_id) {
+      // Geometry/content can be compared now, but only server verification below
+      // may restore this exact historical reference and its translation review.
+      recovering.add(old.segment_id);
+      return { ...native, accepted_ocr_source: provenance };
+    }
     if (!old || old.source_text_origin !== "accepted_ocr" || !provenance || native.source_text_origin !== "native") return native;
     const item = ocrItems.find((candidate) => candidate.id === provenance.review_id);
     if (!item || item.source !== "block" || provenance.source !== "block" || item.reason !== provenance.reason ||
@@ -1055,6 +1231,12 @@ export function restoreVerifiedOcrItems(imported: TranslationJob, expected: Tran
     const segment = imported.segments.find(segment => segment.source_text_origin === "accepted_ocr"
       && segment.accepted_ocr_source?.review_id === item.id);
     const proof = segment?.accepted_ocr_source;
+    if (proof?.revision_id && !verifiedRevisions.has(proof.revision_id) && item.server_revision_id === proof.revision_id) {
+      // A previously displayed acceptance is not authority after server rejection.
+      // Keep the OCR result for review, but never keep a revoked reference current.
+      return { ...item, status: "pending", selected_text_source: "native", effective_text: item.native_text,
+        server_revision_id: null };
+    }
     if (!proof?.revision_id || !verifiedRevisions.has(proof.revision_id) || item.source !== "block"
         || proof.source !== "block" || proof.reason !== item.reason || segment!.page_number !== item.page_number
         || JSON.stringify(proof.bbox) !== JSON.stringify(item.pdf_bbox)) return item;
@@ -1392,7 +1574,7 @@ function isTranslationRuleMetadata(version: unknown, adjustments: unknown): bool
   if (!(version === null || typeof version === "string") || !Array.isArray(adjustments)) return false;
   return adjustments.every((item) =>
     isRecord(item) &&
-    ["technical_range", "technical_unit_spacing", "decimal_separator"].includes(String(item.rule_id)) &&
+    ["technical_range", "technical_unit_spacing", "decimal_separator", "reviewed_unit_symbol_correction"].includes(String(item.rule_id)) &&
     typeof item.rule_version === "string" &&
     ["temperature", "measurement", "percentage", "time", "unit_spacing", "decimal_number"].includes(String(item.kind)) &&
     typeof item.source_text === "string" &&

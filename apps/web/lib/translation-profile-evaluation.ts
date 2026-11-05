@@ -17,6 +17,7 @@ import type { GlossaryEntry, TranslationJob, TranslationSegment } from "./transl
 import { findGlossaryMatches } from "./glossary";
 import { protectTechnicalTokens } from "./technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
+import { proposeSiMeasurements, reviewedUnitTarget, type ReviewedUnitContext } from "./si-measurements";
 import { createTranslationContentRevision, validateTranslationTechnicalIntegrity, PROTECTED_DATA_RULES_VERSION } from "./translation-integrity";
 
 export const CURRENT_QC_RULES_REVISION = `current-segment-qc-v2:${PROTECTED_DATA_RULES_VERSION}:${TRANSLATION_PROFILE_ID}:${TRANSLATION_PROFILE_VERSION}:${TRANSLATION_PROFILE_CANONICAL_SHA256}:${TECHNICAL_RANGE_RULES_VERSION}`;
@@ -42,7 +43,9 @@ export function refreshTranslationProfileMetadata(job: TranslationJob): Translat
   const currentJob = { ...job, segments: job.segments.map((segment) => refreshCurrentSegmentQc({
     ...segment,
     glossary_matches: findGlossaryMatches(segment.source_text, job.glossary),
-  }, profileRevision)) };
+  }, `${profileRevision}:${job.reviewed_unit_correction?.evidence_sha256 ?? "no-unit-correction"}`, {
+    document_sha256: job.document_identity?.sha256 ?? "", segment_id: segment.segment_id, page_number: segment.page_number, source_bbox: segment.source_bbox, source_kind: segment.source_text_origin === "native" ? "native" : "accepted_ocr", record: job.reviewed_unit_correction,
+  })) };
   if (!currentJob.translation_profile) return { ...currentJob, quality_checklist: currentJob.quality_checklist ?? [] };
   const profile = currentJob.translation_profile;
   if (profile.profile_id !== TRANSLATION_PROFILE_ID || profile.profile_version !== TRANSLATION_PROFILE_VERSION) {
@@ -71,7 +74,7 @@ export function refreshTranslationProfileMetadata(job: TranslationJob): Translat
   };
 }
 
-export function refreshCurrentSegmentQc(segment: TranslationSegment, profileRevision = "segment-check"): TranslationSegment {
+export function refreshCurrentSegmentQc(segment: TranslationSegment, profileRevision = "segment-check", context?: ReviewedUnitContext): TranslationSegment {
   const target = ["pending", "failed", "translating"].includes(segment.status) && !segment.edited_translation
     ? "" : segment.edited_translation || segment.translated_text;
   const contentRevision = createTranslationContentRevision(segment);
@@ -86,6 +89,12 @@ export function refreshCurrentSegmentQc(segment: TranslationSegment, profileRevi
     severity: "warning",
     message: "Izvor vsebuje dvoumen tehnični razpon, ki zahteva ročni pregled.",
   }] : [];
+  for (const warning of proposeSiMeasurements(segment.source_text).warnings) sourceFindings.push({
+    code: "technical_integrity", severity: "warning",
+    message: reviewedUnitTarget(segment.source_text, context)
+      ? `Izvorna enota ima dokumentno odobreno popravo po dokazilu ${context?.record?.evidence_sha256}. Izvor ostaja nespremenjen.`
+      : `Izvorni merski zapis zahteva sledljiv pregled; ni bil samodejno popravljen: ${warning}`,
+  });
   if (segment.skip_reason || !target.trim()) return {
     ...segment,
     current_qc: { content_revision: contentRevision, rules_revision: rulesRevision, status: "not_checked", findings: segment.skip_reason ? [] : sourceFindings },
@@ -95,7 +104,7 @@ export function refreshCurrentSegmentQc(segment: TranslationSegment, profileRevi
   let technicalValid = false;
   let technicalDifference = "";
   try {
-    const checked = validateTranslationTechnicalIntegrity(segment.source_text, target);
+    const checked = validateTranslationTechnicalIntegrity(segment.source_text, target, context);
     technicalValid = checked.valid;
     technicalDifference = ` Pričakovano: ${JSON.stringify(checked.expected)}. Zaznano: ${JSON.stringify(checked.detected)}.`;
   }

@@ -1,7 +1,8 @@
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
 import type { ProtectedToken, TranslationSegment } from "./translation-types";
+import { canonicalSiNumber, formatSiMeasurement, reviewedUnitTarget, SI_RULES_VERSION, type ReviewedUnitContext } from "./si-measurements";
 
-export const PROTECTED_DATA_RULES_VERSION = "protected-data-v1";
+export const PROTECTED_DATA_RULES_VERSION = `protected-data-v2:${SI_RULES_VERSION}`;
 
 export function createTranslationContentRevision(segment: Pick<TranslationSegment, "status" | "source_text" | "edited_translation" | "translated_text" | "source_text_origin" | "accepted_ocr_source">): string {
   return createTranslationContentRevisionFromValues(
@@ -16,14 +17,16 @@ export function createTranslationContentRevisionFromValues(sourceText: string, t
   return JSON.stringify({ source_text: sourceText, target_text: targetText, ocr_revision: ocrRevision });
 }
 
-export function validateTranslationTechnicalIntegrity(source: string, target: string): { valid: boolean; normalizedTarget: string; expected: string[]; detected: string[] } {
+export function validateTranslationTechnicalIntegrity(source: string, target: string, context?: ReviewedUnitContext): { valid: boolean; normalizedTarget: string; expected: string[]; detected: string[] } {
   const normalizedSource = source.replace(/−/g, "-");
   const normalizedInput = target.replace(/−/g, "-");
   const validPercentageSpacing = !hasInvalidPercentageSpacing(normalizedSource) && !hasInvalidPercentageSpacing(normalizedInput);
   const targetProtection = protectTechnicalTokens(normalizedInput);
   const sourceValues = integritySignatures(normalizedSource);
   const targetValues = integritySignatures(normalizedInput);
-  const valid = validPercentageSpacing
+  const approvedTarget = reviewedUnitTarget(source, context);
+  const spellingApproved = approvedTarget !== null && formatSiMeasurement(target.trim(), true) === formatSiMeasurement(approvedTarget, true);
+  const valid = spellingApproved || validPercentageSpacing
     && !sourceValues.some((value) => value.startsWith("inconsistent-temperature-units:"))
     && !targetValues.some((value) => value.startsWith("inconsistent-temperature-units:"))
     && sourceValues.length === targetValues.length
@@ -70,7 +73,8 @@ function technicalSignatures(tokens: ProtectedToken[]): string[] {
     if (token.kind === "technical_unit_boundary") return [];
     if (token.kind !== "technical_range" || !token.technical_range) {
       if (["product_code", "url", "email", "source_placeholder"].includes(token.kind)) return [token.value];
-      return [normalizeTechnicalSignature(token.replacement_value ?? token.value)];
+      const si = token.kind === "measurement" ? formatSiMeasurement(token.value, true) : null;
+      return [si ?? normalizeTechnicalSignature(token.replacement_value ?? token.value)];
     }
     const range = token.technical_range;
     if (range.unit_kind === "translatable_word") {
@@ -82,7 +86,7 @@ function technicalSignatures(tokens: ProtectedToken[]): string[] {
 }
 
 function normalizeTechnicalSignature(value: string): string {
-  const normalized = value.replace(/−/g, "-").replace(/(?<=\d)\.(?=\d)/g, ",");
+  const normalized = value.replace(/[+\-−]?\d+(?:[.,]\d+)?/g, canonicalSiNumber);
   const percentage = normalized.match(/^([+-]?\d+(?:,\d+)?)(?: |\u00a0)?%$/u);
   if (percentage) return `${percentage[1]}%`;
   return normalized.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();

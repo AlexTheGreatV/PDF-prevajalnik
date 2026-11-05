@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     glossary_database_path: Path = Path("local-data/glossary.sqlite3")
     translation_memory_database_path: Path = Path("local-data/translation-memory.sqlite3")
     ocr_database_path: Path | None = None
+    reviewed_unit_correction_path: Path | None = None
+    reviewed_unit_correction_sha256: str | None = None
 
     @property
     def resolved_ocr_database_path(self) -> Path:

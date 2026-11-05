@@ -1,7 +1,8 @@
+import { canonicalSiNumber, formatSiMeasurement, isMachineValue, SI_MEASUREMENT_PATTERN, OPAQUE_MEASUREMENT_PATTERN, SI_RULES_VERSION } from "./si-measurements";
 import type { PlaceholderStrategy, ProtectedToken } from "./translation-types";
 import { analyzeTechnicalRanges, TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
 
-const TOKEN_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\{\{[A-Za-z_][\w.-]*\}\}|\$\{[A-Za-z_][\w.-]*\}|\{[A-Za-z_][\w.-]*\}|%(?:s|d)|\[LINK\]|\bRAL\s+\d{3,5}\b|(?<![\p{L}\p{N}])[+-]\s*\/\s*[A-Z]\s+\d+(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\+\d(?:[\d -]{5,}\d)(?![\p{L}\p{N}])|[+-]?\d+(?:[.,]\d+)?(?:\s*(?:°\s*[CF]|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|min|kW|W|h|m|%)|[ \u00a0]+K)(?=$|\s|[),.;:])|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|(?<!\p{L})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){2,}(?!\p{L})|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|(?<![\p{L}\p{N}])\d+[A-Z][A-Z0-9/-]*(?![\p{L}\p{N}])|[+-]?\d+(?:[.,]\d+)?/gu;
+const TOKEN_PATTERN = new RegExp(String.raw`https?://[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\{\{[A-Za-z_][\w.-]*\}\}|\$\{[A-Za-z_][\w.-]*\}|\{[A-Za-z_][\w.-]*\}|%(?:s|d)|\[LINK\]|\bRAL\s+\d{3,5}\b|(?<![\p{L}\p{N}])[+-]\s*/\s*[A-Z]\s+\d+(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\+\d(?:[\d -]{5,}\d)(?![\p{L}\p{N}])|${SI_MEASUREMENT_PATTERN}|${OPAQUE_MEASUREMENT_PATTERN}|(?<![\p{L}\p{N}])CO[₂2](?![\p{L}\p{N}])|(?<!\p{L})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){2,}(?!\p{L})|\b[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*\d)[A-Z0-9/-]{1,20}\b|(?<![\p{L}\p{N}])\d+[A-Z][A-Z0-9/-]*(?![\p{L}\p{N}])|[+-]?\d+(?:[.,]\d+)?`, "gu");
 export function protectTechnicalTokens(text: string, strategy: PlaceholderStrategy = "primary_tk"): { protected_text: string; tokens: ProtectedToken[]; warnings: string[] } {
   const tokens: ProtectedToken[] = [];
   const analysis = analyzeTechnicalRanges(text);
@@ -110,14 +111,15 @@ function placeholderFor(index: number, strategy: PlaceholderStrategy): string {
 function protectValues(text: string, tokens: ProtectedToken[], strategy: PlaceholderStrategy): string {
   // Digit-leading designations (e.g. coating systems) must not lose their letters.
   // Existing measurements/URLs win at the same offset; the code wins over a bare number.
-  return text.replace(TOKEN_PATTERN, (value, offset: number) => {
+  return text.replace(TOKEN_PATTERN, (value, ...captures: (string | number | undefined)[]) => {
+    const offset = captures[captures.length - 2] as number;
     const index = String(tokens.length).padStart(3, "0");
     const placeholder = strategy === "primary_tk" ? `TK${index}TK` : `PHX${index}XHP`;
     const kind = tokenKind(value, offset, text);
-    const decimalNormalization = kind === "number" && /^[+-]?\d+\.\d+$/.test(value);
+    const decimalNormalization = kind === "number" && canonicalSiNumber(value) !== value;
     const replacement = kind === "measurement"
       ? typographicMeasurement(value)
-      : decimalNormalization ? value.replace(".", ",") : value;
+      : decimalNormalization ? canonicalSiNumber(value) : value;
     tokens.push({
       placeholder,
       value,
@@ -125,7 +127,7 @@ function protectValues(text: string, tokens: ProtectedToken[], strategy: Placeho
       kind,
       ...(replacement !== value ? decimalNormalization
         ? { rule_id: "decimal_separator" as const, rule_version: "sl-general-sskj-v1" }
-        : { rule_id: "technical_unit_spacing" as const, rule_version: TECHNICAL_RANGE_RULES_VERSION }
+        : { rule_id: "technical_unit_spacing" as const, rule_version: SI_RULES_VERSION }
       : {}),
       profile_rule_ids: replacement !== value && /\d\.\d/.test(value) && /\d,\d/.test(replacement)
         ? ["SL-SSKJ-05-001"]
@@ -136,18 +138,25 @@ function protectValues(text: string, tokens: ProtectedToken[], strategy: Placeho
 }
 
 function typographicMeasurement(value: string): string {
+  const si = formatSiMeasurement(value);
+  if (si !== null) return si;
   const normalized = normalizeDecimalDots(value.startsWith("-") ? `−${value.slice(1)}` : value);
   return normalized.replace(/(?<=\d)\s+(?=(?:°\s*C|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|m|%))/u, "\u00a0");
 }
 
 function normalizeDecimalDots(value: string): string {
-  return value.replace(/(?<=\d)\.(?=\d)/g, ",");
+  return value.replace(/[+\-−]?\d+(?:[.,]\d+)?/g, part => {
+    const normalized = canonicalSiNumber(part);
+    return part.startsWith("−") ? `−${normalized.slice(1)}` : normalized;
+  });
 }
 
 function tokenKind(value: string, offset: number, source: string): ProtectedToken["kind"] {
   if (/^https?:|^www\./i.test(value)) return "url";
   if (value.includes("@")) return "email";
   if (/^(?:\{\{|\$?\{|%(?:s|d)$|\[LINK\]$)/.test(value)) return "source_placeholder";
+  if (isMachineValue(source, offset)) return "product_code";
+  if (formatSiMeasurement(value) !== null) return "measurement";
   if (/\d(?:\s*(?:°\s*[CF]|MPa|kPa|Pa|ml|mL|L|kg|g|mm|cm|min|kW|W|h|m|%)|[ \u00a0]+K)$/u.test(value)) return "measurement";
   if (/^[+-]?\d+(?:[.,]\d+)?$/.test(value)) {
     const before = source[offset - 1] ?? "";

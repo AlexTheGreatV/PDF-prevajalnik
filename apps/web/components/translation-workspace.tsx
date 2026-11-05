@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { verifyImportedOcrSources } from "../lib/pdf-client";
+import { apiBaseUrl, verifyImportedOcrSources } from "../lib/pdf-client";
+import type { ReviewedUnitCorrection } from "../lib/si-measurements";
 import type { OcrReviewItem } from "../lib/ocr-review";
-import { nativeSourceReviewWarning } from "../lib/ocr-review";
+import { nativeSourceReviewWarning, sourceAwareQcLabel } from "../lib/ocr-review";
 import type { PdfAnalysis } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
 import { PdfExportPanel, type PdfExportUiState } from "./pdf-export-panel";
@@ -12,6 +13,10 @@ import {
   restoreVerifiedOcrItems,
   hasUnresolvedOcrSources,
   createTranslationJob,
+  previewTranslationMemoryRefresh,
+  applyTranslationMemoryRefresh,
+  previewMeasurementNormalization,
+  applyMeasurementNormalization,
   editTranslation,
   exportTranslationJob,
   importTranslationJob,
@@ -24,7 +29,7 @@ import {
 import type { GlossaryEntry, TranslationJob, TranslationSegment, TranslationStatus } from "../lib/translation-types";
 import { useLocalTranslation } from "./use-local-translation";
 import { TranslationProfileSummary } from "./translation-profile-summary";
-import { updateTerminologySources } from "../lib/translation-profile-evaluation";
+import { refreshTranslationProfileMetadata, updateTerminologySources } from "../lib/translation-profile-evaluation";
 import { GlossaryManager, type GlossaryProposal } from "./glossary-manager";
 import {
   createReviewedCorrectionDraft,
@@ -70,6 +75,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("sl");
   const [translationDomain, setTranslationDomain] = useState("");
+  const [customDomain, setCustomDomain] = useState(false);
   const [documentGlossary, setDocumentGlossary] = useState<GlossaryEntry[]>([]);
   const [persistentGlossary, setPersistentGlossary] = useState<PersistentGlossaryLoadState>({ status: "loading" });
   const [glossaryReloadRequest, setGlossaryReloadRequest] = useState(0);
@@ -78,6 +84,19 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
   const [translationMemoryReloadRequest, setTranslationMemoryReloadRequest] = useState(0);
   const [translationMemoryProposal, setTranslationMemoryProposal] = useState<TranslationMemoryProposal | null>(null);
   const [job, setJob] = useState<TranslationJob | null>(null);
+  const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
+  const unitCorrection = useRef<ReviewedUnitCorrection | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch(`${apiBaseUrl}/api/environment`, { signal: controller.signal, cache: "no-store" }).then(async response => {
+      if (!response.ok) throw new Error("Strežniškega dokazila merskega popravka ni mogoče preveriti.");
+      const data = await response.json();
+      if (controller.signal.aborted) return;
+      unitCorrection.current = data.reviewed_unit_correction ?? null;
+      setJob(current => current ? refreshTranslationProfileMetadata({ ...current, reviewed_unit_correction: unitCorrection.current }) : current);
+    }).catch(error => { if (!controller.signal.aborted) setMessage(error instanceof Error ? error.message : "Dokazilo merskega popravka ni na voljo."); });
+    return () => controller.abort();
+  }, []);
   const [filter, setFilter] = useState<TranslationFilter>("all");
   const [guidedReviewIndex, setGuidedReviewIndex] = useState(0);
   const [qcFocusId, setQcFocusId] = useState<string | null>(null);
@@ -85,7 +104,6 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
     if (qcFocusId) document.getElementById(`translation-${qcFocusId}`)?.focus();
   }, [qcFocusId, filter, mode]);
   const [exportState, setExportState] = useState<PdfExportUiState>({ plan: null, downloadCompleted: false, appliedReplacements: 0 });
-  const [message, setMessage] = useState("Pripravite segmente za lokalni prevod ali ročni pregled.");
   const local = useLocalTranslation(job, setJob);
   const glossary = useMemo(
     () => resolveGlossarySnapshot(documentGlossary, persistentGlossary, createDefaultGlossary()),
@@ -95,6 +113,17 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
   const glossaryReady = glossary !== null;
   const translationMemoryReady = canInitializeTranslationJob(true, persistentGlossary.status, translationMemory.status);
   const translationMemoryHash = translationMemory.status === "ready" ? translationMemory.active_set_hash : "";
+  const memoryRefreshPreview = useMemo(() => {
+    if (!job || local.running || translationMemory.status !== "ready") return null;
+    const options = { source_language: sourceLanguage, domain: translationDomain,
+      entries: translationMemory.entries, active_set_hash: translationMemory.active_set_hash };
+    try {
+      return { options, preview: previewTranslationMemoryRefresh(job, options), error: null };
+    } catch (error) {
+      return { options, preview: null, error: error instanceof Error ? error.message : "Pregled sprememb TM ni uspel." };
+    }
+  }, [job, local.running, translationMemory, sourceLanguage, translationDomain]);
+  const measurementPreview = useMemo(() => job ? previewMeasurementNormalization(job) : null, [job]);
 
   useEffect(() => {
     // OCR acceptance is external review state; synchronize it before any export can reuse an old approval.
@@ -158,7 +187,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
 
   function createPreparedJob(): TranslationJob | null {
     if (!glossaryReady || !translationMemoryReady) return null;
-    return createTranslationJob(analysis, ocrItems, {
+    return refreshTranslationProfileMetadata({ ...createTranslationJob(analysis, ocrItems, {
       source_language: sourceLanguage,
       target_language: targetLanguage,
       glossary: glossary!,
@@ -166,7 +195,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
       translation_memory: translationMemory.status === "ready" ? translationMemory.entries : [],
       translation_memory_set_hash: translationMemory.status === "ready" ? translationMemory.active_set_hash : null,
       domain: translationDomain,
-    });
+    }), reviewed_unit_correction: unitCorrection.current });
   }
 
   function prepare() {
@@ -188,6 +217,21 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
     setJob(prepared);
     setMessage("Segmenti so pripravljeni iz preverjenih lokalnih virov.");
     if (local.status?.available) await local.translate(prepared);
+  }
+
+  function refreshMemoryContext() {
+    if (!job || local.running || !memoryRefreshPreview?.preview) return;
+    try {
+      const refreshed = applyTranslationMemoryRefresh(job, memoryRefreshPreview.options, memoryRefreshPreview.preview);
+      importGeneration.current += 1;
+      setJob(current => current === job ? refreshed.job : current);
+      setTranslationDomain(refreshed.job.domain);
+      setCustomDomain(false);
+      setExportState({ plan: null, downloadCompleted: false, appliedReplacements: 0 });
+      setMessage(`Posodobljenih TM-predlogov: ${refreshed.changed_segment_ids.length}. Potrjeni in ročno urejeni prevodi so ohranjeni. Model ni bil ponovno zagnan; drugi prevodi niso ponovno prevedeni.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Osvežitev TM ni uspela.");
+    }
   }
 
   function updateSegment(segmentId: string, update: (segment: TranslationSegment) => TranslationSegment) {
@@ -250,11 +294,12 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
       const restoredItems = restoreVerifiedOcrItems(imported, expected, ocrItems, verified);
       const compatible = recoverTranslationJobForAnalysis(imported, createTranslationJob(analysis, restoredItems, options), restoredItems);
       if (restoredItems.some((item, index) => item !== ocrItems[index])) onRestoreOcrItems(restoredItems);
-      setJob(compatible);
+      setJob(refreshTranslationProfileMetadata({ ...compatible, reviewed_unit_correction: unitCorrection.current }));
       setDocumentGlossary(compatible.glossary.filter((entry) => entry.scope === "document"));
       setSourceLanguage(imported.source_language);
       setTargetLanguage(imported.target_language);
       setTranslationDomain(imported.domain);
+      setCustomDomain(false);
       setMessage(hasUnresolvedOcrSources(compatible)
         ? "Opravilo je obnovljeno. Zastareli OCR zahteva ponovni pregled izreza in potrditev; drugi prevodi so ohranjeni."
         : "Prevajalsko opravilo je bilo uspešno uvoženo.");
@@ -277,7 +322,7 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
         </div>
         <div className="translation-languages">
           <label>Izvorni jezik
-            <select value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} disabled={Boolean(job)}>
+            <select value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} disabled={local.running}>
               <option value="auto">Samodejno</option><option value="en">English</option><option value="de">Deutsch</option><option value="sl">Slovenščina</option>
             </select>
           </label>
@@ -287,7 +332,15 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
             </select>
           </label>
           <label>Področje (neobvezno)
-            <input value={translationDomain} onChange={(event) => setTranslationDomain(event.target.value)} disabled={Boolean(job)} placeholder="npr. construction_adhesives" aria-describedby="translation-memory-domain-scope" />
+            <select value={customDomain || (translationDomain !== "" && translationDomain !== "technical_datasheets") ? "custom" : translationDomain}
+              onChange={event => { const value = event.target.value; setCustomDomain(value === "custom"); setTranslationDomain(value === "custom" ? "" : value); }}
+              disabled={local.running} aria-describedby="translation-memory-domain-scope">
+              <option value="">Splošno — brez področja</option>
+              <option value="technical_datasheets">Tehnični listi</option>
+              <option value="custom">Drugo področje …</option>
+            </select>
+            {(customDomain || (translationDomain !== "" && translationDomain !== "technical_datasheets")) &&
+              <input aria-label="Drugo področje" value={translationDomain} onChange={event => setTranslationDomain(event.target.value)} disabled={local.running} placeholder="npr. construction_adhesives" />}
           </label>
         </div>
       </div>
@@ -295,6 +348,50 @@ export function TranslationWorkspace({ analysis, ocrItems, sourceFile, mode, mis
       <p id="translation-memory-domain-scope" className="translation-memory-domain-scope" role="status">
         {translationMemoryDomainScopeLabel(job?.domain ?? translationDomain)}
       </p>
+      {job && <div className="advanced-only">
+        {measurementPreview && measurementPreview.changes.length > 0 && <details>
+          <summary>Predlogi slovenskega merskega zapisa: {measurementPreview.changes.length}</summary>
+          <p>Pred uporabo preglejte celotno besedilo. Sprememba potrjenega prevoda razveljavi njegovo potrditev. Izvor in enote se ne popravljajo z ugibanjem.</p>
+          <table><thead><tr><th>Enota in izvor</th><th>Pred uporabo</th><th>Po uporabi</th></tr></thead>
+            <tbody>{measurementPreview.changes.map(change => <tr key={change.segment_id}>
+              <td>{change.segment_id}<p>{change.source}</p>{change.reviewed && <strong>Potrditev bo razveljavljena</strong>}</td>
+              <td style={{ whiteSpace: "pre-wrap" }}>{change.before}</td><td style={{ whiteSpace: "pre-wrap" }}>{change.after}</td>
+            </tr>)}</tbody></table>
+          {measurementPreview.changes.some(change => change.reviewed_correction) && <p>
+            Popravek izvorne enote je omejen na ta dokument in segment, z ločenim pripetim strežniškim dokazilom. To ni splošna zamenjava enot.
+          </p>}
+          <button className="button secondary" disabled={local.running} onClick={() => {
+            if (!job) return;
+            try {
+              const next = applyMeasurementNormalization(job, measurementPreview);
+              importGeneration.current += 1;
+              setJob(current => current === job ? next : current);
+              setExportState({ plan: null, downloadCompleted: false, appliedReplacements: 0 });
+              setMessage("Merski zapis je posodobljen. Spremenjeni prevodi zahtevajo ponovni pregled; izvor ostaja nespremenjen.");
+            } catch (error) { setMessage(error instanceof Error ? error.message : "Merskega zapisa ni mogoče posodobiti."); }
+          }}>Uporabi prikazane spremembe merskega zapisa</button>
+        </details>}
+        {(sourceLanguage !== job.source_language || translationDomain.trim() !== job.domain) && <p role="status">
+          Spremembi jezika in področja še nista uporabljeni v opravilu. Obstoječi prevodi niso ponovno prevedeni.
+        </p>}
+        {memoryRefreshPreview?.error && <p role="alert">{memoryRefreshPreview.error}</p>}
+        {memoryRefreshPreview?.preview && <div aria-label="Predvidene spremembe TM">
+          <h3>Predvidene spremembe TM: {memoryRefreshPreview.preview.changes.length}</h3>
+          <p>Spodaj so celotni predlogi pred uporabo. Sprememba področja sama ne spremeni prevodov.</p>
+          {memoryRefreshPreview.preview.changes.length > 0 ? <table>
+            <thead><tr><th>Enota in izvor</th><th>Sedanji prevod</th><th>Predlagani prevod TM</th></tr></thead>
+            <tbody>{memoryRefreshPreview.preview.changes.map(change => <tr key={change.segment_id}>
+              <td>{change.segment_id} · stran {change.page_number}<p>{change.source}</p></td>
+              <td style={{ whiteSpace: "pre-wrap" }}>{change.before || "Brez prevoda"}</td>
+              <td style={{ whiteSpace: "pre-wrap" }}>{change.after}</td>
+            </tr>)}</tbody>
+          </table> : <p>Ni dodatnih besedilnih sprememb. Uporabi se samo izbrani kontekst in ponovno izračuna aktualni QC.</p>}
+        </div>}
+        <button className="button secondary" disabled={local.running || !memoryRefreshPreview?.preview} onClick={refreshMemoryContext}>
+          Uporabi področje in osveži TM-predloge
+        </button>
+        <p>Osveži samo natančne TM-zadetke pri nepotrjenih, ročno nespremenjenih predlogih. Potrditve, ročni popravki in drugi prevodi ostanejo ohranjeni. Model se ne zažene.</p>
+      </div>}
 
       <div className="advanced-only">
         <GlossaryManager proposal={glossaryProposal} reloadRequest={glossaryReloadRequest} onProposalConsumed={() => setGlossaryProposal(null)} onApprovedEntriesChange={updatePersistentGlossary} />
@@ -422,7 +519,7 @@ function TranslationSegmentRow({ segment, sourceWarning, onEdit, onReview, onRes
       </header>
       <div className="translation-state-grid" aria-label="Stanje pregleda in kakovosti">
         <span><strong>Uporabniški pregled</strong>{reviewStateLabel(segment)}</span>
-        <span><strong>Avtomatski QC</strong>{qcStateLabel(segment)}</span>
+        <span><strong>Avtomatski QC</strong>{sourceAwareQcLabel(segment, sourceWarning)}</span>
       </div>
       <div className="translation-columns">
         <div><h3>Izvorno</h3><pre>{segment.source_text || "Ni izvornega besedila."}</pre></div>
@@ -438,10 +535,16 @@ function TranslationSegmentRow({ segment, sourceWarning, onEdit, onReview, onRes
       {sourceWarning && <p className="translation-warning" role="note">{sourceWarning} <a href="#ocr-review">Preglej OCR območje</a></p>}
       {segment.source_text_origin === "accepted_ocr" && !segment.accepted_ocr_source?.revision_id && <p className="translation-warning">Prevod je shranjen, vendar OCR-povezava ni potrjena. <a href="#ocr-review-list">Preglej izvorni izrez in ponovno potrdi OCR</a>. Nato ločeno potrdi prevod te različice.</p>}
       {segment.current_qc?.findings.map((finding, index) => <p className={finding.severity === "blocking" ? "translation-error" : "translation-warning"} key={`${finding.code}-${finding.glossary_entry_id ?? index}`}>{finding.message}</p>)}
-      {(segment.warnings.length > 0 || segment.placeholder_attempts.length > 0) && <details className="translation-history">
+      {(segment.warnings.length > 0 || segment.placeholder_attempts.length > 0 || (segment.terminology_attempts?.length ?? 0) > 0) && <details className="translation-history">
         <summary>Zgodovina prevajanja in ponovnih poskusov</summary>
         {segment.warnings.length > 0 && <p>Pretekla opozorila: {segment.warnings.join(", ")}</p>}
         {segment.placeholder_attempts.length > 0 && <p>Poskusi placeholderjev: {segment.placeholder_attempts.length}</p>}
+        {segment.terminology_attempts?.map((attempt, index) => <div key={index}>
+          <p>Ponovni prevod celotnega segmenta s terminološkim kontekstom · {attempt.reason}</p>
+          <p>Predlog pred poskusom: {attempt.before}</p>
+          {attempt.candidates.map((candidate, candidateIndex) => <p key={candidateIndex}>Modelni kandidat: {candidate}</p>)}
+          <p>{attempt.selected === null ? "Obstoječi predlog je ohranjen; kandidat zahteva pregled." : "Izbran preverjeni osnutek; uporabniška potrditev je še potrebna."}</p>
+        </div>)}
       </details>}
       {segment.chunks.length > 1 && <details className="translation-chunks">
         <summary>Zgodovinski modelni deli: {segment.chunks.filter((chunk) => chunk.status === "translated").length}/{segment.chunks.length}</summary>
@@ -474,12 +577,6 @@ function reviewStateLabel(segment: TranslationSegment): string {
     : "Potrjeno v starejšem ali uvoženem opravilu; izvor potrditve ni znan";
 }
 
-function qcStateLabel(segment: TranslationSegment): string {
-  if (!segment.current_qc || segment.current_qc.status === "not_checked") return "Ni preverjeno";
-  if (segment.current_qc.status === "passed") return "Zaščiteni podatki preverjeni";
-  if (segment.current_qc.status === "warnings") return "Opozorila za trenutno besedilo";
-  return "Blokada za trenutno besedilo";
-}
 
 function GlossaryEditor({ entries, onChange, onAdd }: { entries: GlossaryEntry[]; onChange: (entries: GlossaryEntry[]) => void; onAdd: () => void }) {
   function update(id: string, value: Partial<GlossaryEntry>) { onChange(entries.map((entry) => entry.id === id ? { ...entry, ...value } : entry)); }

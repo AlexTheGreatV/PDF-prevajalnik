@@ -67,6 +67,8 @@ def test_tampered_source_cannot_hide_changed_target_or_tokens(tmp_path, endpoint
     ("-40 °C to +90 °C", "od −40 do +90 °C"),
     ("+5 °C to 35 °C", "od 5 do 35 °C"),
     ("Use 2K paint.", "Uporabite dvokomponentno barvo (2K)."),
+    ("Density 1.59 g/ml", "Gostota 1,59\u00a0g/ml"),
+    ("Stress 2.5 N/mm²", "Napetost 2,5\u00a0N/mm²"),
 ])
 def test_valid_slovenian_forms_plan_and_write_extractable_pdf(tmp_path, source, target):
     import pymupdf
@@ -93,6 +95,17 @@ def test_export_recomputes_integrity_after_valid_plan(tmp_path):
     payload["segments"][0]["edited_translation"] = "od −41 do +90 °C"
     response = request(path, payload, "")
     assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "protected_data_mismatch"
+
+
+@pytest.mark.parametrize("endpoint", ["/plan", ""])
+@pytest.mark.parametrize("target", ["Gostota 1,60 g/ml", "Gostota 1,59 kg/ml", "Gostota 1,59 g/L", "Gostota 1,590 g/ml"])
+def test_si_values_prefixes_units_and_precision_cannot_change(tmp_path, endpoint, target):
+    path = tmp_path / "density.pdf"
+    _make_pdf(path, source_text="Density 1.59 g/ml")
+    payload = _job_payload(path, "Density 1.59 g/ml", target)
+    response = request(path, payload, endpoint)
+    assert response.status_code == 400, response.text
     assert response.json()["detail"]["code"] == "protected_data_mismatch"
 
 
@@ -148,3 +161,19 @@ def test_ocr_integrity_is_bound_to_accepted_server_revision(tmp_path):
     assert unlinked.status_code == 200
     assert unlinked.json()["ocr_replacements"][0]["skip_reason"] == "ocr_registry_missing"
     ocr_review_registry.clear()
+
+
+@pytest.mark.parametrize("endpoint", ["/plan", ""])
+@pytest.mark.parametrize("target,code", [("50 % r. v.", 200), ("51 % r. v.", 400), ("50 %", 400)])
+def test_relative_humidity_in_real_plan_and_writer(tmp_path, endpoint, target, code):
+    path = tmp_path / "humidity.pdf"
+    _make_pdf(path, source_text="50 % Rh.")
+    payload = _job_payload(path, "50 % Rh.", target)
+    response = request(path, payload, endpoint)
+    assert response.status_code == code, response.text
+    if code == 400:
+        assert response.json()["detail"]["code"] == "protected_data_mismatch"
+    elif not endpoint:
+        import pymupdf
+        with pymupdf.open(stream=response.content, filetype="pdf") as doc:
+            assert "50 % r. v." in doc[0].get_text().replace("\u00a0", " ")

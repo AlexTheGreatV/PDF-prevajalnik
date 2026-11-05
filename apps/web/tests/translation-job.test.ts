@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { createPdfExportSettings, restorePdfExportSettings } from "../lib/pdf-export-settings";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { nativeSourceReviewWarning, sourceAwareQcLabel } from "../lib/ocr-review";
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
 import { findGlossaryMatches } from "../lib/glossary";
+import { proposeSiMeasurements, SI_RULES_VERSION } from "../lib/si-measurements";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "../lib/technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "../lib/technical-ranges";
 import {
@@ -14,6 +16,11 @@ import {
   restoreVerifiedOcrItems,
   hasUnresolvedOcrSources,
   createTranslationJob,
+  refreshTranslationMemoryContext,
+  previewTranslationMemoryRefresh,
+  applyTranslationMemoryRefresh,
+  previewMeasurementNormalization,
+  applyMeasurementNormalization,
   createTranslationChunks,
   editTranslation,
   exportTranslationJob,
@@ -38,6 +45,242 @@ import { refreshTranslationProfileMetadata } from "../lib/translation-profile-ev
 import type { TranslationMemoryEntry } from "../lib/translation-memory";
 
 const tests: Promise<void>[] = [];
+test("a durable verified alias imports over identical accepted OCR without transferring unverified reviews", () => {
+  const analysis = fixture();
+  const bbox = analysis.document!.pages[0].regions.flatMap(region => region.blocks).find(block => block.reading_order === 1)!.bbox;
+  const old = { ...acceptedOcr(), pdf_bbox: bbox, server_revision_id: "a".repeat(32) };
+  const current = { ...old, server_revision_id: "b".repeat(32) };
+  let imported = createTranslationJob(analysis, [old], { source_language: "en", target_language: "sl" });
+  const id = imported.segments.find(s => s.source_text_origin === "accepted_ocr")!.segment_id;
+  // Synthetic review setup, not a real user's approval.
+  imported = updateTranslationJobSegment(imported, id, s => reviewTranslation(editTranslation(s, "UPORABA")));
+  const expected = createTranslationJob(analysis, [current], { source_language: "en", target_language: "sl" });
+  const items = restoreVerifiedOcrItems(imported, expected, [current], new Set([old.server_revision_id]));
+  const restored = recoverTranslationJobForAnalysis(imported, createTranslationJob(analysis, items,
+    { source_language: "en", target_language: "sl" }), items);
+  assert.deepEqual(restored.segments.find(s => s.segment_id === id)!.review_state,
+    imported.segments.find(s => s.segment_id === id)!.review_state);
+  assert.equal(restored.segments.find(s => s.segment_id === id)!.status, "reviewed");
+  const unverifiedItems = restoreVerifiedOcrItems(imported, expected, [current], new Set());
+  const unresolved = recoverTranslationJobForAnalysis(imported, expected, unverifiedItems).segments.find(s => s.segment_id === id)!;
+  assert.equal(unresolved.review_state, null); assert.equal(unresolved.needs_review, true);
+  assert.equal(unresolved.accepted_ocr_source?.revision_id, null);
+  const rejectedSame = restoreVerifiedOcrItems(imported, imported, [old], new Set());
+  assert.equal(rejectedSame[0].status, "pending");
+  assert.equal(rejectedSame[0].ocr_text, old.ocr_text);
+  const rejectedJob = recoverTranslationJobForAnalysis(imported, createTranslationJob(analysis, rejectedSame,
+    { source_language: "en", target_language: "sl" }), rejectedSame);
+  assert.equal(rejectedJob.segments.find(s => s.segment_id === id)!.review_state, null);
+  const changed = { ...current, ocr_text: "DIFFERENT", effective_text: "DIFFERENT" };
+  assert.throws(() => recoverTranslationJobForAnalysis(imported, createTranslationJob(analysis, [changed],
+    { source_language: "en", target_language: "sl" }), [changed]), /nezdružljive/);
+});
+test("SI suggestions are explicit, traceable and invalidate only edited confirmations", () => {
+  let job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const id = job.segments.find(s => s.source_text === "Fast curing")!.segment_id;
+  job = updateTranslationJobSegment(job, id, s => reviewTranslation(editTranslation({ ...s,
+    source_text: "Pressure 2.50 MPa at 45°." }, "Tlak 2.50MPa pri 45 °.")));
+  const original = JSON.stringify(job);
+  const preview = previewMeasurementNormalization(job);
+  assert.equal(JSON.stringify(job), original);
+  assert.equal(preview.changes.length, 1);
+  assert.equal(preview.changes[0].after, "Tlak 2,50\u00a0MPa pri 45°." );
+  assert.equal(preview.changes[0].reviewed, true);
+  const applied = applyMeasurementNormalization(job, preview);
+  const changed = applied.segments.find(s => s.segment_id === id)!;
+  assert.equal(changed.source_text, "Pressure 2.50 MPa at 45°.");
+  assert.equal(changed.status, "translated"); assert.equal(changed.needs_review, true);
+  assert.equal(changed.review_state, null); assert.equal(changed.current_qc?.status, "passed");
+  assert.ok(changed.translation_rule_adjustments?.some(row => row.source_text === "2.50MPa" && row.replacement_text === "2,50\u00a0MPa"));
+  assert.deepEqual(previewMeasurementNormalization(applied).changes, []);
+  assert.throws(() => applyMeasurementNormalization(applied, preview), /zastarel/);
+  assert.deepEqual(importTranslationJob(exportTranslationJob(applied)).segments, applied.segments);
+});
+test("SI proposals leave ambiguous decimals, codes, URLs and source-unit repairs for review", async () => {
+  const { proposeSiMeasurements } = await import("../lib/si-measurements");
+  const source = "1,000 g; 1.59 gr/ml; 2 Mpa; code 2.5mm; MS65; ISO 1.5; https://example.test/1.59g";
+  const result = proposeSiMeasurements(source);
+  assert.deepEqual(result.changes, []);
+  assert.ok(result.warnings.some(w => w.startsWith("ambiguous_measurement_number:")));
+  assert.ok(result.warnings.some(w => w.includes("gr/ml")));
+  assert.ok(result.warnings.some(w => w.includes("Mpa")));
+});
+test("one reviewed quantity spelling is scoped and never approves new digits or imported claims", () => {
+  let job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const id = job.segments.find(s => s.source_text === "Fast curing")!.segment_id;
+  job = updateTranslationJobSegment(job, id, s => editTranslation({ ...s, source_text: "1.59 gr/ml" }, "1,59 gr/ml"));
+  // Synthetic server-verified record; not a review of any real document.
+  const record = { version: 1 as const, profile: "unit-test", document_sha256: job.document_identity!.sha256,
+    segment_id: id, page_number: job.segments.find(s => s.segment_id === id)!.page_number, source_bbox: job.segments.find(s => s.segment_id === id)!.source_bbox!, source_kind: "native", source_text: "1.59 gr/ml", target_unit: "g/ml", approval_note: "Synthetic source spelling review",
+    recorded_at: "2026-11-03T00:00:00+00:00", evidence_sha256: "a".repeat(64) };
+  job = { ...job, reviewed_unit_correction: record };
+  const preview = previewMeasurementNormalization(job);
+  assert.equal(preview.changes.length, 1);
+  assert.equal(preview.changes[0].after, "1,59\u00a0g/ml");
+  const applied = applyMeasurementNormalization(job, preview);
+  const segment = applied.segments.find(s => s.segment_id === id)!;
+  assert.equal(segment.status, "translated"); assert.equal(segment.review_state, null);
+  assert.equal(segment.current_qc?.status, "warnings");
+  assert.equal(segment.current_qc?.findings.some(f => f.severity === "blocking"), false);
+  assert.equal(segment.translation_rule_adjustments?.at(-1)?.evidence_sha256, record.evidence_sha256);
+  const context = { document_sha256: record.document_sha256, segment_id: id, page_number: record.page_number, source_bbox: record.source_bbox, source_kind: record.source_kind, record };
+  assert.equal(validateTranslationTechnicalIntegrity("1.59 gr/ml", "1,59 g/ml", context).valid, true);
+  for (const text of ["1,60 g/ml", "1,590 g/ml", "-1,59 g/ml", "1,59 kg/ml", "1,59 g/L", "1,59 g/ml and 20 L"]) {
+    assert.equal(validateTranslationTechnicalIntegrity("1.59 gr/ml", text, context).valid, false, text);
+  }
+  assert.equal(validateTranslationTechnicalIntegrity("1.59 gr/ml", "1,59 g/ml", { ...context, segment_id: "other" }).valid, false);
+  assert.equal(validateTranslationTechnicalIntegrity("1.59 gr/ml", "1,59 g/ml", { ...context, document_sha256: "b".repeat(64) }).valid, false);
+  const imported = importTranslationJob(exportTranslationJob(applied));
+  assert.equal(imported.reviewed_unit_correction, undefined);
+  assert.equal(imported.segments.find(s => s.segment_id === id)!.current_qc?.status, "blocked");
+  assert.equal(refreshTranslationProfileMetadata({ ...imported, reviewed_unit_correction: record }).segments.find(s => s.segment_id === id)!.current_qc?.findings.some(f => f.severity === "blocking"), false);
+});
+test("TM preview is non-mutating and applying it preserves JSON review, OCR and export settings", () => {
+  const analysis = fixture();
+  const table = analysis.document!.pages[0].regions[1].blocks.find(block => block.kind === "table")!;
+  table.table_provenance = { table_id: "refresh-test-table", bbox: table.bbox, row_count: 2, column_count: 2,
+    geometry_evidence: "vector_grid", cells: [], warnings: [] };
+  let job = createTranslationJob(analysis, [acceptedOcr()], { source_language: "auto", target_language: "sl" });
+  job = { ...job, export_settings: createPdfExportSettings(analysis, "document-role-typography-pilot-v1",
+    { page_number: 1, table_id: "refresh-test-table" }) };
+  const reviewedId = job.segments.find(s => s.source_text === "Package")!.segment_id;
+  job = updateTranslationJobSegment(job, reviewedId, s => reviewTranslation(editTranslation(s, "Ročni paket")));
+  const options = { source_language: "en", domain: "technical_datasheets",
+    entries: [tmEntry("Fast curing", "Hitro utrjevanje")], active_set_hash: "preview-test" };
+  const original = JSON.stringify(job);
+  const preview = previewTranslationMemoryRefresh(job, options);
+  assert.equal(JSON.stringify(job), original);
+  assert.equal(preview.changes.length, 1);
+  assert.equal(preview.changes[0].source, "Fast curing");
+  assert.equal(preview.changes[0].after, "Hitro utrjevanje");
+  const refreshed = applyTranslationMemoryRefresh(job, options, preview).job;
+  const restored = importTranslationJob(exportTranslationJob(refreshed));
+  assert.deepEqual(restored.segments, refreshed.segments);
+  assert.deepEqual(restored.export_settings, job.export_settings);
+  assert.deepEqual(restored.segments.map(s => s.accepted_ocr_source), job.segments.map(s => s.accepted_ocr_source));
+  assert.deepEqual(restored.segments.find(s => s.segment_id === reviewedId)!.review_state,
+    job.segments.find(s => s.segment_id === reviewedId)!.review_state);
+  const repeat = previewTranslationMemoryRefresh(restored, options);
+  assert.deepEqual(repeat.changes, []);
+  assert.deepEqual(applyTranslationMemoryRefresh(restored, options, repeat).job, refreshed);
+});
+test("late TM preview cannot overwrite changed work, domain, TM entries or active set", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "auto", target_language: "sl" });
+  const options = { source_language: "en", domain: "technical_datasheets",
+    entries: [tmEntry("Fast curing", "Hitro utrjevanje")], active_set_hash: "first" };
+  const preview = previewTranslationMemoryRefresh(job, options);
+  const changed = updateTranslationJobSegment(job, job.segments[0].segment_id, s => editTranslation(s, "Novo ročno besedilo"));
+  assert.throws(() => applyTranslationMemoryRefresh(changed, options, preview), /zastarel/);
+  for (const replacement of [{ ...options, domain: "other" }, { ...options, source_language: "de" },
+    { ...options, active_set_hash: "second" }, { ...options, entries: [tmEntry("Fast curing", "Drug predlog")] }]) {
+    assert.throws(() => applyTranslationMemoryRefresh(job, replacement, preview), /zastarel/);
+  }
+  assert.equal(changed.segments[0].edited_translation, "Novo ročno besedilo");
+});
+test("explicit TM context refresh preserves reviewed and manual work and source identity", () => {
+  let job = createTranslationJob(fixture(), [], { source_language: "auto", target_language: "sl" });
+  const provider = job.segments.find(s => s.source_text === "Fast curing")!;
+  const reviewed = job.segments.find(s => s.source_text === "qPPLICATIONS")!;
+  const manual = job.segments.find(s => s.source_text === "Package")!;
+  job = updateTranslationJobSegment(job, provider.segment_id, s => ({ ...s, status: "translated",
+    translated_text: "Star predlog", edited_translation: "Star predlog", translation_origin: "provider",
+    placeholder_attempts: [{ strategy: "primary_tk", provider_text: "Star predlog", valid: true, error: null }] }));
+  // Explicit synthetic fixture review, not a real document approval.
+  job = updateTranslationJobSegment(job, reviewed.segment_id, s => reviewTranslation(editTranslation(s, "Pregledani naslov")));
+  job = updateTranslationJobSegment(job, manual.segment_id, s => editTranslation(s, "Ročno urejeni paket"));
+  const before = JSON.stringify(job);
+  const entries = [tmEntry("Fast curing", "Hitro utrjevanje", { domain: "technical_datasheets" }),
+    tmEntry("qPPLICATIONS", "Drugi naslov", { id: "reviewed-match", domain: "technical_datasheets" }),
+    tmEntry("Package", "Drug paket", { id: "manual-match", domain: "technical_datasheets" })];
+  const result = refreshTranslationMemoryContext(job, { source_language: "en", domain: "technical_datasheets", entries, active_set_hash: "new" });
+  assert.equal(JSON.stringify(job), before);
+  assert.equal(result.job.created_at, job.created_at);
+  assert.deepEqual(result.job.document_identity, job.document_identity);
+  assert.deepEqual(result.changed_segment_ids, [provider.segment_id]);
+  const updated = result.job.segments.find(s => s.segment_id === provider.segment_id)!;
+  assert.equal(updated.edited_translation, "Hitro utrjevanje");
+  assert.equal(updated.translation_origin, "translation_memory");
+  assert.equal(updated.needs_review, true);
+  assert.equal(updated.review_state, null);
+  assert.equal(updated.current_qc?.status, "passed");
+  assert.deepEqual(updated.placeholder_attempts, job.segments.find(s => s.segment_id === provider.segment_id)!.placeholder_attempts);
+  const afterReviewed = result.job.segments.find(s => s.segment_id === reviewed.segment_id)!;
+  assert.equal(afterReviewed.edited_translation, "Pregledani naslov");
+  assert.equal(afterReviewed.status, "reviewed");
+  assert.deepEqual(afterReviewed.review_state, job.segments.find(s => s.segment_id === reviewed.segment_id)!.review_state);
+  assert.equal(result.job.segments.find(s => s.segment_id === manual.segment_id)!.edited_translation, "Ročno urejeni paket");
+  for (const [index, segment] of job.segments.entries()) {
+    const after = result.job.segments[index];
+    assert.equal(after.segment_id, segment.segment_id);
+    assert.equal(after.source_text, segment.source_text);
+    assert.deepEqual(after.source_bbox, segment.source_bbox);
+    assert.deepEqual(after.accepted_ocr_source, segment.accepted_ocr_source);
+  }
+  assert.equal(importTranslationJob(exportTranslationJob(result.job)).domain, "technical_datasheets");
+  assert.equal(editTranslation(afterReviewed, "Spremenjeni naslov").review_state, null);
+  assert.equal(editTranslation(afterReviewed, "Spremenjeni naslov").status, "translated");
+});
+test("TM context refresh leaves missing, conflicting, unapproved and unsafe matches untouched", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "auto", target_language: "sl" });
+  const source = job.segments.find(s => s.source_text === "Fast curing")!;
+  for (const entries of [[], [tmEntry(source.source_text, "Predlog", { status: "proposed" })],
+    [tmEntry(source.source_text, "Prvi"), tmEntry(source.source_text, "Drugi", { id: "conflict" })]]) {
+    const result = refreshTranslationMemoryContext(job, { source_language: "en", domain: "technical_datasheets", entries, active_set_hash: "test" });
+    assert.deepEqual(result.changed_segment_ids, []);
+    assert.equal(result.job.segments.find(s => s.segment_id === source.segment_id)!.edited_translation, source.edited_translation);
+  }
+  const technical = job.segments.find(s => s.source_text.includes("CO₂"))!;
+  const result = refreshTranslationMemoryContext(job, { source_language: "en", domain: "technical_datasheets",
+    entries: [tmEntry(technical.source_text, "Manjkajoče zaščitene vrednosti")], active_set_hash: "unsafe" });
+  assert.deepEqual(result.changed_segment_ids, []);
+  assert.equal(result.job.segments.find(s => s.segment_id === technical.segment_id)!.edited_translation, technical.edited_translation);
+});
+test("context-only changes never claim unmatched provider translations were refreshed", () => {
+  let job = createTranslationJob(fixture(), [], { source_language: "auto", target_language: "sl" });
+  const source = job.segments.find(s => s.source_text === "Fast curing")!;
+  job = updateTranslationJobSegment(job, source.segment_id, s => ({ ...s, status: "translated",
+    translated_text: "Isti ponudnikov predlog", edited_translation: "Isti ponudnikov predlog", translation_origin: "provider" }));
+  const result = refreshTranslationMemoryContext(job, { source_language: "en", domain: "technical_datasheets", entries: [], active_set_hash: "empty" });
+  assert.deepEqual(result.changed_segment_ids, []);
+  const after = result.job.segments.find(s => s.segment_id === source.segment_id)!;
+  assert.equal(after.edited_translation, source.edited_translation || "Isti ponudnikov predlog");
+  assert.equal(after.translation_origin, "provider");
+  assert.equal(result.job.source_language, "en");
+  assert.equal(result.job.domain, "technical_datasheets");
+});
+test("TM refresh respects explicit glossary translations and unlabelled manual edits", () => {
+  let job = createTranslationJob(fixture(), [], { source_language: "auto", target_language: "sl" });
+  const source = job.segments.find(s => s.source_text === "Fast curing")!;
+  const entries = [tmEntry(source.source_text, "TM predlog")];
+  for (const segment of [{ ...source, translation_origin: "glossary" as const, translated_text: "Glosar", edited_translation: "Glosar" },
+    { ...source, translation_origin: "provider" as const, translated_text: "Model", edited_translation: "Ročna sprememba" }]) {
+    job = { ...job, segments: job.segments.map(s => s.segment_id === source.segment_id ? segment : s) };
+    const result = refreshTranslationMemoryContext(job, { source_language: "en", domain: "technical_datasheets", entries, active_set_hash: "current" });
+    assert.equal(result.job.segments.find(s => s.segment_id === source.segment_id)!.edited_translation, segment.edited_translation);
+    assert.deepEqual(result.changed_segment_ids, []);
+  }
+});
+test("repeated explicit TM refresh is deterministic and never creates a review", () => {
+  const job = createTranslationJob(fixture(), [], { source_language: "auto", target_language: "sl" });
+  const options = { source_language: "en", domain: "technical_datasheets", entries: [tmEntry("Fast curing", "Hitro utrjevanje")], active_set_hash: "same" };
+  const first = refreshTranslationMemoryContext(job, options);
+  const second = refreshTranslationMemoryContext(first.job, options);
+  assert.deepEqual(second.changed_segment_ids, []);
+  assert.deepEqual(second.job, first.job);
+  assert.equal(second.job.segments.some(s => s.status === "reviewed"), false);
+});
+test("context refresh changes export revision without changing confirmed content revision", async () => {
+  const { createCoverageRevisionKey } = await import("../lib/document-coverage");
+  const analysis = fixture();
+  let job = createTranslationJob(analysis, [], { source_language: "auto", target_language: "sl" });
+  const source = job.segments.find(s => s.source_text === "Fast curing")!;
+  job = updateTranslationJobSegment(job, source.segment_id, s => reviewTranslation(editTranslation(s, "Potrjen prevod")));
+  const after = refreshTranslationMemoryContext(job, { source_language: "en", domain: "technical_datasheets", entries: [], active_set_hash: "next" }).job;
+  assert.notEqual(createCoverageRevisionKey({ analysis, ocrItems: [], job, mode: "replacement_preview" }),
+    createCoverageRevisionKey({ analysis, ocrItems: [], job: after, mode: "replacement_preview" }));
+  assert.deepEqual(after.segments.find(s => s.segment_id === source.segment_id)!.review_state,
+    job.segments.find(s => s.segment_id === source.segment_id)!.review_state);
+});
 test("JSON preserves explicit typography and table choice without persisting an authorization token or changing reviews", () => {
   const analysis = fixture();
   const table = analysis.document!.pages[0].regions[1].blocks.find(block => block.kind === "table")!;
@@ -583,7 +826,7 @@ test("protects and restores technical values exactly", () => {
   for (const value of ["CO₂", "+5 °C to +25 °C", "2.5 MPa", "50 %", "RAL 9001", "290 ml", "600 ml", "20 L", "200 L"]) {
     assert.ok(protectedValue.tokens.some((token) => token.value === value), `Missing protected token: ${value}`);
   }
-  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), "CO₂, +5\u00a0°C do +25\u00a0°C, 2,5\u00a0MPa, 50\u00a0%, RAL 9001, 290\u00a0ml, 600\u00a0ml, 20\u00a0L and 200\u00a0L.");
+  assert.equal(restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens), "CO₂, od 5 do 25\u00a0°C, 2,5\u00a0MPa, 50\u00a0%, RAL 9001, 290\u00a0ml, 600\u00a0ml, 20\u00a0L and 200\u00a0L.");
   assert.throws(() => restoreTechnicalTokens(protectedValue.protected_text.replace("TK000TK", "broken"), protectedValue.tokens), /placeholder/);
   assert.throws(() => restoreTechnicalTokens(`${protectedValue.protected_text} TK000TK`, protectedValue.tokens), /placeholder/);
 });
@@ -666,8 +909,8 @@ test("protects formulas codes URLs email and source placeholders", () => {
 
 test("parses and localizes only structured technical ranges", () => {
   const cases = [
-    ["-40 °C to +90 °C", "−40\u00a0°C do +90\u00a0°C", "temperature"],
-    ["from -40 °C to +90 °C", "od −40\u00a0°C do +90\u00a0°C", "temperature"],
+    ["-40 °C to +90 °C", "od −40 do 90\u00a0°C", "temperature"],
+    ["from -40 °C to +90 °C", "od −40 do 90\u00a0°C", "temperature"],
     ["5 mm to 10 mm", "5\u00a0mm do 10\u00a0mm", "measurement"],
     ["10 % to 20 %", "10\u00a0% do 20\u00a0%", "percentage"],
     ["between 5 MPa and 10 MPa", "med 5\u00a0MPa in 10\u00a0MPa", "measurement"],
@@ -758,7 +1001,7 @@ test("records versioned technical range adjustments without automatic review", a
   const translated = await translateJobBatch(job, provider);
   const segment = translated.segments[0];
   assert.equal(segment.source_text, source);
-  assert.equal(segment.translated_text, "Temperaturna odpornost −40\u00a0°C do +90\u00a0°C");
+  assert.equal(segment.translated_text, "Temperaturna odpornost od −40 do 90\u00a0°C");
   assert.equal(segment.status, "translated");
   assert.equal(segment.needs_review, true);
   assert.equal(segment.translation_rules_version, TECHNICAL_RANGE_RULES_VERSION);
@@ -767,7 +1010,7 @@ test("records versioned technical range adjustments without automatic review", a
     rule_version: TECHNICAL_RANGE_RULES_VERSION,
     kind: "temperature",
     source_text: "-40 °C to +90 °C",
-    replacement_text: "−40\u00a0°C do +90\u00a0°C",
+    replacement_text: "od −40 do 90\u00a0°C",
   }]);
   assert.ok(segment.warnings.includes("technical_translation_rule_applied"));
   assert.equal(segment.status, "translated");
@@ -1742,4 +1985,141 @@ test("server-verified unchanged OCR survives fresh analysis and JSON round trips
   assert.throws(()=>restoreVerifiedOcrItems(imported,expected,[{...candidate,pdf_bbox:{...box,x0:box.x0+1}}],new Set([accepted.server_revision_id!])));
 });
 
+
+// Synthetic proposal automation; no real user review is created here.
+function terminologyFixture() {
+  const analysis = fixture();
+  analysis.document!.pages[0].regions = [{kind:"body",bbox:{x0:0,y0:0,x1:100,y1:50},reading_order:1,
+    blocks:[block(1,"paragraph","Durable coating.")]}];
+  const glossary: GlossaryEntry[] = [{id:"coating",source_term:"coating",target_term:"premaz",case_sensitive:false,
+    mode:"preferred",enabled:true,origin:"user"}];
+  return createTranslationJob(analysis,[],{source_language:"en",target_language:"sl",domain:"technical_datasheets",glossary});
+}
+test("full-segment terminology retry selects verified candidate and keeps proposal history", async () => {
+  const base=terminologyFixture();
+  const provider=new DeterministicProvider((_text,_index,_call,request)=>request.context.terminology_retry?"Trajen premaz.":"Trajna obloga.");
+  const result=await translateJobBatch(base,provider); const segment=result.segments[0];
+  assert.equal(segment.edited_translation,"Trajen premaz."); assert.equal(segment.status,"translated");
+  assert.equal(segment.needs_review,true); assert.equal(segment.review_state,null);
+  assert.equal(provider.requests[1][0].context.domain,"technical_datasheets");
+  assert.equal(provider.requests[1][0].text,"Durable coating.");
+  assert.equal(segment.terminology_attempts?.[0].before,"Trajna obloga.");
+  assert.ok(segment.terminology_attempts?.[0].before_chunks?.length);
+  const imported=importTranslationJob(exportTranslationJob(result));
+  assert.equal(imported.domain,"technical_datasheets");
+  assert.deepEqual(imported.segments[0].terminology_attempts,segment.terminology_attempts);
+  await translateJobBatch(result,provider); assert.equal(provider.calls,2);
+});
+test("terminology retry rejects invented protected data and retains the previous draft", async () => {
+  const provider=new DeterministicProvider((_text,_i,_call,r)=>r.context.terminology_retry?"Premaz 99 kg.":"Trajna obloga.");
+  const result=await translateJobBatch(terminologyFixture(),provider);
+  assert.equal(result.segments[0].edited_translation,"Trajna obloga.");
+  assert.equal(result.segments[0].terminology_attempts?.[0].selected,null);
+});
+test("terminology retry cancellation never installs a late result", async () => {
+  const base=terminologyFixture(); const controller=new AbortController();
+  const provider=new DeterministicProvider((_text,_i,_call,r)=>{
+    if(r.context.terminology_retry) controller.abort(); return r.context.terminology_retry?"Trajen premaz.":"Trajna obloga.";
+  });
+  assert.equal(await translateJobBatch(base,provider,controller.signal),base);
+});
+test("exact approved memory bypasses terminology rewrite and remains unreviewed", async () => {
+  const base=terminologyFixture(); base.translation_memory_snapshot=[tmEntry("Durable coating.","Trajna obloga.",{domain:"technical_datasheets"})];
+  const provider=new DeterministicProvider(); const result=await translateJobBatch(base,provider);
+  assert.equal(result.segments[0].translation_origin,"translation_memory");
+  assert.equal(result.segments[0].edited_translation,"Trajna obloga.");
+  assert.equal(result.segments[0].status,"translated"); assert.equal(provider.calls,0);
+});
+
+test("fresh exact glossary proposals receive SI formatting without altering existing reviews", async () => {
+  const base=terminologyFixture();
+  base.segments[0].source_text="Coating 2.50 MPa";
+  base.glossary=[{id:"exact-measurement",source_term:"Coating 2.50 MPa",target_term:"Premaz 2.50MPa",case_sensitive:true,
+    mode:"exact_segment",enabled:true,origin:"user"}];
+  const provider=new DeterministicProvider();const result=await translateJobBatch(base,provider);
+  assert.equal(result.segments[0].edited_translation,"Premaz 2,50\u00a0MPa");
+  assert.equal(result.segments[0].translation_origin,"glossary"); assert.equal(result.segments[0].status,"translated");
+  assert.equal(result.segments[0].needs_review,true); assert.equal(provider.calls,0);
+  const manual=updateTranslationJobSegment(result,result.segments[0].segment_id,s=>reviewTranslation(editTranslation(s,"Premaz 2.50 MPa")));
+  const next=await translateJobBatch(manual,provider);
+  assert.equal(next.segments[0].edited_translation,"Premaz 2.50 MPa");
+  assert.deepEqual(next.segments[0].review_state,manual.segments[0].review_state);
+});
+
+test("whole-segment terminology retry cannot overwrite an approved memory chunk", async () => {
+  const base=terminologyFixture();base.segments[0].source_text="Coating protects. Durable coating.";
+  base.translation_memory_snapshot=[tmEntry("Coating protects.","Obloga varuje.",{domain:"technical_datasheets"})];
+  const provider=new DeterministicProvider((_text,_i,_call,r)=>r.context.terminology_retry?"Premaz varuje. Trajen premaz.":"Trajna obloga.");
+  const result=await translateJobBatch(base,provider);const segment=result.segments[0];
+  assert.equal(segment.translation_origin,"mixed");
+  assert.equal(segment.edited_translation,"Obloga varuje. Trajna obloga.");
+  assert.equal(segment.terminology_attempts?.[0].reason,"review_required_for_memory_alignment");
+  assert.equal(segment.terminology_attempts?.[0].selected,null);
+  assert.ok(segment.chunks.some(c=>c.translation_memory_entry_id==="tm-1"));
+});
+
+test("a suspicious native source is never displayed as ordinary successful QC", () => {
+  const analysis=fixture();const item=acceptedOcr();const job=createTranslationJob(analysis,[],{source_language:"en",target_language:"sl"});
+  const native=job.segments.find(s=>s.source_text==="qPPLICATIONS")!;
+  const matching={...item,pdf_bbox:native.source_bbox!,status:"pending" as const,native_text:native.source_text};
+  const warning=nativeSourceReviewWarning(native,[matching]);assert.ok(warning);
+  const passed={...native,current_qc:{content_revision:"test",rules_revision:"test",status:"passed" as const,findings:[]}};
+  assert.match(sourceAwareQcLabel(passed,warning),/^Pregled izvora potreben/);
+  assert.match(sourceAwareQcLabel({...passed,current_qc:{...passed.current_qc,status:"blocked"}},warning),/Blokada/);
+  assert.equal(sourceAwareQcLabel(passed,null),"Zaščiteni podatki preverjeni");
+  assert.equal(nativeSourceReviewWarning({...native,source_text_origin:"accepted_ocr"},[matching]),null);
+});
+
+test("Slovenian temperature proposals use od-do, a shared unit and no redundant plus", () => {
+  for (const [source,target] of [
+    ["-12.50 °C to +37.0 °C","od −12,50 do 37,0\u00a0°C"],
+    ["+6 °C to 48 °C","od 6 do 48\u00a0°C"],
+    ["from -8 °F to +33 °F","od −8 do 33\u00a0°F"],
+    ["280 K to 310 K","od 280 do 310\u00a0K"],
+  ]) {
+    const protectedValue=protectTechnicalTokens(source);
+    assert.equal(restoreTechnicalTokens(protectedValue.protected_text,protectedValue.tokens),target);
+    assert.equal(validateTranslationTechnicalIntegrity(source,target).valid,true);
+  }
+  for (const target of ["od 12,50 do 37,0 °C","od −12,51 do 37,0 °C","od −12,50 do 37,0 K","od 37,0 do −12,50 °C"])
+    assert.equal(validateTranslationTechnicalIntegrity("-12.50 °C to +37.0 °C",target).valid,false);
+  const codes=protectTechnicalTokens("2K and 4K paints; RAL 9001; 45°.");
+  assert.equal(restoreTechnicalTokens(codes.protected_text,codes.tokens),"2K and 4K paints; RAL 9001; 45°.");
+});
+
+test("temperature style changes in an existing reviewed job require explicit preview and new review", () => {
+  let job=terminologyFixture();job=updateTranslationJobSegment(job,job.segments[0].segment_id,s=>reviewTranslation(editTranslation({...s,source_text:"-12.50 °C to +37.0 °C"},"−12,50 °C do +37,0 °C")));
+  const original=JSON.stringify(job);const preview=previewMeasurementNormalization(job);
+  assert.equal(JSON.stringify(job),original);assert.equal(preview.changes.length,1);
+  assert.equal(preview.changes[0].after,"od −12,50 do 37,0\u00a0°C");
+  const applied=applyMeasurementNormalization(job,preview);
+  assert.equal(applied.segments[0].status,"translated");assert.equal(applied.segments[0].review_state,null);
+  assert.equal(applied.segments[0].source_text,"-12.50 °C to +37.0 °C");
+  assert.deepEqual(proposeSiMeasurements("https://example.test/5°Cto10°C; ID 5 °C to 10 °C; RAL 9001; 2K").changes,[]);
+  assert.ok(!proposeSiMeasurements("5 °C/s to 10 °C/s").changes.some(c=>c.after.startsWith("od ")));
+});
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });
+
+
+test("relative humidity preview is explicit, idempotent and invalidates only changed reviews", () => {
+  let job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
+  const id = job.segments.find(s => s.source_text === "Fast curing")!.segment_id;
+  job = updateTranslationJobSegment(job, id, s => reviewTranslation(editTranslation({ ...s,
+    source_text: "10 min (20 °C /50 % Rh.)" }, "10 min (20 °C / 50 % r.v.)")));
+  const before = JSON.stringify(job);
+  const preview = previewMeasurementNormalization(job);
+  assert.equal(JSON.stringify(job), before);
+  const proposed = preview.changes.find(c => c.segment_id === id)!;
+  assert.equal(proposed.after, "10\u00a0min (20\u00a0°C / 50\u00a0%\u00a0r. v.)");
+  assert.equal(proposed.reviewed, true);
+  const applied = applyMeasurementNormalization(job, preview);
+  const target = applied.segments.find(s => s.segment_id === id)!;
+  assert.equal(target.source_text, "10 min (20 °C /50 % Rh.)");
+  assert.equal(target.status, "translated"); assert.equal(target.review_state, null);
+  assert.equal(target.needs_review, true);
+  assert.equal(target.current_qc?.findings.some(f => f.severity === "blocking"), false);
+  assert.equal(previewMeasurementNormalization(applied).changes.some(c => c.segment_id === id), false);
+  assert.ok(target.translation_rule_adjustments?.some(r => r.rule_version === SI_RULES_VERSION));
+  const untouched = proposeSiMeasurements("https://example.test/50%Rh. ID 50%Rh.");
+  assert.deepEqual(untouched.changes, []);
+});

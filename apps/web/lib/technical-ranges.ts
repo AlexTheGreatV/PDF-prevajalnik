@@ -1,4 +1,6 @@
-export const TECHNICAL_RANGE_RULES_VERSION = "sl-technical-ranges-v2";
+import rules from "./si-measurement-rules.json";
+import { formatSiMeasurement, formatSlovenianTemperatureRange } from "./si-measurements";
+export const TECHNICAL_RANGE_RULES_VERSION = "sl-technical-ranges-v4";
 
 export type TechnicalRangeKind = "temperature" | "measurement" | "percentage" | "time";
 export type TechnicalRangeConnector = "to" | "from_to" | "between_and" | "hyphen";
@@ -22,12 +24,12 @@ export type TechnicalRangeAnalysis = {
 };
 
 const NUMBER_SOURCE = String.raw`[+\-−]?\d+(?:[.,]\d+)?`;
-const IMMUTABLE_UNIT_SOURCE = String.raw`(?:°\s*C|MPa|kPa|Pa|mL|ml|mm|cm|kg|kW|g|L|K|W|%|min|h|m)`;
+const IMMUTABLE_UNIT_SOURCE = rules.unit_pattern;
 const WORD_UNIT_SOURCE = String.raw`(?:minutes?|hours?|days?|months?|years?)`;
 const UNIT_SOURCE = String.raw`(?:${IMMUTABLE_UNIT_SOURCE}|${WORD_UNIT_SOURCE})`;
 const RANGE_PATTERN = new RegExp(
   String.raw`(?<![\p{L}\p{N}])(?:(from|between)\s+)?(${NUMBER_SOURCE})\s*(${UNIT_SOURCE})?\s*(to|and|[-–—])\s*(${NUMBER_SOURCE})\s*(${UNIT_SOURCE})(?![\p{L}\p{N}])`,
-  "giu",
+  "gu",
 );
 const RANGE_CANDIDATE_PATTERN = new RegExp(
   String.raw`(?<![\p{L}\p{N}])(?:(?:from|between)\s+)?${NUMBER_SOURCE}\s*(?:${UNIT_SOURCE})?\s*(?:to|and|[-–—])\s*(?:${NUMBER_SOURCE}|\S+)\s*(?:${UNIT_SOURCE})?(?![\p{L}\p{N}])`,
@@ -55,6 +57,7 @@ export function analyzeTechnicalRanges(text: string): TechnicalRangeAnalysis {
 }
 
 function parseMatch(match: RegExpMatchArray): TechnicalRange | null {
+  if ([match[2], match[5]].some(value => new RegExp(rules.ambiguous_number_pattern).test(value))) return null;
   const prefix = match[1]?.toLowerCase() ?? null;
   const connectorText = match[4].toLowerCase();
   if ((prefix === "from" && connectorText !== "to") || (prefix === "between" && connectorText !== "and")) return null;
@@ -75,7 +78,10 @@ function parseMatch(match: RegExpMatchArray): TechnicalRange | null {
   const endValue = normalizeNumber(match[5]);
   const start = unitKind === "translatable_word" ? startValue : formatValue(startValue, startUnit);
   const end = unitKind === "translatable_word" ? endValue : formatValue(endValue, endUnit);
-  const targetText = connector === "from_to"
+  const temperatureTo = ["°C", "°F", "K"].includes(endUnit) && ["to", "from_to"].includes(connector);
+  const targetText = temperatureTo
+    ? formatSlovenianTemperatureRange(startValue, endValue, endUnit)!
+    : connector === "from_to"
     ? `od ${start} do ${end}`
     : connector === "between_and"
       ? `med ${start} in ${end}`
@@ -114,15 +120,15 @@ function unitFamily(unit: string): string {
     month: "month", months: "month",
     year: "year", years: "year",
   };
-  return wordFamilies[normalized] ?? normalized;
+  return wordFamilies[normalized] ?? unit;
 }
 
 function formatValue(value: string, unit: string): string {
-  return unit ? `${value}\u00a0${unit}` : value;
+  return unit ? formatSiMeasurement(`${value} ${unit}`) ?? `${value}\u00a0${unit}` : value;
 }
 
 function rangeKind(unit: string): TechnicalRangeKind {
-  if (unit === "°C") return "temperature";
+  if (["°C", "°F", "K"].includes(unit)) return "temperature";
   if (unit === "%") return "percentage";
   if (/^(?:minutes?|hours?|days?|months?|years?|min|h)$/i.test(unit)) return "time";
   return "measurement";

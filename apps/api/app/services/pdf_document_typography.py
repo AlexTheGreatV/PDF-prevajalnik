@@ -17,7 +17,7 @@ from app.services.pdf_image_overlap import PdfImageOverlapAnalyzer
 from app.services.pdf_typography import PdfTypographyResolver
 
 PROFILE_VERSION = "document-role-typography-pilot-v1"
-PROFILE_LAYOUT_REVISION = "source-line-anchors-cell-groups-v7"
+PROFILE_LAYOUT_REVISION = "source-style-heading-label-groups-v9"
 
 
 class DocumentTypographyResolver(PdfTypographyResolver):
@@ -50,8 +50,9 @@ class DocumentTypographyResolver(PdfTypographyResolver):
             role = segment.block_type
             bold = style.bold
             if role == "heading":
-                role = "heading_" + str(round(style.font_size, 2))
-                bold = True
+                # Structural heading detection may include a regular label/code.
+                # Source emphasis, not the block label, determines its style group.
+                role = "heading_" + str(round(style.font_size, 2)) if bold else "paragraph"
             elif role == "table_cell":
                 proof = segment.table_cell_provenance
                 if proof is None:
@@ -126,6 +127,28 @@ def _write_footprint(page, item, typography) -> list[pymupdf.Rect] | None:
 
 def _footprints_overlap(left, right) -> bool:
     return any(exporter._is_material_overlap(a & b) for a in left for b in right)
+
+
+
+def _formatting_footprints_conflict(left, right, left_regions, right_regions) -> bool:
+    """Only equal, proven-uniform background patches may overlap one another.
+
+    Erasure rectangles and measured glyphs never gain this permission. All patches
+    have already passed the ordinary uniform-background and expanded-area checks.
+    """
+    def split(item, regions):
+        erasures = len(item.redaction_rects) if item.background_patch_used and item.redaction_rects else 1
+        patches = len(item.patch_rects) if item.background_patch_used else 0
+        return regions[:erasures] + regions[erasures + patches:], regions[erasures:erasures + patches]
+    left_core, left_patches = split(left, left_regions)
+    right_core, right_patches = split(right, right_regions)
+    if (_footprints_overlap(left_core, right_regions) or _footprints_overlap(left_patches, right_core)):
+        return True
+    if not _footprints_overlap(left_patches, right_patches):
+        return False
+    return not (left.background_patch_used and right.background_patch_used
+                and left.image_overlap_kind == right.image_overlap_kind == "simple_background"
+                and left.background_color is not None and left.background_color == right.background_color)
 
 
 def export_document_typography_pilot(
@@ -225,7 +248,10 @@ def export_document_typography_pilot(
                 if other is item or other.page_number != item.page_number:
                     continue
                 occupied = footprints[id(other)] or [exporter._rect(other.original_bbox), exporter._rect(other.fitted_bbox)]
-                if _footprints_overlap(affected, occupied):
+                # Unknown writer geometry remains a hard obstacle.
+                conflict = (_footprints_overlap(affected, occupied) if footprints[id(other)] is None
+                            else _formatting_footprints_conflict(item, other, affected, occupied))
+                if conflict:
                     exporter._skip(item, "overlap_conflict", "Oblikovanje se prekriva z drugim posegom.")
                     break
         written_translations = sum(r.eligible for r in [*plan.replacements, *plan.ocr_replacements])

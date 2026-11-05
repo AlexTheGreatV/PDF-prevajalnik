@@ -60,11 +60,13 @@ export type ProtectedToken = {
 };
 
 export type TranslationRuleAdjustment = {
-  rule_id: "technical_range" | "technical_unit_spacing" | "decimal_separator";
+  rule_id: "technical_range" | "technical_unit_spacing" | "decimal_separator" | "reviewed_unit_symbol_correction";
   rule_version: string;
   kind: TechnicalRangeKind | "unit_spacing" | "decimal_number";
   source_text: string;
   replacement_text: string;
+  evidence_sha256?: string;
+  approval_note?: string;
 };
 
 export type GlossaryEntry = {
@@ -150,6 +152,12 @@ export type TranslationChunk = {
   translation_memory_domain?: string | null;
 };
 
+export type TerminologyAttempt = {
+  source_text: string; before: string; before_chunks?: TranslationChunk[]; candidates: string[]; selected: string | null;
+  terms: Array<{ source_term: string; target_term: string }>;
+  reason: string; mode: "full_segment_beam4";
+};
+
 export type TranslationSegment = {
   segment_id: string;
   page_number: number;
@@ -188,12 +196,14 @@ export type TranslationSegment = {
   current_qc: TranslationQcResult | null;
   chunks: TranslationChunk[];
   forced_chunking: boolean;
+  terminology_attempts?: TerminologyAttempt[];
   translation_rules_version?: string | null;
   translation_rule_adjustments?: TranslationRuleAdjustment[];
   created_at: string;
 };
 
 export type TranslationJob = {
+  reviewed_unit_correction?: import("./si-measurements").ReviewedUnitCorrection | null;
   schema_version: 10;
   export_settings?: import("./pdf-export-settings").PdfExportSettings;
   source_filename: string;
@@ -233,6 +243,8 @@ export type TranslationContext = {
   page_number: number;
   block_type: TranslationSegment["block_type"];
   glossary_matches: GlossaryMatch[];
+  domain?: string;
+  terminology_retry?: boolean;
 };
 
 export type TranslationRequest = {
@@ -242,6 +254,7 @@ export type TranslationRequest = {
 };
 
 export type TranslationProviderResult = {
+  alternative_translations?: string[];
   segment_id: string;
   translated_text: string | null;
   confidence: number | null;

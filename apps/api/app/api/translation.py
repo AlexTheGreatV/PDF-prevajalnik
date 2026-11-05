@@ -43,7 +43,7 @@ async def local_translate(
     try:
         results = await run_in_threadpool(
             provider.translate_batch,
-            [TranslationInput(segment_id=segment.segment_id, text=segment.text) for segment in payload.segments],
+            [TranslationInput(segment_id=segment.segment_id, text=segment.text, terminology_retry=segment.context is not None) for segment in payload.segments],
         )
     except LocalTranslationUnavailableError as exc:
         raise HTTPException(

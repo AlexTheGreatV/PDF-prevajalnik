@@ -62,7 +62,13 @@ export class LocalTranslationProvider implements TranslationProvider {
         body: JSON.stringify({
           source_language: sourceLanguage,
           target_language: options.target_language,
-          segments: chunk.map((request) => ({ segment_id: request.segment_id, text: request.text })),
+          segments: chunk.map((request) => ({ segment_id: request.segment_id, text: request.text,
+            ...(request.context.terminology_retry ? { context: { mode: "preferred_terms",
+              source_segment_id: request.context.segment_id, domain: request.context.domain ?? "",
+              preferred_terms: request.context.glossary_matches.filter(m => m.mode === "preferred")
+                .slice(0, 8).map(m => ({ source_term: m.source_term, target_term: m.target_term })),
+            } } : {}),
+          })),
         }),
         signal: options.signal,
       });

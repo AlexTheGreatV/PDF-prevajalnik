@@ -15,6 +15,14 @@ export function nativeSourceReviewWarning(
   return candidate ? "Sumljiv izvor: pred potrditvijo prevoda preglejte OCR izrez. Uspešen QC zaščitenih podatkov ne potrjuje pravilnosti izvora." : null;
 }
 
+export function sourceAwareQcLabel(segment: Pick<TranslationSegment, "current_qc">, sourceWarning?: string | null): string {
+  const status = segment.current_qc?.status;
+  const technical = !status || status === "not_checked" ? "Ni preverjeno"
+    : status === "passed" ? "Zaščiteni podatki preverjeni"
+    : status === "warnings" ? "Opozorila za trenutno besedilo" : "Blokada za trenutno besedilo";
+  return sourceWarning ? `Pregled izvora potreben · ${technical}` : technical;
+}
+
 export type OcrReviewStatus = "pending" | "processing" | "suggested" | "accepted" | "rejected" | "failed" | "needs_review";
 export type OcrTextSource = "native" | "ocr";
 export type OcrReviewReason =

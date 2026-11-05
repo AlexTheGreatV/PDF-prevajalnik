@@ -51,6 +51,7 @@ export async function registerAndAcceptOcrSource(file: File, item: OcrReviewItem
     text: item.ocr_text,
     source: item.source,
     reason: item.reason,
+    preferred_revision_id: item.server_revision_id,
   }));
   const registration = await parseApiResponse<{ revision_id: string }>(
     await fetchApi(`${apiBaseUrl}/api/pdf/ocr-review/register`, form),

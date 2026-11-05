@@ -86,6 +86,7 @@ class AcceptedOcrSource(BaseModel):
 
 
 class OcrReviewRegistration(BaseModel):
+    preferred_revision_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
     review_id: str = Field(min_length=1, max_length=300)
     page_number: int = Field(ge=1, le=100_000)
     bbox: BBox

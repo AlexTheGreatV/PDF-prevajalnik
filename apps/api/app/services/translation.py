@@ -43,10 +43,11 @@ class RuntimeTranslation:
     beam_size: int = 2
     raw_output_tokens: tuple[str, ...] = ()
     error_code: str | None = None
+    alternative_translations: tuple[str, ...] = ()
 
 
 class TranslationRuntime(Protocol):
-    def translate_batch(self, texts: list[str]) -> list[RuntimeTranslation | str | Exception]: ...
+    def translate_batch(self, texts: list[str], *, num_hypotheses: int = 1) -> list[RuntimeTranslation | str | Exception]: ...
 
 
 class LocalTranslationUnavailableError(RuntimeError):
@@ -57,6 +58,7 @@ class LocalTranslationUnavailableError(RuntimeError):
 class TranslationInput:
     segment_id: str
     text: str
+    terminology_retry: bool = False
 
 
 RuntimeFactory = Callable[[Path, str, str, RuntimeModelSpec], TranslationRuntime]
@@ -116,7 +118,15 @@ class LocalCTranslate2TranslationProvider:
         started = time.perf_counter()
         try:
             with self._translation_lock:
-                outputs = runtime.translate_batch([item.text for item in inputs])
+                if any(item.terminology_retry for item in inputs):
+                    # Retry full source segments with a bounded wider beam. Hints
+                    # rank real hypotheses client-side; they are never injected as text.
+                    outputs = []
+                    for item in inputs:
+                        outputs.extend(runtime.translate_batch([item.text], num_hypotheses=4)
+                                       if item.terminology_retry else runtime.translate_batch([item.text]))
+                else:
+                    outputs = runtime.translate_batch([item.text for item in inputs])
         except Exception as exc:
             raise LocalTranslationUnavailableError("Lokalni prevod ni uspel zaradi napake prevajalskega pogona.") from exc
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
@@ -138,6 +148,7 @@ class LocalCTranslate2TranslationProvider:
                         reached_decoding_limit=output.reached_decoding_limit,
                         has_end_token=output.has_end_token,
                         beam_size=output.beam_size,
+                        alternative_translations=list(output.alternative_translations),
                     )
                 )
                 continue
@@ -226,7 +237,9 @@ class CTranslate2SentencePieceRuntime:
             max_queued_batches=1,
         )
 
-    def translate_batch(self, texts: list[str]) -> list[RuntimeTranslation | Exception]:
+    def translate_batch(self, texts: list[str], *, num_hypotheses: int = 1) -> list[RuntimeTranslation | Exception]:
+        if num_hypotheses not in {1, 4}:
+            raise ValueError("Only ordinary or bounded terminology decoding is supported")
         tokenized = [encode_sentencepiece_source(self._source, text, self._spec.tokenizer) for text in texts]
         outputs: list[RuntimeTranslation | Exception | None] = [None] * len(texts)
         valid = [(index, tokens) for index, tokens in enumerate(tokenized) if len(tokens) <= self.MAX_SOURCE_TOKENS]
@@ -238,7 +251,8 @@ class CTranslate2SentencePieceRuntime:
         max_decoding_length = decoding_length_for_source_tokens(max(len(tokens) for _, tokens in valid))
         translated = self._translator.translate_batch(
             [tokens for _, tokens in valid],
-            beam_size=2,
+            beam_size=4 if num_hypotheses == 4 else 2,
+            **({"num_hypotheses": 4} if num_hypotheses == 4 else {}),
             max_batch_size=32,
             max_input_length=0,
             max_decoding_length=max_decoding_length,
@@ -258,6 +272,10 @@ class CTranslate2SentencePieceRuntime:
                 max_decoding_length,
                 reached_limit,
                 has_end_token,
+                beam_size=4 if num_hypotheses == 4 else 2,
+                alternative_translations=tuple(self._target.decode(list(h[:-1] if eos_piece and h and h[-1] == eos_piece else h))
+                                               for h in result.hypotheses[:4]
+                                               if len(h) < max_decoding_length or (eos_piece and h and h[-1] == eos_piece)) if num_hypotheses == 4 and not reached_limit else (),
                 raw_output_tokens=raw_tokens,
                 error_code="decoding_limit" if reached_limit else None,
             )

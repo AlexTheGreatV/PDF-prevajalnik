@@ -78,10 +78,11 @@ def test_pending_recognition_does_not_supersede_until_explicit_accept(tmp_path):
     assert old_worker.validate(revision_id=old.revision_id, **values()) == "stale"
     assert old_worker.accept(old.revision_id) is None  # Cannot reactivate it from another worker.
     assert durable(path).validate(revision_id=new.revision_id, **values(text="Corrected source")) is None
-    # Even an identical recognition remains a new unaccepted registration.
+    # Identical durable content reuses its acceptance without a new review event.
     pending = new_worker.register(**values(text="Corrected source"))
     assert new_worker.validate(revision_id=new.revision_id, **values(text="Corrected source")) is None
-    assert pending.revision_id != new.revision_id
+    assert pending.revision_id == new.revision_id
+    assert pending.accepted
 
 
 @pytest.mark.parametrize("change, expected", [
@@ -114,6 +115,57 @@ def test_repeat_accept_keeps_original_utc_metadata(tmp_path):
     original = repository.lookup(revision.revision_id)
     assert registry.accept(revision.revision_id)
     assert repository.lookup(revision.revision_id) == original
+
+
+def test_three_identical_acceptances_reuse_revision_without_new_metadata(tmp_path):
+    path = tmp_path / "same.sqlite3"
+    first = accepted(durable(path))
+    before = path.read_bytes()
+    for _ in range(3):
+        registry = durable(path)
+        duplicate = registry.register(**values())
+        assert duplicate.accepted and duplicate.revision_id == first.revision_id
+        assert registry.accept(duplicate.revision_id).revision_id == first.revision_id
+        assert durable(path).validate(revision_id=first.revision_id, **values()) is None
+    assert path.read_bytes() == before
+
+
+def test_legacy_duplicate_chain_recovers_but_changed_content_never_resurrects(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    registry = durable(path)
+    first = accepted(registry)
+    # Synthetic pre-fix duplicate rows: no human approval of real document text.
+    with sqlite3.connect(path) as db:
+        columns = [r[1] for r in db.execute("PRAGMA table_info(ocr_acceptances)")]
+        row = db.execute("SELECT * FROM ocr_acceptances").fetchone()
+        for revision in ["b" * 32, "c" * 32]:
+            clone = dict(zip(columns, row)); clone["revision_id"] = revision
+            db.execute("INSERT INTO ocr_acceptances VALUES (" + ",".join("?" for _ in columns) + ")", list(clone.values()))
+        db.execute("UPDATE ocr_acceptance_heads SET revision_id=?", ("c" * 32,))
+    for revision in [first.revision_id, "b" * 32, "c" * 32]:
+        assert durable(path).validate(revision_id=revision, **values()) is None
+    restored = durable(path)
+    reference = restored.register(**values(), preferred_revision_id=first.revision_id)
+    assert reference.revision_id == first.revision_id
+    assert restored.accept(reference.revision_id).revision_id == first.revision_id
+    changed = accepted(durable(path), text="Changed source")
+    assert durable(path).validate(revision_id=first.revision_id, **values()) == "stale"
+    again = accepted(durable(path))
+    assert again.revision_id != first.revision_id
+    assert durable(path).validate(revision_id=first.revision_id, **values()) == "stale"
+    assert durable(path).validate(revision_id=changed.revision_id, **values(text="Changed source")) == "stale"
+    # An explicit invalidation of the head fails closed, never a JSON-only restoration.
+    with sqlite3.connect(path) as db:
+        db.execute("DELETE FROM ocr_acceptance_heads")
+    with pytest.raises(OcrAcceptanceStorageError):
+        durable(path).validate(revision_id=again.revision_id, **values())
+    after_revoke = accepted(durable(path))
+    assert durable(path).validate(revision_id=again.revision_id, **values()) == "stale"
+    repository = SqliteOcrAcceptanceRepository(path, "test")
+    repository.revoke(values()["document_sha256"], values()["review_id"])
+    newest = accepted(durable(path))
+    assert durable(path).validate(revision_id=after_revoke.revision_id, **values()) == "stale"
+    assert durable(path).validate(revision_id=newest.revision_id, **values()) is None
 
 
 @pytest.mark.parametrize("coordinate", [float("nan"), float("inf"), -float("inf")])

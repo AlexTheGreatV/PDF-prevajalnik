@@ -1166,3 +1166,18 @@ def _work(tmp_path: Path, name: str) -> Path:
     path = tmp_path / name
     path.mkdir()
     return path
+
+
+def test_output_verification_joins_complete_consecutive_blocks_without_fuzzy_matching(tmp_path: Path) -> None:
+    from app.services.pdf_exporter import _contiguous_text_block_candidates
+    with pymupdf.open() as document:
+        page = document.new_page(width=400, height=220)
+        for y, text in [(30, "Neighbor title"), (60, "First complete line."),
+                        (90, "Second complete line."), (120, "Third complete line."),
+                        (150, "Neighbor footer")]:
+            page.insert_text((20, y), text, fontsize=10)
+        candidates = _contiguous_text_block_candidates(page, pymupdf.Rect(10, 10, 390, 180))
+        expected = "First complete line. Second complete line. Third complete line."
+        assert any(_written_text_matches(expected, text) for text in candidates)
+        assert not any(_written_text_matches("First complete line. Third complete line.", text) for text in candidates)
+        assert not any(_written_text_matches("First changed line. Second complete line. Third complete line.", text) for text in candidates)

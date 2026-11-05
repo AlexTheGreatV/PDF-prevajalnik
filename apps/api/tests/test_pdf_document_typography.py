@@ -415,3 +415,68 @@ def test_sparse_source_labels_without_row_ownership_preserve_source(tmp_path: Pa
     with pymupdf.open(source) as original, pymupdf.open(result.path) as written:
         assert written[0].get_text() == original[0].get_text()
         assert written[0].get_drawings() == original[0].get_drawings()
+
+
+def test_source_emphasis_groups_headings_and_regular_row_labels_without_promoting_codes(tmp_path: Path):
+    source = tmp_path / "source-style-groups.pdf"
+    blue = (0, .06, .21)
+    rows = [(40, "FIRST SECTION", "hebo", 10, "heading", "PRVI RAZDELEK", "reviewed"),
+            (75, "SECOND SECTION", "hebo", 10, "heading", "Nepotrjeni prevod", "translated"),
+            (115, "Black", "helv", 8.5, "paragraph", "Črna", "reviewed"),
+            (140, "RAL 9001", "helv", 8.5, "heading", "", "skipped"),
+            (165, "White", "helv", 8.5, "paragraph", "Bela", "reviewed")]
+    with pymupdf.open() as doc:
+        page = doc.new_page(width=400, height=230)
+        for y, text, font, size, *_ in rows:
+            page.insert_text((40, y), text, fontname=font, fontsize=size, color=blue)
+            if y >= 115: page.draw_rect(pymupdf.Rect(180, y-8, 205, y), fill=(.3,.4,.5))
+        doc.save(source)
+    job = _fixture_job_from_text(source, "placeholder")
+    with pymupdf.open(source) as doc:
+        segments=[]
+        for i, (y, text, font, size, kind, target, status) in enumerate(rows):
+            rect=doc[0].search_for(text)[0]
+            segments.append(job.segments[0].model_copy(update={"segment_id":f"row-{i}","block_id":f"row-{i}",
+                "block_type":kind,"source_text":text,"edited_translation":target,"status":status,
+                "source_bbox":BBox(x0=rect.x0,y0=rect.y0,x1=rect.x1,y1=rect.y1)}))
+        job.segments=segments
+        (tmp_path/'fonts').mkdir()
+        resolver=DocumentTypographyResolver(tmp_path/'fonts',doc,job)
+        assert resolver.assignments['row-0']['group']==resolver.assignments['row-1']['group']
+        assert resolver.assignments['row-2']['group']==resolver.assignments['row-3']['group']==resolver.assignments['row-4']['group']
+        assert resolver.assignments['row-0']['bold']
+        assert not resolver.assignments['row-3']['bold']
+    before=job.model_dump_json()
+    result=export_document_typography_pilot(source,job,tmp_path/'out')
+    with pymupdf.open(source) as original,pymupdf.open(result.path) as written:
+        canonical = lambda page: [{k:v for k,v in d.items() if k != 'seqno'} for d in page.get_drawings()]
+        assert canonical(original[0])==canonical(written[0])
+        text=written[0].get_text()
+        assert 'SECOND SECTION' in text and 'Nepotrjeni prevod' not in text
+        styles={}
+        for b in written[0].get_text('dict')['blocks']:
+            for line in b.get('lines',[]):
+                for span in line['spans']:
+                    if span['text'].strip() in {'Črna','Bela','RAL 9001'}:styles[span['text'].strip()]=span
+        assert len(styles)==3
+        assert len({(s['font'],round(s['size'],2),s['flags'],s['color']) for s in styles.values()})==1
+        for label,y in [('Črna',115),('RAL 9001',140),('Bela',165)]:
+            assert styles[label]['origin'][1]==pytest.approx(y,abs=.02)
+        assert text.count('RAL 9001')==1
+    assert job.model_dump_json()==before
+
+
+@pytest.mark.parametrize("collision,expected", [("blank",False),("different_color",True),("glyph",True),("erasure",True),("unproven",True)])
+def test_only_same_proven_uniform_patch_margins_may_overlap(tmp_path, collision, expected):
+    source=tmp_path/'patches.pdf';job=_fixture(source)
+    left=exporter._new_replacement(job.segments[0]);right=exporter._new_replacement(job.segments[1])
+    for item in [left,right]:
+        item.background_patch_used=True;item.image_overlap_kind='simple_background';item.background_color='#ffffff'
+        item.redaction_rects=[BBox(x0=0,y0=0,x1=1,y1=1)];item.patch_rects=[BBox(x0=0,y0=0,x1=1,y1=1)]
+    a=[pymupdf.Rect(0,0,10,8),pymupdf.Rect(0,0,10,10),pymupdf.Rect(0,0,10,8)]
+    b=[pymupdf.Rect(0,12,10,20),pymupdf.Rect(0,9,10,21),pymupdf.Rect(0,12,10,20)]
+    if collision=='different_color':right.background_color='#eeeeee'
+    if collision=='glyph':b[2]=pymupdf.Rect(0,7,10,20)
+    if collision=='erasure':b[0]=pymupdf.Rect(0,7,10,20)
+    if collision=='unproven':right.image_overlap_kind='complex_background'
+    assert document_typography._formatting_footprints_conflict(left,right,a,b) is expected

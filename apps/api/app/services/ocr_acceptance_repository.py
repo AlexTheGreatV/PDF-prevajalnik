@@ -45,6 +45,10 @@ SCHEMA = (
         revision_id TEXT NOT NULL, PRIMARY KEY(profile, document_sha256, review_id),
         FOREIGN KEY(profile, revision_id) REFERENCES ocr_acceptances(profile, revision_id))""",
 )
+INVALIDATIONS_SCHEMA = """CREATE TABLE ocr_acceptance_invalidations (
+    profile TEXT NOT NULL, document_sha256 TEXT NOT NULL, review_id TEXT NOT NULL,
+    through_rowid INTEGER NOT NULL,
+    PRIMARY KEY(profile, document_sha256, review_id))"""
 
 
 class SqliteOcrAcceptanceRepository:
@@ -72,8 +76,11 @@ class SqliteOcrAcceptanceRepository:
                 for statement in SCHEMA:
                     connection.execute(statement)
                 connection.execute("PRAGMA user_version=1")
-            elif version != 1:
+            elif version not in {1, 2}:
                 raise OcrAcceptanceStorageError()
+            if write and version in {0, 1}:
+                connection.execute(INVALIDATIONS_SCHEMA)
+                connection.execute("PRAGMA user_version=2")
             yield connection
             connection.commit()
         except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as exc:
@@ -83,9 +90,18 @@ class SqliteOcrAcceptanceRepository:
                 connection.close()  # An exceptional write transaction rolls back.
 
     def accept(self, *, revision_id: str, document_sha256: str, review_id: str, page_number: int,
-               bbox: BBox, text: str, source: str, reason: str, registered_at: str) -> bool:
+               bbox: BBox, text: str, source: str, reason: str, registered_at: str) -> OcrAcceptance | None:
         self._validate_source(revision_id, document_sha256, page_number, bbox)
         with self._connection(write=True) as db:
+            head = db.execute("SELECT a.* FROM ocr_acceptance_heads h JOIN ocr_acceptances a "
+                "ON a.profile=h.profile AND a.revision_id=h.revision_id WHERE h.profile=? "
+                "AND h.document_sha256=? AND h.review_id=?", (self.profile, document_sha256, review_id)).fetchone()
+            if head is not None:
+                current = self._record(head)
+                proposed = OcrAcceptance(revision_id, document_sha256, review_id, page_number, bbox,
+                    text, source, reason, registered_at, current.accepted_at)
+                if self._source_key(current) == self._source_key(proposed):
+                    return current  # No new revision, timestamp, or head for a duplicate acceptance.
             existing = db.execute("SELECT * FROM ocr_acceptances WHERE profile=? AND revision_id=?",
                                   (self.profile, revision_id)).fetchone()
             if existing is not None:
@@ -95,7 +111,15 @@ class SqliteOcrAcceptanceRepository:
                 if self._record(existing) != OcrAcceptance(revision_id, document_sha256, review_id, page_number,
                         bbox, text, source, reason, registered_at, existing["accepted_at"]):
                     raise OcrAcceptanceStorageError()
-                return current is not None and current["revision_id"] == revision_id
+                return self._record(existing) if current is not None and current["revision_id"] == revision_id else None
+            if head is None:
+                # A deliberately removed head must not later resurrect historical aliases.
+                through = db.execute("SELECT MAX(rowid) FROM ocr_acceptances WHERE profile=? "
+                    "AND document_sha256=? AND review_id=?", (self.profile, document_sha256, review_id)).fetchone()[0]
+                if through is not None:
+                    db.execute("INSERT INTO ocr_acceptance_invalidations VALUES (?,?,?,?) "
+                        "ON CONFLICT(profile,document_sha256,review_id) DO UPDATE SET through_rowid=excluded.through_rowid",
+                        (self.profile, document_sha256, review_id, through))
             accepted_at = datetime.now(UTC).isoformat()
             db.execute("INSERT INTO ocr_acceptances (profile,revision_id,document_sha256,review_id,page_number,"
                 "bbox_json,text,source,reason,registered_at,accepted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -104,7 +128,28 @@ class SqliteOcrAcceptanceRepository:
             db.execute("INSERT INTO ocr_acceptance_heads VALUES (?,?,?,?) "
                 "ON CONFLICT(profile,document_sha256,review_id) DO UPDATE SET revision_id=excluded.revision_id",
                 (self.profile, document_sha256, review_id, revision_id))
-            return True
+            return OcrAcceptance(revision_id, document_sha256, review_id, page_number, bbox,
+                text, source, reason, registered_at, accepted_at)
+
+    def current(self, document_sha256: str, review_id: str) -> OcrAcceptance | None:
+        if not self.database_path.exists():
+            return None
+        with self._connection() as db:
+            row = db.execute("SELECT a.* FROM ocr_acceptance_heads h JOIN ocr_acceptances a "
+                "ON a.profile=h.profile AND a.revision_id=h.revision_id WHERE h.profile=? "
+                "AND h.document_sha256=? AND h.review_id=?", (self.profile, document_sha256, review_id)).fetchone()
+            return self._record(row) if row is not None else None
+
+    def revoke(self, document_sha256: str, review_id: str) -> None:
+        """Explicit administrative invalidation, never invoked by import or verification."""
+        with self._connection(write=True) as db:
+            through = db.execute("SELECT COALESCE(MAX(rowid),0) FROM ocr_acceptances WHERE profile=? "
+                "AND document_sha256=? AND review_id=?", (self.profile, document_sha256, review_id)).fetchone()[0]
+            db.execute("INSERT INTO ocr_acceptance_invalidations VALUES (?,?,?,?) "
+                "ON CONFLICT(profile,document_sha256,review_id) DO UPDATE SET through_rowid=excluded.through_rowid",
+                (self.profile, document_sha256, review_id, through))
+            db.execute("DELETE FROM ocr_acceptance_heads WHERE profile=? AND document_sha256=? AND review_id=?",
+                (self.profile, document_sha256, review_id))
 
     def lookup(self, revision_id: str) -> tuple[OcrAcceptance | None, bool]:
         if not self.database_path.exists():
@@ -119,7 +164,30 @@ class SqliteOcrAcceptanceRepository:
                 "AND document_sha256=? AND review_id=?", (self.profile, record.document_sha256, record.review_id)).fetchone()
             if head is None:
                 raise OcrAcceptanceStorageError()
-            return record, head["revision_id"] == revision_id
+            if head["revision_id"] == revision_id:
+                return record, True
+            if db.execute("PRAGMA user_version").fetchone()[0] == 2:
+                invalidation = db.execute("SELECT through_rowid FROM ocr_acceptance_invalidations WHERE profile=? "
+                    "AND document_sha256=? AND review_id=?", (self.profile, record.document_sha256, record.review_id)).fetchone()
+                rowid = db.execute("SELECT rowid FROM ocr_acceptances WHERE profile=? AND revision_id=?",
+                    (self.profile, revision_id)).fetchone()[0]
+                if invalidation is not None and rowid <= invalidation[0]:
+                    return record, False
+            # Recover legacy duplicates only across an uninterrupted run of identical
+            # durable acceptances. A -> B -> A must never resurrect the first A.
+            chain = db.execute("SELECT * FROM ocr_acceptances WHERE profile=? AND document_sha256=? "
+                "AND review_id=? AND rowid >= (SELECT rowid FROM ocr_acceptances WHERE profile=? AND revision_id=?) "
+                "AND rowid <= (SELECT rowid FROM ocr_acceptances WHERE profile=? AND revision_id=?) ORDER BY rowid",
+                (self.profile, record.document_sha256, record.review_id, self.profile, revision_id,
+                 self.profile, head["revision_id"])).fetchall()
+            return record, bool(chain) and chain[-1]["revision_id"] == head["revision_id"] and all(
+                self._source_key(self._record(item)) == self._source_key(record) for item in chain)
+
+    @staticmethod
+    def _source_key(record: OcrAcceptance) -> tuple:
+        return (record.document_sha256, record.review_id, record.page_number,
+                record.bbox.x0, record.bbox.y0, record.bbox.x1, record.bbox.y1,
+                record.text, record.source, record.reason)
 
     @staticmethod
     def _validate_source(revision_id: str, document_sha256: str, page_number: int, bbox: BBox) -> None:

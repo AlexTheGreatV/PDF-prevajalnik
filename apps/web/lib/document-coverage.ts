@@ -126,7 +126,7 @@ export function calculateDocumentCoverage(input: {
     if (!hasAcquiredText) warnings.push("Na tej strani besedilo ni bilo pridobljeno.");
     if (unresolvedOcrCandidates > 0) warnings.push(`Nerešeni OCR kandidati: ${unresolvedOcrCandidates}.`);
     if (unreviewedImageAreas > 0) warnings.push(`Nepregledana slikovna območja: ${unreviewedImageAreas}.`);
-    const pageBlocked = segments.filter((segment) => exportItems.get(segment.segment_id)?.resolution?.startsWith("blocked_")).length;
+    const pageBlocked = reviewed.filter((segment) => exportItems.get(segment.segment_id)?.resolution?.startsWith("blocked_")).length;
     if (plan && pageBlocked > 0) warnings.push(`Potrjeni segmenti, ki niso varno izvozljivi: ${pageBlocked}.`);
 
     return {

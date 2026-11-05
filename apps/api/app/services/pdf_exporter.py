@@ -84,10 +84,19 @@ class PdfExportValidationError(ValueError):
         self.details = details or {}
 
 
-def _require_technical_integrity(segment: PdfExportSegment, authoritative_source: str) -> None:
+def _require_technical_integrity(segment: PdfExportSegment, authoritative_source: str, document_path: Path | None = None, *, page_number: int | None = None, source_bbox: dict | None = None, source_kind: str | None = None) -> None:
     # Fuzzy source matching is only a geometry aid, never a protected-data proof.
     for stage, text in (("source", segment.source_text), ("target", segment.edited_translation)):
         result = validate_technical_integrity(authoritative_source, text)
+        if not result.valid and stage == "target" and document_path is not None:
+            try:
+                result = validate_technical_integrity(authoritative_source, text,
+                    document_sha256=_sha256(document_path), segment_id=segment.segment_id,
+                    page_number=page_number, source_bbox=source_bbox, source_kind=source_kind)
+            except (OSError, ValueError, TypeError) as exc:
+                raise PdfExportValidationError("reviewed_unit_evidence_invalid",
+                    f"Dokazila merskega popravka segmenta {segment.segment_id} ni mogoče potrditi.",
+                    details={"segment_id": segment.segment_id, "expected": result.expected, "detected": result.detected}) from exc
         if not result.valid:
             raise PdfExportValidationError(
                 "protected_data_mismatch",
@@ -241,7 +250,7 @@ def _plan_segment(
     extracted = page.get_text("text", clip=rect, sort=True)
     if not _text_matches(segment.source_text, extracted):
         return _skip(replacement, "source_text_mismatch", "Besedilo v navedenem območju se ne ujema z izvornim segmentom.")
-    _require_technical_integrity(segment, extracted)
+    _require_technical_integrity(segment, extracted, Path(document.name), page_number=page.number + 1, source_bbox=_bbox(rect).model_dump(), source_kind="native")
     if not source_formatting and _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
         return _preserve_identical(replacement)
     if source_formatting and not _written_text_matches(segment.source_text, extracted):
@@ -312,7 +321,7 @@ def _plan_ocr_segment(
         return _skip(replacement, reason, message)
     if segment.source_text != provenance.accepted_text or not _same_bbox(segment.source_bbox, provenance.bbox):
         return _skip(replacement, "ocr_provenance_mismatch", "Sprejeto OCR besedilo ali območje se je po potrditvi spremenilo.")
-    _require_technical_integrity(segment, provenance.accepted_text)
+    _require_technical_integrity(segment, provenance.accepted_text, Path(document.name), page_number=segment.page_number, source_bbox=provenance.bbox.model_dump(), source_kind="accepted_ocr")
     if _strict_display_text(segment.source_text) == _strict_display_text(segment.edited_translation):
         return _preserve_identical(replacement)
     if not 1 <= segment.page_number <= document.page_count:
@@ -632,7 +641,7 @@ def _plan_provenance_cell(
     ):
         raise ValueError("Source formatting may only write the authoritative native cell text.")
     if segment.status == "reviewed" and segment.source_text_origin == "native":
-        _require_technical_integrity(segment, source_text)
+        _require_technical_integrity(segment, source_text, Path(page.parent.name), page_number=page.number + 1, source_bbox=provenance.source_bbox.model_dump(), source_kind="native")
     base = _new_replacement(segment).model_dump()
     base.update(
         source_bbox=provenance.source_bbox,
@@ -855,7 +864,7 @@ def _plan_table_cell(
     if geometry.source_bbox is None or geometry.content_bbox is None or geometry.cell_bbox is None:
         return _skip(cell, "missing_cell_bbox", "Celica nima zanesljivega vsebinskega območja.")
     if segment.status == "reviewed" and segment.source_text_origin == "native":
-        _require_technical_integrity(segment, geometry.text)
+        _require_technical_integrity(segment, geometry.text, Path(page.parent.name), page_number=page.number + 1, source_bbox=geometry.source_bbox.model_dump(), source_kind="native")
     if canonical_text(geometry.text) != canonical_text(segment.source_text):
         cell.source_match_status = "mismatch"
         return _skip(cell, "source_text_mismatch", "Izvorno besedilo se ne ujema z vsebino celice.")
@@ -2054,7 +2063,7 @@ def _verify_inserted_text(
                 verification_boxes.append(item.fitted_bbox)
             extracted_regions = [page.get_text("text", clip=_rect(bbox), sort=True) for bbox in verification_boxes]
             if item.fitted_bbox is not None:
-                extracted_regions.extend(_text_blocks_in_rect(page, _rect(item.fitted_bbox)))
+                extracted_regions.extend(_contiguous_text_block_candidates(page, _rect(item.fitted_bbox)))
             # Adjacent paragraphs can become one extraction block. Server-measured
             # writer glyph boxes allow strict full-text comparison without including
             # neighboring glyphs from the unused part of an HTML layout rectangle.
@@ -2064,6 +2073,19 @@ def _verify_inserted_text(
                 extracted_regions.append("\n".join(page.get_text("text", clip=_rect(box), sort=True) for box in measured))
             if not any(_written_text_matches(_rendered_translation(item), text) for text in extracted_regions):
                 raise PdfExportValidationError("output_verification_failed", f"Vstavljenega prevoda segmenta {item.segment_id} ni bilo mogoče preveriti.")
+
+
+def _contiguous_text_block_candidates(page: pymupdf.Page, rect: pymupdf.Rect) -> list[str]:
+    """A writer paragraph may be extracted as separate consecutive line blocks.
+
+    Compare complete sequences strictly, never a fuzzy match or character substring.
+    Nearby source content is not required to belong to the same extraction block.
+    """
+    blocks = _text_blocks_in_rect(page, rect)
+    if len(blocks) > 64:
+        return blocks  # Fail closed for excessively fragmented extraction.
+    return ["\n".join(blocks[start:end])
+            for start in range(len(blocks)) for end in range(start + 1, len(blocks) + 1)]
 
 
 def _text_blocks_in_rect(page: pymupdf.Page, rect: pymupdf.Rect) -> list[str]:

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 
+import { sourceAwareQcLabel } from "../lib/ocr-review";
 import type { TranslationSegment } from "../lib/translation-types";
 
 export function GuidedTranslationReview({
@@ -45,7 +46,7 @@ export function GuidedTranslationReview({
     <p className="translation-origin">Izvor prevoda: {translationOriginLabel(segment)}</p>
     <div className="translation-state-grid" aria-label="Stanje pregleda in kakovosti">
       <span><strong>Uporabniški pregled</strong>{segment.status === "reviewed" ? segment.review_state?.origin === "local_user_action" ? "Uporabniško potrjeno" : "Potrditev neznanega izvora" : "Ni potrjeno"}</span>
-      <span><strong>Avtomatski QC</strong>{qcLabel(segment)}</span>
+      <span><strong>Avtomatski QC</strong>{sourceAwareQcLabel(segment, sourceWarning)}</span>
     </div>
     {segment.needs_review && <p className="translation-warning">Ta prevod zahteva ročni pregled.</p>}
     {sourceWarning && <p className="translation-warning" role="note">{sourceWarning} <a href="#ocr-review">Preglej OCR območje</a></p>}
@@ -68,12 +69,6 @@ export function GuidedTranslationReview({
   </section>;
 }
 
-function qcLabel(segment: TranslationSegment): string {
-  if (!segment.current_qc || segment.current_qc.status === "not_checked") return "Ni preverjeno";
-  if (segment.current_qc.status === "passed") return "Zaščiteni podatki preverjeni";
-  if (segment.current_qc.status === "warnings") return "Opozorila";
-  return "Blokada";
-}
 
 function translationOriginLabel(segment: TranslationSegment): string {
   if (segment.translation_origin === "glossary") return "glosar";

@@ -46,11 +46,23 @@ class OcrReviewRegistry:
         scope = (str(repository.database_path), repository.profile) if repository is not None else None
         return repository, scope
 
-    def register(self, *, document_sha256: str, review_id: str, page_number: int, bbox: BBox, text: str, source: str, reason: str) -> OcrReviewRevision:
+    def register(self, *, document_sha256: str, review_id: str, page_number: int, bbox: BBox, text: str, source: str, reason: str,
+                 preferred_revision_id: str | None = None) -> OcrReviewRevision:
         now = time.monotonic()
         with self._lock:
             self._purge(now)
-            _, scope = self._context()
+            repository, scope = self._context()
+            current = repository.current(document_sha256, review_id) if repository is not None else None
+            if current is not None and (current.page_number, current.bbox, current.text, current.source, current.reason) == (page_number, bbox, text, source, reason):
+                if preferred_revision_id:
+                    preferred, valid = repository.lookup(preferred_revision_id)
+                    if valid and preferred is not None and repository._source_key(preferred) == repository._source_key(current):
+                        current = preferred  # Keep an old job's proven alias and its separate translation review.
+                revision = OcrReviewRevision(**{k: v for k, v in current.__dict__.items() if k != "accepted_at"}, accepted=True, expires_at=now + self._ttl_seconds)
+                self._records[revision.revision_id] = revision
+                self._scopes[revision.revision_id] = scope
+                self._latest[(scope, document_sha256, review_id)] = revision.revision_id
+                return revision
             revision = OcrReviewRevision(
                 revision_id=uuid.uuid4().hex,
                 document_sha256=document_sha256,
@@ -78,10 +90,18 @@ class OcrReviewRegistry:
             if (record is None or self._scopes.get(revision_id) != scope
                     or self._latest.get((scope, record.document_sha256, record.review_id)) != revision_id):
                 return None
-            if repository is not None and not repository.accept(**{
-                    key: value for key, value in record.__dict__.items() if key not in {"accepted", "expires_at"}}):
+            if repository is not None and record.accepted:
+                persisted, valid = repository.lookup(revision_id)
+                return record if valid and persisted is not None else None
+            durable = repository.accept(**{key: value for key, value in record.__dict__.items()
+                if key not in {"accepted", "expires_at"}}) if repository is not None else None
+            if repository is not None and durable is None:
                 return None
-            accepted = OcrReviewRevision(**{**record.__dict__, "accepted": True})
+            accepted = (OcrReviewRevision(**{k: v for k, v in durable.__dict__.items() if k != "accepted_at"}, accepted=True, expires_at=record.expires_at)
+                if durable is not None else OcrReviewRevision(**{**record.__dict__, "accepted": True}))
+            self._scopes[accepted.revision_id] = scope
+            self._latest[(scope, record.document_sha256, record.review_id)] = accepted.revision_id
+            self._records[accepted.revision_id] = accepted
             self._records[revision_id] = accepted
             return accepted
 

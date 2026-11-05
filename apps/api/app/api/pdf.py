@@ -105,17 +105,21 @@ async def register_ocr_review_source(file: UploadFile = File(...), source: str =
             raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail="PDF-ja za OCR revizijo ni bilo mogoče preveriti.") from exc
-        revision = ocr_review_registry.register(
-            document_sha256=document_sha256(path.read_bytes()),
-            review_id=candidate.review_id,
-            page_number=candidate.page_number,
-            bbox=candidate.bbox,
-            text=candidate.text,
-            source=candidate.source,
-            reason=candidate.reason,
-        )
+        try:
+            revision = ocr_review_registry.register(
+                document_sha256=document_sha256(path.read_bytes()),
+                review_id=candidate.review_id,
+                page_number=candidate.page_number,
+                bbox=candidate.bbox,
+                text=candidate.text,
+                source=candidate.source,
+                reason=candidate.reason,
+                preferred_revision_id=candidate.preferred_revision_id,
+            )
+        except OcrAcceptanceStorageError as exc:
+            raise _ocr_storage_unavailable(exc) from exc
     return OcrReviewRegistrationResult(
-        revision_id=revision.revision_id, accepted=False, expires_in_seconds=OCR_REVIEW_TTL_SECONDS
+        revision_id=revision.revision_id, accepted=revision.accepted, expires_in_seconds=OCR_REVIEW_TTL_SECONDS
     )
 
 
@@ -147,7 +151,7 @@ async def verify_ocr_review_sources(file: UploadFile = File(...), sources: str =
         for candidate in candidates.sources:
             try:
                 reason = ocr_review_registry.validate(document_sha256=sha,
-                    **candidate.model_dump(exclude={"bbox"}), bbox=candidate.bbox)
+                    **candidate.model_dump(exclude={"bbox", "preferred_revision_id"}), bbox=candidate.bbox)
             except OcrAcceptanceStorageError as exc:
                 raise _ocr_storage_unavailable(exc) from exc
             results.append({"revision_id": candidate.revision_id, "valid": reason is None, "reason": reason})

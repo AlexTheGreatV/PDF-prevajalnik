@@ -300,3 +300,69 @@ def test_real_hplt_model_integration() -> None:
     assert result.translated_text
     assert result.error is None
     assert provider.status().model_id == "HPLT/translate-en-sl-v2.0-hplt"
+
+
+def test_bounded_terminology_retry_preserves_ordinary_decoding(tmp_path: Path) -> None:
+    class RetryRuntime(FakeRuntime):
+        def translate_batch(self, texts, *, num_hypotheses=1):
+            self.calls.append((texts, num_hypotheses))
+            return [RuntimeTranslation("Obloga", 1, 1, 32, False, True, beam_size=4,
+                                       alternative_translations=("Obloga", "Premaz")) for _ in texts]
+    runtime = RetryRuntime()
+    provider = provider_with_runtime(tmp_path, runtime)
+    results = provider.translate_batch([TranslationInput("a", "Coating", terminology_retry=True),
+                                       TranslationInput("b", "Ordinary")])
+    assert runtime.calls == [(["Coating"], 4), (["Ordinary"], 1)]
+    assert results[0].alternative_translations == ["Obloga", "Premaz"]
+
+
+def test_terminology_retry_request_is_bounded() -> None:
+    from app.translation_models import TranslationBatchRequest
+    from pydantic import ValidationError
+    context = {"mode": "preferred_terms", "source_segment_id": "a", "domain": "technical_datasheets",
+               "preferred_terms": [{"source_term": "coating", "target_term": "premaz"}]}
+    payload = {"source_language": "en", "target_language": "sl", "segments": [{"segment_id": "a", "text": "Coating", "context": context}]}
+    assert TranslationBatchRequest.model_validate(payload).segments[0].context.domain == "technical_datasheets"
+    context["preferred_terms"] *= 9
+    with pytest.raises(ValidationError):
+        TranslationBatchRequest.model_validate(payload)
+
+
+def test_retry_endpoint_propagates_context_and_alternatives(tmp_path: Path) -> None:
+    class RetryRuntime(FakeRuntime):
+        def translate_batch(self, texts, *, num_hypotheses=1):
+            self.calls.append(num_hypotheses)
+            return [RuntimeTranslation("Obloga", 1, 1, 32, False, True, beam_size=4,
+                                       alternative_translations=("Obloga", "Premaz"))]
+    runtime = RetryRuntime()
+    app.dependency_overrides[get_local_translation_provider] = lambda: provider_with_runtime(tmp_path, runtime)
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/translation/providers/local/translate", json={
+                "source_language": "en", "target_language": "sl", "segments": [{"segment_id": "a", "text": "Coating",
+                "context": {"mode": "preferred_terms", "source_segment_id": "full-a", "domain": "technical_datasheets",
+                            "preferred_terms": [{"source_term": "coating", "target_term": "premaz"}]}}]})
+        assert response.status_code == 200
+        assert runtime.calls == [4]
+        assert response.json()["results"][0]["alternative_translations"] == ["Obloga", "Premaz"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_retry_never_exposes_truncated_alternative() -> None:
+    from types import SimpleNamespace
+    from app.services.translation import CTranslate2SentencePieceRuntime, runtime_spec_for_profile
+    class Piece:
+        def encode(self, text, out_type): return ["source"]
+        def eos_id(self): return 1
+        def id_to_piece(self, value): return "EOS"
+        def decode(self, tokens): return " ".join(tokens)
+    class Translator:
+        def translate_batch(self, texts, **kwargs):
+            assert kwargs["beam_size"] == 4 and kwargs["num_hypotheses"] == 4
+            return [SimpleNamespace(hypotheses=[["good", "EOS"], ["truncated"] * kwargs["max_decoding_length"], ["better", "EOS"]])]
+    runtime = object.__new__(CTranslate2SentencePieceRuntime)
+    runtime._spec = runtime_spec_for_profile(get_model_profile("hplt-en-sl-v2"))
+    runtime._source = runtime._target = Piece()
+    runtime._translator = Translator()
+    assert runtime.translate_batch(["Source"], num_hypotheses=4)[0].alternative_translations == ("good", "better")
