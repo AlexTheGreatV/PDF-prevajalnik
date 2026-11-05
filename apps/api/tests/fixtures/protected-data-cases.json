@@ -71,5 +71,15 @@
   {"id":"sl-range-style-arbitrary-bounds","source":"-12.50 °C to +37.0 °C","target":"od −12,50 do 37,0 °C","valid":true},
   {"id":"sl-range-style-Kelvin-unit-preserved","source":"280 K to 310 K","target":"od 280 do 310 K","valid":true},
   {"id":"sl-range-style-changed-bound","source":"-12.50 °C to +37.0 °C","target":"od −12,51 do 37,0 °C","valid":false},
-  {"id":"sl-range-style-changed-unit","source":"-12.50 °C to +37.0 °C","target":"od −12,50 do 37,0 K","valid":false}
+  {"id":"sl-range-style-changed-unit","source":"-12.50 °C to +37.0 °C","target":"od −12,50 do 37,0 K","valid":false},
+  {"id":"mins-symbol-alias","source":"approx. 15 mins (at +20 °C/RH 50%)","target":"pribl. 15 min (pri +20 °C/RH 50 %)","valid":true},
+  {"id":"mins-changed-value","source":"15 mins","target":"16 min","valid":false},
+  {"id":"mins-seconds","source":"15 mins","target":"15 s","valid":false},
+  {"id":"mins-milliseconds","source":"15 mins","target":"15 ms","valid":false},
+  {"id":"mins-missing-unit","source":"15 mins","target":"15","valid":false},
+  {"id":"mins-case-code","source":"15 MINS","target":"15 min","valid":false},
+  {"id":"parenthesized-phone","source":"Call +31 (0)888-93 88 39.","target":"Pokličite +31 (0)888-93 88 39.","valid":true},
+  {"id":"changed-phone","source":"Call +31 (0)888-93 88 39.","target":"Pokličite +31 (0)888-93 88 38.","valid":false},
+  {"id":"missing-phone-prefix","source":"Call +31 (0)888-93 88 39.","target":"Pokličite (0)888-93 88 39.","valid":false},
+  {"id":"phone-loses-trunk","source":"Call +31 (0)888-93 88 39.","target":"Pokličite +31 888-93 88 39.","valid":false}
 ]

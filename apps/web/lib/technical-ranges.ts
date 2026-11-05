@@ -1,6 +1,6 @@
 import rules from "./si-measurement-rules.json";
 import { formatSiMeasurement, formatSlovenianTemperatureRange } from "./si-measurements";
-export const TECHNICAL_RANGE_RULES_VERSION = "sl-technical-ranges-v4";
+export const TECHNICAL_RANGE_RULES_VERSION = "sl-technical-ranges-v5";
 
 export type TechnicalRangeKind = "temperature" | "measurement" | "percentage" | "time";
 export type TechnicalRangeConnector = "to" | "from_to" | "between_and" | "hyphen";
@@ -39,9 +39,13 @@ const RANGE_CANDIDATE_PATTERN = new RegExp(
 export function analyzeTechnicalRanges(text: string): TechnicalRangeAnalysis {
   const ranges: TechnicalRangeAnalysis["ranges"] = [];
   const acceptedSpans: Array<{ start: number; end: number }> = [];
+  const contacts = [...text.matchAll(new RegExp(rules.phone_pattern, "gu"))]
+    .map(match => ({ start: match.index, end: match.index + match[0].length }));
+  const overlapsContact = (start: number, end: number) => contacts.some(span => start < span.end && end > span.start);
   for (const match of text.matchAll(RANGE_PATTERN)) {
     const start = match.index;
     const end = start + match[0].length;
+    if (overlapsContact(start, end)) continue;
     const parsed = parseMatch(match);
     if (!parsed) continue;
     ranges.push({ ...parsed, start, end });
@@ -51,7 +55,7 @@ export function analyzeTechnicalRanges(text: string): TechnicalRangeAnalysis {
   const ambiguous = [...text.matchAll(RANGE_CANDIDATE_PATTERN)].some((match) => {
     const start = match.index;
     const end = start + match[0].length;
-    return !acceptedSpans.some((span) => span.start <= start && span.end >= end);
+    return !overlapsContact(start, end) && !acceptedSpans.some((span) => span.start <= start && span.end >= end);
   });
   return { ranges, warnings: ambiguous ? ["technical_range_ambiguous"] : [] };
 }

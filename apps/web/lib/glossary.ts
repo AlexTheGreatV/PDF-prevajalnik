@@ -39,7 +39,9 @@ export function findGlossaryMatches(text: string, glossary: GlossaryEntry[]): Gl
       continue;
     }
     const flags = entry.case_sensitive ? "gu" : "giu";
-    const escaped = escapeRegExp(entry.source_term.trim());
+    const escaped = entry.mode === "preferred"
+      ? preferredSourcePattern(entry.source_term.trim())
+      : escapeRegExp(entry.source_term.trim());
     const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, flags);
     for (const match of text.matchAll(pattern)) {
       const start = match.index!;
@@ -73,4 +75,15 @@ function equals(left: string, right: string, caseSensitive: boolean): boolean {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Finite orthographic alternatives, never stemming or substring matching.
+// They only discover advisory preferred-term matches; they never rewrite a translation.
+function preferredSourcePattern(term: string): string {
+  return term.split(/([ -])/u).map(part => {
+    if (part === " " || part === "-") return "[ -]";
+    if (/^(?:fibre|fiber)$/u.test(part)) return "f(?:ibre|iber)";
+    if (/^(?:Fibre|Fiber)$/u.test(part)) return "F(?:ibre|iber)";
+    return escapeRegExp(part);
+  }).join("");
 }

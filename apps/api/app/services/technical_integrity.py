@@ -36,6 +36,7 @@ TOKEN = re.compile(
     r"\{\{[A-Za-z_][A-Za-z0-9_.-]*\}\}|\$\{[A-Za-z_][A-Za-z0-9_.-]*\}|\{[A-Za-z_][A-Za-z0-9_.-]*\}|%(?:s|d)|\[LINK\]|"
     r"(?<![A-Za-z0-9_])RAL\s+[0-9]{3,5}(?![A-Za-z0-9_])|"
     r"(?<![^\W_])[+-]\s*/\s*[A-Z]\s+[0-9]+(?![^\W_])|"
+    rf"(?<!{ALNUM}){SI_RULES['phone_pattern']}(?!{ALNUM})|"
     r"(?<![^\W_])\+[0-9](?:[0-9 -]{5,}[0-9])(?![^\W_])|"
     + MEASUREMENT + "|" + OPAQUE_MEASUREMENT + r"|(?<![^\W_])CO[₂2](?![^\W_])|"
     rf"(?<!{LETTER})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){{2,}}(?!{LETTER})|"
@@ -88,7 +89,7 @@ def _si_signature(value: str) -> str:
     match = re.fullmatch(MEASUREMENT, value)
     if re.fullmatch(SI_RULES["humidity_unit_pattern"], match[2]):
         return _si_number(match[1]) + " % r. v."
-    unit = re.sub(r"[ \u00a0]", "", match[2])
+    unit = SI_RULES["accepted_unit_aliases"].get(match[2], re.sub(r"[ \u00a0]", "", match[2]))
     unit = re.sub(r"[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+", lambda m: "^" + "".join(SI_RULES["superscript"][c] for c in m[0]), unit)
     return _si_number(match[1]) + ("" if unit in {"°", "′", "″"} else " ") + unit
 
@@ -109,7 +110,10 @@ def _signatures(text: str) -> list[str]:
 
 def _range_signatures(text: str) -> list[str]:
     values, cursor = [], 0
+    contacts = [(m.start(), m.end()) for m in re.finditer(SI_RULES["phone_pattern"], text)]
     for match in RANGE.finditer(text):
+        if any(match.start() < end and match.end() > start for start, end in contacts):
+            continue
         prefix, start, first, connector, end, last = match.groups()
         if any(re.fullmatch(SI_RULES["ambiguous_number_pattern"], value) for value in (start, end)):
             continue

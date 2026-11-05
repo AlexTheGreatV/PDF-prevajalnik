@@ -2101,6 +2101,44 @@ test("temperature style changes in an existing reviewed job require explicit pre
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });
 
 
+
+test("international telephone with a parenthesized trunk code is one immutable token", () => {
+  const source = "Call +44 (0)1234-567 890 or office@example.test; www.example.test";
+  const protectedValue = protectTechnicalTokens(source);
+  assert.equal(protectedValue.tokens.filter(t => t.value === "+44 (0)1234-567 890").length, 1);
+  assert.equal(protectedValue.warnings.includes("technical_range_ambiguous"), false);
+  assert.equal(protectTechnicalTokens(source + "; between 5 and unknown").warnings.includes("technical_range_ambiguous"), true);
+  const restored = restoreTechnicalTokens(protectedValue.protected_text, protectedValue.tokens);
+  assert.equal(restored, source);
+  assert.equal(validateTranslationTechnicalIntegrity(source, restored).valid, true);
+  assert.equal(validateTranslationTechnicalIntegrity(source, restored.replace("890", "891")).valid, false);
+  assert.equal(validateTranslationTechnicalIntegrity(source, restored.replace("office@", "other@")).valid, false);
+});
+
+test("known minute abbreviation normalizes with provenance but never changes value or unit", () => {
+  const protectedValue = protectTechnicalTokens("approx. 17 mins");
+  assert.equal(protectedValue.tokens[0].value, "17 mins");
+  assert.equal(protectedValue.tokens[0].replacement_value, "17\u00a0min");
+  assert.equal(protectedValue.tokens[0].rule_version, SI_RULES_VERSION);
+  assert.equal(validateTranslationTechnicalIntegrity("17 mins", "17 min").valid, true);
+  for (const bad of ["18 min", "17 ms", "17", "17 h"]) {
+    assert.equal(validateTranslationTechnicalIntegrity("17 mins", bad).valid, false);
+  }
+});
+
+test("preferred term spelling variants stay advisory and exact entries remain literal", () => {
+  const entry: GlossaryEntry = { id: "orthography", source_term: "fibre cement panels", target_term: "vlaknocementne plošče", mode: "preferred", case_sensitive: false, enabled: true, origin: "user" };
+  const source = "Bond fiber cement panels safely.";
+  assert.equal(findGlossaryMatches(source, [entry])[0].matched_text, "fiber cement panels");
+  assert.equal(findGlossaryMatches("fiberglass cement panels", [entry]).length, 0);
+  assert.equal(findGlossaryMatches(source, [{ ...entry, mode: "locked_inline" }]).length, 0);
+  assert.equal(findGlossaryMatches("fiber cement panels", [{ ...entry, mode: "exact_segment" }]).length, 0);
+  const hyphen = { ...entry, source_term: "shrink-free", target_term: "brez krčenja" };
+  assert.equal(findGlossaryMatches("Shrink free.", [hyphen]).length, 1);
+  assert.equal(findGlossaryMatches("shrink freely", [hyphen]).length, 0);
+  assert.equal(findGlossaryMatches("FIBER cement panels", [{ ...entry, case_sensitive: true }]).length, 0);
+});
+
 test("relative humidity preview is explicit, idempotent and invalidates only changed reviews", () => {
   let job = createTranslationJob(fixture(), [], { source_language: "en", target_language: "sl" });
   const id = job.segments.find(s => s.source_text === "Fast curing")!.segment_id;

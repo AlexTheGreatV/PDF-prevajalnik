@@ -1,6 +1,7 @@
 import rules from "./si-measurement-rules.json";
 
 export const SI_RULES_VERSION = rules.version;
+export const INTERNATIONAL_PHONE_PATTERN = rules.phone_pattern;
 export type ReviewedUnitCorrection = {
   version: 1; profile: string; document_sha256: string; segment_id: string; source_text: string;
   page_number: number; source_bbox: { x0: number; y0: number; x1: number; y1: number }; source_kind: string;
@@ -43,7 +44,7 @@ export function formatSiMeasurement(value: string, signature = false): string | 
   if (new RegExp(`^${rules.humidity_unit_pattern}$`, "u").test(match[2])) {
     return `${number}${signature ? " " : rules.value_unit_separator}${signature ? "% r. v." : rules.humidity_unit_output}`;
   }
-  const rawUnit = match[2].replace(/[ \u00a0]/g, "");
+  const rawUnit = (rules.accepted_unit_aliases as Record<string, string>)[match[2]] ?? match[2].replace(/[ \u00a0]/g, "");
   const superscript: Record<string, string> = rules.superscript;
   const raised = Object.fromEntries(Object.entries(superscript).map(([key, value]) => [value, key]));
   const unit = signature ? rawUnit.replace(/[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+/g, value => `^${[...value].map(c => superscript[c]).join("")}`)

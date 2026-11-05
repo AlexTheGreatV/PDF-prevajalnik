@@ -1,9 +1,9 @@
 {
-  "version": "sl-si-measurements-v3",
+  "version": "sl-si-measurements-v4",
   "decimal_marker": ",",
   "value_unit_separator": " ",
   "number_pattern": "[+\\-−]?[0-9]+(?:[.,][0-9]+)?",
-  "unit_pattern": "(?:%[ \\u00a0]*(?:[Rr][Hh]\\.?|[Rr]\\.[ \\u00a0]*[Vv]\\.)|(?:°[ \\u00a0]?C|°[ \\u00a0]?F|min|h|%|°|′|″|(?<=[ \\u00a0])K|(?:(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)?(?:mol|kat|rad|sr|Hz|Pa|Wb|lm|lx|Bq|Gy|Sv|cd|g|m|s|A|N|J|W|C|V|F|Ω|S|T|H|L|l)|(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)K))(?:[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+|\\^[+\\-]?[0-9]+)?(?:[·/](?:K|min|h|(?:(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)?(?:mol|kat|rad|sr|Hz|Pa|Wb|lm|lx|Bq|Gy|Sv|cd|g|m|s|A|N|J|W|C|V|F|Ω|S|T|H|L|l)|(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)K))(?:[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+|\\^[+\\-]?[0-9]+)?)*)",
+  "unit_pattern": "(?:%[ \\u00a0]*(?:[Rr][Hh]\\.?|[Rr]\\.[ \\u00a0]*[Vv]\\.)|(?:°[ \\u00a0]?C|°[ \\u00a0]?F|mins|min|h|%|°|′|″|(?<=[ \\u00a0])K|(?:(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)?(?:mol|kat|rad|sr|Hz|Pa|Wb|lm|lx|Bq|Gy|Sv|cd|g|m|s|A|N|J|W|C|V|F|Ω|S|T|H|L|l)|(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)K))(?:[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+|\\^[+\\-]?[0-9]+)?(?:[·/](?:K|min|h|(?:(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)?(?:mol|kat|rad|sr|Hz|Pa|Wb|lm|lx|Bq|Gy|Sv|cd|g|m|s|A|N|J|W|C|V|F|Ω|S|T|H|L|l)|(?:da|Q|R|Y|Z|E|P|T|G|M|k|h|d|c|m|µ|μ|n|p|f|a|z|y|r|q)K))(?:[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+|\\^[+\\-]?[0-9]+)?)*)",
   "ambiguous_number_pattern": "^[+\\-−]?[0-9]{1,3}[.,][0-9]{3}$",
   "sources": [
     "https://www.bipm.org/en/publications/si-brochure",
@@ -29,5 +29,9 @@
   "opaque_unit_pattern": "(?:°[0-9]+(?:[.,][0-9]+)?[′″](?:[0-9]+(?:[.,][0-9]+)?″)?|[A-Za-zµμΩ°]+[A-Za-z0-9µμΩ°⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹/^·()]*[/^·⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹][A-Za-z0-9µμΩ°⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹/^·()]*)",
   "suspicious_unit_pattern": "(?:°[ \\u00a0]?[cC]|°[ \\u00a0]?[fF]|[mM][iI][nN]|[hH]|%|°|′|″|(?<=[ \\u00a0])[kK]|(?:(?:[dD][aA]|[qQ]|[rR]|[yY]|[zZ]|[eE]|[pP]|[tT]|[gG]|[mM]|[kK]|[hH]|[dD]|[cC]|[mM]|µ|μ|[nN]|[pP]|[fF]|[aA]|[zZ]|[yY]|[rR]|[qQ])?(?:[mM][oO][lL]|[kK][aA][tT]|[rR][aA][dD]|[sS][rR]|[hH][zZ]|[pP][aA]|[wW][bB]|[lL][mM]|[lL][xX]|[bB][qQ]|[gG][yY]|[sS][vV]|[cC][dD]|[gG]|[mM]|[sS]|[aA]|[nN]|[jJ]|[wW]|[cC]|[vV]|[fF]|Ω|[sS]|[tT]|[hH]|[lL]|[lL])|(?:[dD][aA]|[qQ]|[rR]|[yY]|[zZ]|[eE]|[pP]|[tT]|[gG]|[mM]|[kK]|[hH]|[dD]|[cC]|[mM]|µ|μ|[nN]|[pP]|[fF]|[aA]|[zZ]|[yY]|[rR]|[qQ])[kK]))(?:[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+|\\^[+\\-]?[0-9]+)?(?:[·/](?:[kK]|[mM][iI][nN]|[hH]|(?:(?:[dD][aA]|[qQ]|[rR]|[yY]|[zZ]|[eE]|[pP]|[tT]|[gG]|[mM]|[kK]|[hH]|[dD]|[cC]|[mM]|µ|μ|[nN]|[pP]|[fF]|[aA]|[zZ]|[yY]|[rR]|[qQ])?(?:[mM][oO][lL]|[kK][aA][tT]|[rR][aA][dD]|[sS][rR]|[hH][zZ]|[pP][aA]|[wW][bB]|[lL][mM]|[lL][xX]|[bB][qQ]|[gG][yY]|[sS][vV]|[cC][dD]|[gG]|[mM]|[sS]|[aA]|[nN]|[jJ]|[wW]|[cC]|[vV]|[fF]|Ω|[sS]|[tT]|[hH]|[lL]|[lL])|(?:[dD][aA]|[qQ]|[rR]|[yY]|[zZ]|[eE]|[pP]|[tT]|[gG]|[mM]|[kK]|[hH]|[dD]|[cC]|[mM]|µ|μ|[nN]|[pP]|[fF]|[aA]|[zZ]|[yY]|[rR]|[qQ])[kK]))(?:[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+|\\^[+\\-]?[0-9]+)?)*",
   "humidity_unit_pattern": "%[ \\u00a0]*(?:[Rr][Hh]\\.?|[Rr]\\.[ \\u00a0]*[Vv]\\.)",
-  "humidity_unit_output": "% r. v."
+  "humidity_unit_output": "% r. v.",
+  "accepted_unit_aliases": {
+    "mins": "min"
+  },
+  "phone_pattern": "\\+[0-9]{1,3}[ \\u00a0]*\\([0-9]{1,4}\\)[ \\u00a0]*[0-9](?:[0-9 \\u00a0-]{5,}[0-9])"
 }
