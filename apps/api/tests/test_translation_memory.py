@@ -171,6 +171,7 @@ def test_locked_database_returns_a_safe_api_error(repository: SqliteTranslationM
 
 
 def test_default_database_path_does_not_depend_on_working_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TRANSLATION_MEMORY_DATABASE_PATH", raising=False)
     expected = (PROJECT_ROOT / "local-data" / "translation-memory.sqlite3").resolve()
     paths = []
     for working_directory in (PROJECT_ROOT, PROJECT_ROOT / "apps" / "api"):

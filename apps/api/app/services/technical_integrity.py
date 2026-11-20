@@ -31,6 +31,18 @@ MEASUREMENT = (r"(?<![\w.,])(" + SI_RULES["number_pattern"] + r")[ \u00a0]*((?:"
     + SI_RULES["unit_pattern"] + "|" + SI_RULES["review_unit_pattern"] + r"))(?![\w/^⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹·])")
 OPAQUE_MEASUREMENT = (r"(?<![\w.,])" + SI_RULES["number_pattern"] + r"[ \u00a0]*(?:"
     + SI_RULES["suspicious_unit_pattern"] + "|" + SI_RULES["opaque_unit_pattern"] + r")(?![\w/^⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹·])")
+RATE = (r"(?<![\w.,])(" + SI_RULES["number_pattern"] + r")[ \u00a0]*(" + SI_RULES["rate_length_pattern"]
+        + r")[ \u00a0]*/[ \u00a0]*(" + SI_RULES["number_pattern"] + r")[ \u00a0]*(" + SI_RULES["rate_time_pattern"]
+        + r")(?![\w/^⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹·])")
+
+
+def _rate_signature(value: str) -> str | None:
+    m = re.fullmatch(RATE, value)
+    if (not m or any(re.fullmatch(SI_RULES["ambiguous_number_pattern"], v) for v in (m[1], m[3]))
+            or m[3].startswith(("-", "−")) or re.fullmatch(r"\+?0+(?:[.,]0+)?", m[3])):
+        return None
+    return f"{_si_number(m[1])} {m[2]}/{_si_number(m[3])} h"
+
 TOKEN = re.compile(
     r"https?://[^\s]+|www\.[^\s]+|[A-Za-z0-9_.+-]+@[A-Za-z0-9_.-]+\.[A-Za-z]{2,}|"
     r"\{\{[A-Za-z_][A-Za-z0-9_.-]*\}\}|\$\{[A-Za-z_][A-Za-z0-9_.-]*\}|\{[A-Za-z_][A-Za-z0-9_.-]*\}|%(?:s|d)|\[LINK\]|"
@@ -38,7 +50,7 @@ TOKEN = re.compile(
     r"(?<![^\W_])[+-]\s*/\s*[A-Z]\s+[0-9]+(?![^\W_])|"
     rf"(?<!{ALNUM}){SI_RULES['phone_pattern']}(?!{ALNUM})|"
     r"(?<![^\W_])\+[0-9](?:[0-9 -]{5,}[0-9])(?![^\W_])|"
-    + MEASUREMENT + "|" + OPAQUE_MEASUREMENT + r"|(?<![^\W_])CO[₂2](?![^\W_])|"
+    + RATE + "|" + MEASUREMENT + "|" + OPAQUE_MEASUREMENT + r"|(?<![^\W_])CO[₂2](?![^\W_])|"
     rf"(?<!{LETTER})(?=[A-Za-z0-9₂₃₄₅₆₇₈₉]*[₂₃₄₅₆₇₈₉])(?:[A-Z][a-z]?[0-9₂₃₄₅₆₇₈₉]*){{2,}}(?!{LETTER})|"
     r"(?<![A-Za-z0-9_])[A-Z]{1,8}[-/]?(?=[A-Z0-9/-]*[0-9])[A-Z0-9/-]{1,20}(?![A-Za-z0-9_])|"
     r"(?<![^\W_])[0-9]+[A-Z][A-Z0-9/-]*(?![^\W_])|" + NUMBER
@@ -135,7 +147,10 @@ def _tokens(text: str) -> list[str]:
     values = []
     for match in TOKEN.finditer(text):
         value = match[0]
-        if re.fullmatch(MEASUREMENT, value):
+        if re.fullmatch(RATE, value):
+            labeled = re.search(SI_RULES["machine_label_pattern"], text[max(0, match.start()-24):match.start()], re.I)
+            values.append(value if labeled else _rate_signature(value) or value)
+        elif re.fullmatch(MEASUREMENT, value):
             labeled = re.search(SI_RULES["machine_label_pattern"], text[max(0, match.start()-24):match.start()], re.I)
             labeled = labeled or (text[max(0, match.start()-1):match.start()] == "/" and
                 re.fullmatch(r"[A-Za-z0-9_]", text[max(0, match.start()-2):match.start()-1]))

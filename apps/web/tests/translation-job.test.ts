@@ -6,7 +6,7 @@ import { nativeSourceReviewWarning, sourceAwareQcLabel } from "../lib/ocr-review
 import type { OcrReviewItem } from "../lib/ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "../lib/pdf-types";
 import { createDefaultGlossary } from "../lib/default-glossary";
-import { findGlossaryMatches } from "../lib/glossary";
+import { containsPreferredTerm, findGlossaryMatches } from "../lib/glossary";
 import { proposeSiMeasurements, SI_RULES_VERSION } from "../lib/si-measurements";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "../lib/technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "../lib/technical-ranges";
@@ -36,6 +36,7 @@ import {
   splitOversizedChunk,
   translateJobBatch,
   updateTranslationJobSegment,
+  updateJobGlossary,
   validateTranslationTechnicalIntegrity,
   validateTranslationJobCompatibility,
 } from "../lib/translation-job";
@@ -1870,7 +1871,7 @@ test("new temperature QC refresh preserves valid content review and reports exac
   assert.equal(current.segments[0].status, "reviewed");
   assert.deepEqual(current.segments[0].review_state, reviewed.segments[0].review_state);
   assert.equal(current.segments[0].current_qc?.status, "passed");
-  assert.ok(current.segments[0].current_qc?.rules_revision.includes("current-segment-qc-v2"));
+  assert.ok(current.segments[0].current_qc?.rules_revision.includes("current-segment-qc-v3"));
   const wrong = updateTranslationJobSegment(current, current.segments[0].segment_id, s => editTranslation(s, "od 40 do 90 °C"));
   assert.equal(wrong.segments[0].status, "translated");
   assert.equal(wrong.segments[0].current_qc?.status, "blocked");
@@ -2098,6 +2099,61 @@ test("temperature style changes in an existing reviewed job require explicit pre
   assert.deepEqual(proposeSiMeasurements("https://example.test/5°Cto10°C; ID 5 °C to 10 °C; RAL 9001; 2K").changes,[]);
   assert.ok(!proposeSiMeasurements("5 °C/s to 10 °C/s").changes.some(c=>c.after.startsWith("od ")));
 });
+
+test("explicit inflected target forms have strict boundaries and survive JSON roundtrip", () => {
+  const base = terminologyFixture();
+  base.glossary[0].target_forms = ["premaza", "premazom"];
+  base.glossary_snapshot = structuredClone(base.glossary);
+  const id = base.segments[0].segment_id;
+  const reviewed = updateTranslationJobSegment(base,id,s=>reviewTranslation(editTranslation(s,"Brez premaza.")));
+  assert.equal(reviewed.segments[0].current_qc?.findings.some(f=>f.code === "preferred_term_missing"),false);
+  assert.equal(reviewed.segments[0].status,"reviewed"); // Synthetic, not a real user's review.
+  assert.deepEqual(importTranslationJob(exportTranslationJob(reviewed)).glossary[0].target_forms,["premaza","premazom"]);
+  assert.equal(containsPreferredTerm("nepremazan", "premaz", ["premaza"]),false);
+  assert.equal(containsPreferredTerm("vlaknocementnih ploščic", "vlaknocementne plošče", ["vlaknocementnih plošč"]),false);
+  const missing = updateTranslationJobSegment(reviewed,id,s=>editTranslation(s,"Brez obloge."));
+  assert.equal(missing.segments[0].current_qc?.findings.some(f=>f.code === "preferred_term_missing"),true);
+  assert.equal(missing.segments[0].status,"translated");
+  assert.equal(missing.segments[0].review_state,null);
+  const malformed = JSON.parse(exportTranslationJob(reviewed)); malformed.glossary[0].target_forms = [42];
+  assert.throws(()=>importTranslationJob(JSON.stringify(malformed)));
+});
+
+test("an explicit declined target form avoids a pointless terminology rewrite", async () => {
+  let base = terminologyFixture();
+  base = updateJobGlossary(base,base.glossary.map(entry=>({...entry,target_forms:["premazom"]})));
+  const provider = new DeterministicProvider(()=>"S premazom.");
+  const result = await translateJobBatch(base,provider);
+  assert.equal(provider.calls,1);
+  assert.equal(result.segments[0].terminology_attempts?.length ?? 0,0);
+  assert.equal(result.segments[0].current_qc?.findings.some(f=>f.code === "preferred_term_missing"),false);
+  assert.equal(result.segments[0].status,"translated");
+  assert.equal(result.segments[0].review_state,null);
+});
+
+test("table component count is a preserved value rather than a page number", () => {
+  assert.equal(getSkipReason("1","table_cell"),"Samostojna številčna vrednost; prevod ni potreben.");
+  assert.equal(getSkipReason("1","paragraph"),"Samostojna številka strani.");
+  assert.equal(getSkipReason("1 component","table_cell"),null);
+});
+
+test("an explicit length per duration is one checked rate with provenance", () => {
+  const source="Cures at 4 mm/36 hours.";
+  const value=protectTechnicalTokens(source);
+  assert.equal(value.tokens.length,1);
+  assert.equal(value.tokens[0].value,"4 mm/36 hours");
+  assert.equal(value.tokens[0].replacement_value,"4\u00a0mm/36\u00a0h");
+  assert.equal(value.tokens[0].rule_version,SI_RULES_VERSION);
+  const preview=proposeSiMeasurements(source);
+  assert.equal(preview.warnings.length,0);
+  assert.equal(preview.changes.length,1);
+  assert.deepEqual(proposeSiMeasurements("ID 4 mm/36 hours; https://example.test/4mm/36hours").changes,[]);
+  assert.equal(validateTranslationTechnicalIntegrity(source,"Utrjuje se s hitrostjo 4 mm/36 h.").valid,true);
+  for(const bad of ["4 mm/35 h","4 cm/36 h","4 mm/36 min","36 mm/4 h","4 mm"]) {
+    assert.equal(validateTranslationTechnicalIntegrity("4 mm/36 hours",bad).valid,false);
+  }
+});
+
 void Promise.all(tests).catch((error) => { console.error(error); process.exitCode = 1; });
 
 

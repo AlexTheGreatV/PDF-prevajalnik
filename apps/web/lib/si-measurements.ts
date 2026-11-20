@@ -28,6 +28,16 @@ export function isMachineValue(text: string, offset: number): boolean {
 }
 export const SI_MEASUREMENT_PATTERN = `(?<![\\p{L}\\p{N}_.,])(${rules.number_pattern})[ \\u00a0]*((?:${rules.unit_pattern}|${rules.review_unit_pattern}))(?![\\p{L}\\p{N}_/^⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹·])`;
 export const OPAQUE_MEASUREMENT_PATTERN = `(?<![\\p{L}\\p{N}_.,])${rules.number_pattern}[ \\u00a0]*(?:${rules.suspicious_unit_pattern}|${rules.opaque_unit_pattern})(?![\\p{L}\\p{N}_/^⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹·])`;
+// A quantity per explicit positive duration, not a numeric range or a unit spelling guess.
+export const SI_RATE_PATTERN = `(?<![\\p{L}\\p{N}_.,])(${rules.number_pattern})[ \\u00a0]*(${rules.rate_length_pattern})[ \\u00a0]*/[ \\u00a0]*(${rules.number_pattern})[ \\u00a0]*(${rules.rate_time_pattern})(?![\\p{L}\\p{N}_/^⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹·])`;
+function formatRate(value: string, signature: boolean): string | null {
+  const m = value.match(new RegExp(`^${SI_RATE_PATTERN}$`, "u"));
+  if (!m || [m[1],m[3]].some(v => new RegExp(rules.ambiguous_number_pattern).test(v))
+      || /^[−-]/u.test(m[3]) || /^\+?0+(?:[.,]0+)?$/u.test(m[3])) return null;
+  const number = (v: string) => signature ? canonicalSiNumber(v) : canonicalSiNumber(v).replace(/^-/, "−");
+  const space = signature ? " " : rules.value_unit_separator;
+  return `${number(m[1])}${space}${m[2]}/${number(m[3])}${space}h`;
+}
 const protectedText = /https?:\/\/[^\s]+|www\.[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/gu;
 
 export function canonicalSiNumber(value: string): string {
@@ -36,6 +46,8 @@ export function canonicalSiNumber(value: string): string {
 }
 
 export function formatSiMeasurement(value: string, signature = false): string | null {
+  const rate = formatRate(value, signature);
+  if (rate !== null) return rate;
   const match = value.match(new RegExp(`^${SI_MEASUREMENT_PATTERN}$`, "u"));
   if (!match) return null;
   const canonicalNumber = canonicalSiNumber(match[1]);
@@ -76,6 +88,13 @@ export function proposeSiMeasurements(text: string) {
     const after = formatSlovenianTemperatureRange(m[1],m[3],last);
     if (after === null) continue;
     protectedSpans.push([m.index,m.index+m[0].length]);
+    if (after !== m[0]) changes.push({rule_id:SI_RULES_VERSION,before:m[0],after,start:m.index,end:m.index+m[0].length});
+  }
+  for (const m of text.matchAll(new RegExp(SI_RATE_PATTERN, "gu"))) {
+    if (isMachineValue(text, m.index) || protectedSpans.some(([start,end]) => start <= m.index && m.index < end)) continue;
+    protectedSpans.push([m.index,m.index+m[0].length]);
+    const after = formatRate(m[0],false);
+    if (after === null) { warnings.push(`ambiguous_measurement_rate:${m[0]}`); continue; }
     if (after !== m[0]) changes.push({rule_id:SI_RULES_VERSION,before:m[0],after,start:m.index,end:m.index+m[0].length});
   }
   for (const m of text.matchAll(new RegExp(SI_MEASUREMENT_PATTERN, "gu"))) {

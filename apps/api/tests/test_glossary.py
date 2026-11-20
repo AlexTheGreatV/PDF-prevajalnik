@@ -432,6 +432,7 @@ def test_entry_survives_repository_restart(tmp_path: Path) -> None:
 
 
 def test_default_database_path_is_independent_of_working_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GLOSSARY_DATABASE_PATH", raising=False)
     expected = PROJECT_ROOT / "local-data" / "glossary.sqlite3"
     paths = []
     for working_directory in (PROJECT_ROOT, PROJECT_ROOT / "apps" / "api"):
@@ -444,6 +445,7 @@ def test_default_database_path_does_not_create_database_under_arbitrary_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("GLOSSARY_DATABASE_PATH", raising=False)
     monkeypatch.chdir(tmp_path)
     settings = Settings(_env_file=None)
     assert settings.glossary_database_path == PROJECT_ROOT / "local-data" / "glossary.sqlite3"

@@ -81,5 +81,19 @@
   {"id":"parenthesized-phone","source":"Call +31 (0)888-93 88 39.","target":"Pokličite +31 (0)888-93 88 39.","valid":true},
   {"id":"changed-phone","source":"Call +31 (0)888-93 88 39.","target":"Pokličite +31 (0)888-93 88 38.","valid":false},
   {"id":"missing-phone-prefix","source":"Call +31 (0)888-93 88 39.","target":"Pokličite (0)888-93 88 39.","valid":false},
-  {"id":"phone-loses-trunk","source":"Call +31 (0)888-93 88 39.","target":"Pokličite +31 888-93 88 39.","valid":false}
+  {"id":"phone-loses-trunk","source":"Call +31 (0)888-93 88 39.","target":"Pokličite +31 888-93 88 39.","valid":false},
+  {"id":"rate-hours-slash","source":"3 mm/24 hours","target":"3 mm/24 h","valid":true},
+  {"id":"rate-hours-declined","source":"2.5 mm/12 hours","target":"2,5 mm/12 ur","valid":true},
+  {"id":"rate-changed-length","source":"3 mm/24 hours","target":"3 cm/24 h","valid":false},
+  {"id":"rate-changed-value","source":"3 mm/24 hours","target":"4 mm/24 h","valid":false},
+  {"id":"rate-changed-duration","source":"3 mm/24 hours","target":"3 mm/12 h","valid":false},
+  {"id":"rate-swapped-values","source":"3 mm/24 hours","target":"24 mm/3 h","valid":false},
+  {"id":"rate-changed-time-unit","source":"3 mm/24 hours","target":"3 mm/24 min","valid":false},
+  {"id":"rate-missing-time-unit","source":"3 mm/24 hours","target":"3 mm/24","valid":false},
+  {"id":"rate-recomputed-average","source":"3 mm/24 hours","target":"0.125 mm/h","valid":false},
+  {"id":"rate-lost-minus","source":"-3 mm/24 hours","target":"3 mm/24 h","valid":false},
+  {"id":"rate-identifier-is-literal","source":"ID 3 mm/24 hours","target":"ID 3 mm/24 h","valid":false},
+  {"id":"rate-ambiguous-number","source":"1,000 mm/24 hours","target":"1 mm/24 h","valid":false},
+  {"id":"rate-zero-duration","source":"3 mm/24 hours","target":"3 mm/0 h","valid":false},
+  {"id":"rate-zero-numerator","source":"0 mm/24 hours","target":"0 mm/24 h","valid":true}
 ]

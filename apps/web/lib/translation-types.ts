@@ -73,6 +73,7 @@ export type GlossaryEntry = {
   id: string;
   source_term: string;
   target_term: string;
+  target_forms?: string[];
   case_sensitive: boolean;
   mode: GlossaryMode;
   enabled: boolean;
@@ -92,6 +93,7 @@ export type GlossaryMatch = {
   glossary_id: string;
   source_term: string;
   target_term: string;
+  target_forms?: string[];
   matched_text: string;
   mode: GlossaryMode;
   origin: GlossaryOrigin;

@@ -1,4 +1,4 @@
-import { findExactSegmentGlossaryMatch, findGlossaryMatches, orderedGlossary } from "./glossary";
+import { containsPreferredTerm, findExactSegmentGlossaryMatch, findGlossaryMatches, orderedGlossary } from "./glossary";
 import type { OcrReviewItem } from "./ocr-review";
 import type { PdfAnalysis, StructuredBlock, StructuredRegion } from "./pdf-types";
 import { protectTechnicalTokens, restoreTechnicalTokens } from "./technical-tokens";
@@ -431,6 +431,7 @@ export function getSkipReason(
   if (blockType === "list") return "Vsebnik seznama; prevajajo se posamezne alineje.";
   if (blockType === "table") return "Tabela brez strukturiranih celic.";
   if (!["heading", "paragraph", "list_item", "table_cell", "caption"].includes(blockType) && !["header", "footer"].includes(regionKind)) return "Vrsta bloka ni vključena v prevod.";
+  if (blockType === "table_cell" && /^\d+(?:[.,]\d+)?$/u.test(value)) return "Samostojna številčna vrednost; prevod ni potreben.";
   if (/^(?:page\s*)?\d+(?:\s*\/\s*\d+)?$/i.test(value)) return "Samostojna številka strani.";
   if (/^(?:https?:\/\/|www\.|[\w.+-]+@[\w.-]+\.)/i.test(value) && !/\s/.test(value)) return "Samostojen URL ali e-poštni naslov.";
   if (!/\p{L}/u.test(value)) return "Besedilo ne vsebuje črk.";
@@ -703,7 +704,7 @@ async function retryMissingPreferredTerms(segments: TranslationSegment[], glossa
     const terms = [...new Map(segment.glossary_matches.filter(m => m.mode === "preferred" && m.target_term.trim())
       .map(m => [m.glossary_id, m])).values()];
     if (segment.status !== "translated" || segment.translation_origin === "translation_memory"
-        || !terms.some(m => !containsTerm(segment.edited_translation, m.target_term)) || terms.length > 8) {
+        || !terms.some(m => !containsPreferredTerm(segment.edited_translation, m.target_term, m.target_forms)) || terms.length > 8) {
       output.push(segment); continue;
     }
     const protectedValue = protectForTranslation(segment.source_text, glossary, "primary_tk");
@@ -720,7 +721,7 @@ async function retryMissingPreferredTerms(segments: TranslationSegment[], glossa
         for (const raw of [...new Set([result.translated_text, ...(result.alternative_translations ?? [])].filter((x): x is string => typeof x === "string"))].slice(0, 4)) {
           try { candidates.push(restoreProtectedTokens(raw, protectedValue.tokens)); } catch { /* Unusable placeholder candidate is never applied. */ }
         }
-        const valid = candidates.filter(text => terms.every(m => containsTerm(text, m.target_term))
+        const valid = candidates.filter(text => terms.every(m => containsPreferredTerm(text, m.target_term, m.target_forms))
           && validateTranslationTechnicalIntegrity(segment.source_text, text).valid);
         // A whole-segment model rewrite must not silently replace approved exact-TM chunks.
         if (segment.chunks.some(c => c.translation_memory_entry_id)) reason = "review_required_for_memory_alignment";
@@ -882,7 +883,7 @@ function assembleSegment(segment: TranslationSegment, chunks: TranslationChunk[]
   });
   const translated = complete ? chunks.map((chunk) => chunk.translated_text + chunk.separator_after).join("").trimEnd() : "";
   const missingPreferred = complete ? segment.glossary_matches.filter((match) =>
-    match.mode === "preferred" && match.target_term.trim() && !containsTerm(translated, match.target_term),
+    match.mode === "preferred" && match.target_term.trim() && !containsPreferredTerm(translated, match.target_term, match.target_forms),
   ) : [];
   const ruleWarnings = complete && adjustments.length > 0 ? ["technical_translation_rule_applied"] : [];
   const glossaryWarnings = missingPreferred.map((match) => `preferred_glossary_term_missing:${match.glossary_id}`);
@@ -1639,6 +1640,9 @@ function validateGlossaryEntry(value: unknown): void {
     typeof value.id !== "string" ||
     typeof value.source_term !== "string" ||
     typeof value.target_term !== "string" ||
+    (value.target_forms !== undefined && (!Array.isArray(value.target_forms) || value.mode !== "preferred"
+      || value.target_forms.length > 16 || !value.target_forms.every(form =>
+        typeof form === "string" && form.trim().length > 0 && form.length <= 200))) ||
     typeof value.case_sensitive !== "boolean" ||
     !["exact_segment", "do_not_translate", "preferred", "locked_inline"].includes(String(value.mode)) ||
     typeof value.enabled !== "boolean" ||
@@ -1721,7 +1725,7 @@ function validateBaseJob(job: Record<string, unknown>): void {
 }
 
 function cloneGlossary(entries: GlossaryEntry[]): GlossaryEntry[] {
-  return entries.map((entry) => ({ ...entry }));
+  return entries.map((entry) => ({ ...entry, ...(entry.target_forms ? { target_forms: [...entry.target_forms] } : {}) }));
 }
 
 function finalizeTranslationJob(job: TranslationJob): TranslationJob {
@@ -1784,9 +1788,6 @@ function collectGlossaryUsage(job: TranslationJob): TranslationJob["glossary_usa
   ])).values()];
 }
 
-function containsTerm(text: string, term: string): boolean {
-  return text.toLocaleLowerCase("sl").includes(term.toLocaleLowerCase("sl"));
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

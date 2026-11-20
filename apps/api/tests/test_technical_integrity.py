@@ -32,6 +32,8 @@ def request(path, payload, endpoint):
     ("-40 °C to +90 °C", "od 40 do +90 °C"),
     ("-40 °C to +90 °C", "od +90 do −40 °C"),
     ("Use 2K paint.", "Uporabite dvokomponentno barvo."),
+    ("Rate 3 mm/24 hours", "Hitrost 3 mm/12 h"),
+    ("Rate 3 mm/24 hours", "Hitrost 3 cm/24 h"),
 ])
 def test_direct_api_rejects_false_reviewed_and_passed_qc(tmp_path, endpoint, profile, source, target):
     path = tmp_path / "technical.pdf"
@@ -69,6 +71,7 @@ def test_tampered_source_cannot_hide_changed_target_or_tokens(tmp_path, endpoint
     ("Use 2K paint.", "Uporabite dvokomponentno barvo (2K)."),
     ("Density 1.59 g/ml", "Gostota 1,59\u00a0g/ml"),
     ("Stress 2.5 N/mm²", "Napetost 2,5\u00a0N/mm²"),
+    ("Rate 3 mm/24 hours", "Hitrost 3 mm/24 h"),
 ])
 def test_valid_slovenian_forms_plan_and_write_extractable_pdf(tmp_path, source, target):
     import pymupdf

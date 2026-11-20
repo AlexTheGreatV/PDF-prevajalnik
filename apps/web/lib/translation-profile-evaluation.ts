@@ -14,13 +14,13 @@ import {
   type TerminologySourceRecord,
 } from "./translation-profile";
 import type { GlossaryEntry, TranslationJob, TranslationSegment } from "./translation-types";
-import { findGlossaryMatches } from "./glossary";
+import { containsPreferredTerm, findGlossaryMatches } from "./glossary";
 import { protectTechnicalTokens } from "./technical-tokens";
 import { TECHNICAL_RANGE_RULES_VERSION } from "./technical-ranges";
 import { proposeSiMeasurements, reviewedUnitTarget, type ReviewedUnitContext } from "./si-measurements";
 import { createTranslationContentRevision, validateTranslationTechnicalIntegrity, PROTECTED_DATA_RULES_VERSION } from "./translation-integrity";
 
-export const CURRENT_QC_RULES_REVISION = `current-segment-qc-v2:${PROTECTED_DATA_RULES_VERSION}:${TRANSLATION_PROFILE_ID}:${TRANSLATION_PROFILE_VERSION}:${TRANSLATION_PROFILE_CANONICAL_SHA256}:${TECHNICAL_RANGE_RULES_VERSION}`;
+export const CURRENT_QC_RULES_REVISION = `current-segment-qc-v3:${PROTECTED_DATA_RULES_VERSION}:${TRANSLATION_PROFILE_ID}:${TRANSLATION_PROFILE_VERSION}:${TRANSLATION_PROFILE_CANONICAL_SHA256}:${TECHNICAL_RANGE_RULES_VERSION}`;
 
 const RULE = {
   userGlossary: "SL-SSKJ-03-002",
@@ -139,7 +139,7 @@ export function refreshCurrentSegmentQc(segment: TranslationSegment, profileRevi
   }
 
   for (const match of segment.glossary_matches.filter((item) =>
-    item.mode === "preferred" && item.target_term.trim() && !containsTerm(target, item.target_term),
+    item.mode === "preferred" && item.target_term.trim() && !containsPreferredTerm(target, item.target_term, item.target_forms),
   )) findings.push({
     code: "preferred_term_missing",
     severity: "warning",
@@ -466,11 +466,6 @@ function hasInconsistentGlossary(glossary: GlossaryEntry[]): boolean {
 
 function normalizedTerm(entry: GlossaryEntry): string {
   return entry.source_term.trim().toLocaleLowerCase();
-}
-
-function containsTerm(text: string, term: string): boolean {
-  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "iu").test(text);
 }
 
 function hasSourcePlaceholder(segment: TranslationSegment): boolean {

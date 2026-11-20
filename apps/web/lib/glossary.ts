@@ -56,6 +56,7 @@ function toMatch(entry: GlossaryEntry, matched_text: string, start_offset: numbe
     glossary_id: entry.id,
     source_term: entry.source_term,
     target_term: entry.target_term,
+    ...(entry.target_forms ? { target_forms: [...entry.target_forms] } : {}),
     matched_text,
     mode: entry.mode,
     origin: entry.origin,
@@ -86,4 +87,12 @@ function preferredSourcePattern(term: string): string {
     if (/^(?:Fibre|Fiber)$/u.test(part)) return "F(?:ibre|iber)";
     return escapeRegExp(part);
   }).join("");
+}
+
+// Only explicitly supplied complete forms; no inferred stems or suffixes.
+export function containsPreferredTerm(text: string, term: string, forms: readonly string[] = []): boolean {
+  return [term, ...forms].filter(value => value.trim()).some(value => {
+    const escaped = escapeRegExp(value.trim());
+    return new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "iu").test(text);
+  });
 }
