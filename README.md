@@ -32,7 +32,7 @@ No external AI services are called in this milestone. Documents stay local.
 
 ## Continue on Another Computer
 
-See [the local comparison handoff](docs/continue-on-another-computer.md) for cloning,
+For Codex, start with [the agent continuation instructions](docs/codex-handoff.md). See [the local comparison handoff](docs/continue-on-another-computer.md) for cloning,
 restoring the separate private transfer bundle, and continuing the isolated HPLT/Qwen
 comparison. Models, glossary/TM/OCR databases, user jobs and test documents are not
 in GitHub. The downloaded Qwen has not yet been evaluated or integrated into the app.

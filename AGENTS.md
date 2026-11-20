@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Continuation on another computer
+
+Before resuming the isolated model comparison, read [the Codex handoff](docs/codex-handoff.md) and [the private-data restoration guide](docs/continue-on-another-computer.md). These record the current checkpoint and safety boundaries; current user instructions take precedence.
+
 ## Project Mission
 
 Build an internal document translation application for JUB/KOOP, starting with a reliable local PDF processing pipeline. Keep the architecture ready for a later SaaS path, but do not build SaaS-only features before the internal workflow is proven.
