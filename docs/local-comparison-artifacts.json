@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "scope": "isolated comparison only, not an application provider",
+  "model": {
+    "upstream": "Qwen/Qwen3-4B-Instruct-2507",
+    "upstream_revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "license": "Apache-2.0",
+    "distribution": "lmstudio-community/Qwen3-4B-Instruct-2507-GGUF",
+    "revision": "4edb920b6f14e3b9284d4502a6485103d72cde05",
+    "relative_path": "local-models/qwen3-4b-instruct-2507-q4-k-m/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    "size_bytes": 2497280448,
+    "sha256": "8cdb57cbb880d313736a9bc4e3d3d2485f145b5e19cf33783746e753e82641fc"
+  },
+  "runtime": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "release": "b12244",
+    "platform": "Windows x86_64 CPU",
+    "archive": "llama-b12244-bin-win-cpu-x64.zip",
+    "archive_bytes": 24930349,
+    "archive_sha256": "318f11fadcbc3a86541ec55d9930cc76646c6b8d2ff18798c8477e9ff0dc452a",
+    "relative_cli": "local-models/runtimes/llama-b12244-win-cpu-x64/bin/llama-cli.exe",
+    "cli_sha256": "aad0392eaa886e3b57a15e6402c589d58a72c04f6aa2e7a7b9bd4f1bca5994c7",
+    "observed_version": "0.9.0-dev build 12244 commit d5bbcd1f3"
+  },
+  "comparison_status": "not executed; model has never been loaded in this pilot",
+  "frozen_final_inputs_sha256": "5238e45f90b684cdc8ea1be3a1e3ee96f6702a3b5ab9675cdd66b7c0b64b2aff",
+  "new_final_cases_used": 0,
+  "approval_policy": "No automatic review; no unapproved term promotion",
+  "download_policy": "explicit user action only; verify artifact identities; never auto-download during startup/tests/builds"
+}
